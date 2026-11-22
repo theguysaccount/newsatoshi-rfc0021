@@ -1,0 +1,31 @@
+[package]
+name = "ns-wallet"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "NEWSATOSHI browser wallet: keys, nullifiers and spend proofs in WebAssembly"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+newsatoshi = { path = "../node", default-features = false }
+# the prover needs randomness; the page supplies it from crypto.getRandomValues
+getrandom = { version = "0.2", features = ["custom"] }
+rand = "0.8"
+hex = "0.4"
+
+# the node's patched Winterfell (zero-knowledge segments); see ../node/Cargo.toml
+[patch.crates-io]
+winter-air = { path = "../node/vendor/winter-air" }
+winter-prover = { path = "../node/vendor/winter-prover" }
+winter-verifier = { path = "../node/vendor/winter-verifier" }
+winter-utils = { path = "../node/vendor/winter-utils" }
+winter-crypto = { path = "../node/vendor/winter-crypto" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

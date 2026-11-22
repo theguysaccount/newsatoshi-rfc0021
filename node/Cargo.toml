@@ -1,0 +1,69 @@
+[package]
+name = "newsatoshi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "NEWSATOSHI reference node: SHA-256 proof of work orders, a SHA-256 STARK validates, notes are shielded."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "newsatoshi"
+path = "src/main.rs"
+
+[features]
+default = ["concurrent"]
+concurrent = ["winterfell/concurrent"]
+# count the SHA-256 compressions the proof system runs (examples/recursion_cost)
+count = []
+
+[[example]]
+name = "recursion_cost"
+required-features = ["count"]
+
+[dependencies]
+winterfell = { version = "0.13.1", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", features = ["compress"] }
+rand = "0.8"
+# persistent collections: a copy of the state shares everything the copies have in common
+imbl = "=7.0.2"
+hex = "0.4"
+winter-utils = "0.13.1"
+primitive-types = { version = "0.12", default-features = false }
+slh-dsa = "=0.1.0"
+# slh-dsa 0.1.0 was built against this pre-release; later pre-releases changed its RNG trait
+signature = "=2.3.0-pre.4"
+# ML-KEM (FIPS 203), only for delivering notes on chain (white paper §2): a break of it
+# would reveal who paid whom, and could never move a coin
+ml-kem = { version = "=0.2.3", default-features = false, features = ["deterministic"] }
+kem = "=0.3.0-pre.0"
+
+
+
+# Winterfell 0.13.1 with two changes. For zero knowledge, the constraint composition
+# polynomial's segments can be masked (Haböck and Al Kindi, ePrint 2024/1037). For safety
+# against hostile proofs, a count read from the bytes being parsed no longer sizes an
+# allocation (winter-utils and winter-crypto; found by examples/fuzz.rs). Each patched
+# line is marked "NEWSATOSHI patch"; everything else is the published crate.
+[patch.crates-io]
+winter-air = { path = "vendor/winter-air" }
+winter-prover = { path = "vendor/winter-prover" }
+winter-verifier = { path = "vendor/winter-verifier" }
+winter-utils = { path = "vendor/winter-utils" }
+winter-crypto = { path = "vendor/winter-crypto" }
+
+# Dependencies are always built optimised and without debug assertions: Winterfell's
+# debug build insists that declared and measured constraint degrees match exactly,
+# which gated constraints only satisfy generically. Soundness is tested instead by
+# verifying real proofs and by our own row-by-row constraint checker (spend::check_trace).
+[profile.dev.package."*"]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
