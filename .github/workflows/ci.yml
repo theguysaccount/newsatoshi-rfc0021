@@ -1,0 +1,22 @@
+name: L1 RFC-0021 CI
+
+on:
+  push:
+    branches: [main, feat/rfc-0021-op-verify-covenant-stark]
+  pull_request:
+
+jobs:
+  l1-covenant-stark:
+    name: Newsatoshi L1 + OP_VERIFY_COVENANT_STARK (0xb4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+      - working-directory: node
+        run: |
+          cargo test --lib
+          cargo test --test covenant_stark_softfork --test conds --test auxpow --test locks --test mainnet_params --test chain
+          cargo build --bin newsatoshi
