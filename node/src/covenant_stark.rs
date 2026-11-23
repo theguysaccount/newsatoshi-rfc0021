@@ -555,6 +555,17 @@ pub fn verify_covenant_stark_bytes(
     if &inputs.change_covenant_rule_hash != expected_rule_hash {
         return Err("recursive covenant continuity violated".into());
     }
+    // Pre-verify integer domain bounds before invoking Winterfell FRI verification (DoS + soundness guard).
+    let max_63 = (1u64 << 63) - 1;
+    if inputs.input_amount > max_63 || inputs.payout_amount > max_63 || inputs.change_amount > max_63 {
+        return Err("covenant amounts exceed 63-bit range bound".into());
+    }
+    if inputs.reinvest_bps > 10_000 {
+        return Err("covenant reinvest_bps exceeds 10000".into());
+    }
+    if inputs.min_soil_health_score > 100 || inputs.soil_health_score > 100 {
+        return Err("covenant soil_health_score exceeds 100".into());
+    }
     let proof =
         Proof::from_bytes(proof_bytes).map_err(|e| format!("bad covenant STARK proof: {e}"))?;
     let acceptable = AcceptableOptions::MinConjecturedSecurity(MIN_SECURITY_BITS);
