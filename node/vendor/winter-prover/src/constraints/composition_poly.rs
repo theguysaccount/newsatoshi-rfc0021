@@ -103,7 +103,13 @@ impl<E: FieldElement> CompositionPoly<E> {
         let capacity = (num_cols - 1) * stride + n;
         assert!(
             coeffs.iter().skip(capacity).all(|c| *c == E::ZERO),
-            "the composition polynomial does not fit its masked segments"
+            "the composition polynomial does not fit its masked segments (degree={}, capacity={}, len={}, num_cols={}, stride={}, n={})",
+            degree_of(&coeffs),
+            capacity,
+            coeffs.len(),
+            num_cols,
+            stride,
+            n,
         );
 
         let mut polys = Vec::with_capacity(num_cols);

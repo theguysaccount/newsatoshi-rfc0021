@@ -276,23 +276,44 @@ mod concurrent {
     // PERMUTATIONS
     // --------------------------------------------------------------------------------------------
 
+    // NEWSATOSHI patch: avoid creating aliasing `&mut [T]` references across rayon threads (UB
+    // under Rust/LLVM `noalias`, which can corrupt parallel bit-reversal permutations on modern
+    // rustc). Use a raw pointer wrapper and `ptr::swap` on provably disjoint pairs `(i, j)`.
+    struct SendMutPtr<T>(*mut T);
+    impl<T> Clone for SendMutPtr<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<T> Copy for SendMutPtr<T> {}
+    impl<T> SendMutPtr<T> {
+        #[inline]
+        fn as_ptr(self) -> *mut T {
+            self.0
+        }
+    }
+    unsafe impl<T: Send> Send for SendMutPtr<T> {}
+
     pub fn permute<T: Send>(v: &mut [T]) {
         let n = v.len();
-        let num_batches = rayon::current_num_threads().next_power_of_two() * 2;
+        let num_batches = (rayon::current_num_threads().next_power_of_two() * 2).min(n).max(1);
         let batch_size = n / num_batches;
-        rayon::scope(|s| {
+        let base = SendMutPtr(v.as_mut_ptr());
+        rayon::scope(move |s| {
             for batch_idx in 0..num_batches {
-                // create another mutable reference to the slice of values to use in a new thread;
-                // this is OK because we never write the same positions in the slice from different
-                // threads
-                let values = unsafe { &mut *(&mut v[..] as *mut [T]) };
                 s.spawn(move |_| {
+                    let ptr = base.as_ptr();
                     let batch_start = batch_idx * batch_size;
                     let batch_end = batch_start + batch_size;
                     for i in batch_start..batch_end {
                         let j = permute_index(n, i);
                         if j > i {
-                            values.swap(i, j);
+                            // SAFETY: `permute_index(n, .)` is an involution on `0..n`, so each
+                            // unordered pair `{i, j}` with `i < j` is swapped by exactly one
+                            // thread without creating aliasing `&mut [T]` references.
+                            unsafe {
+                                core::ptr::swap(ptr.add(i), ptr.add(j));
+                            }
                         }
                     }
                 });

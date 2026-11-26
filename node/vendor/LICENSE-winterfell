@@ -1,6 +1,6 @@
-The five crates in this directory are Winterfell 0.13.1 (winter-air, winter-prover,
-winter-verifier, winter-utils, winter-crypto), published on crates.io under the MIT license,
-with the changes marked "NEWSATOSHI patch" in their sources. Their licence:
+The six crates in this directory are Winterfell 0.13.1 (winter-air, winter-math,
+winter-prover, winter-verifier, winter-utils, winter-crypto), published on crates.io under
+the MIT license, with the changes marked "NEWSATOSHI patch" in their sources. Their licence:
 
 MIT License
 

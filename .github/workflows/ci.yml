@@ -18,7 +18,7 @@ jobs:
       - working-directory: node
         run: |
           cargo test --lib
-          cargo test --release --test payword_channel --test clearinghouse_substrate --test crypto_kats --test covenant_stark_softfork --test conds --test auxpow --test locks --test light --test mainnet_params --test chain
+          cargo test --release --test payword_channel --test clearinghouse_substrate --test audit_redteam --test crypto_kats --test covenant_stark_softfork --test conds --test auxpow --test locks --test light --test mainnet_params --test chain
           cargo build --bin newsatoshi --example channel_http_harness --example extract_lean_spend
           cargo run --release --example extract_lean_spend -- /tmp/SpendBalance.lean
           diff -u proof/SpendBalance.lean /tmp/SpendBalance.lean

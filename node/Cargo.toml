@@ -41,13 +41,17 @@ kem = "=0.3.0-pre.0"
 
 
 
-# Winterfell 0.13.1 with two changes. For zero knowledge, the constraint composition
-# polynomial's segments can be masked (Haböck and Al Kindi, ePrint 2024/1037). For safety
-# against hostile proofs, a count read from the bytes being parsed no longer sizes an
-# allocation (winter-utils and winter-crypto; found by examples/fuzz.rs). Each patched
-# line is marked "NEWSATOSHI patch"; everything else is the published crate.
+# Winterfell 0.13.1 with three surgical changes. (1) For zero knowledge, the constraint
+# composition polynomial's segments can be masked (Haböck and Al Kindi, ePrint 2024/1037).
+# (2) For safety against hostile proofs, a count read from the bytes being parsed no longer
+# sizes an allocation (winter-utils and winter-crypto; found by examples/fuzz.rs). (3) For
+# memory safety under modern rustc/LLVM `noalias`, concurrent FFT bit-reversal (`permute`)
+# and Merkle tree construction (`build_merkle_nodes`) use raw-pointer disjoint writes instead
+# of aliasing `&mut` slices across rayon threads (winter-math, winter-prover, winter-crypto).
+# Each patched site is marked "NEWSATOSHI patch"; everything else is the published crate.
 [patch.crates-io]
 winter-air = { path = "vendor/winter-air" }
+winter-math = { path = "vendor/winter-math" }
 winter-prover = { path = "vendor/winter-prover" }
 winter-verifier = { path = "vendor/winter-verifier" }
 winter-utils = { path = "vendor/winter-utils" }

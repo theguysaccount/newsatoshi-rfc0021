@@ -1,8 +1,8 @@
-# Newsatoshi Mainnet v2 External Security Audit Scope & Cutover Packet (`v0.7.0-trustless-v2`)
+# Newsatoshi Mainnet v2 External Security Audit Scope & Cutover Packet (`v0.7.1-trustless-v2`)
 
 This document is the authoritative, zero-hype engineering scope packet for **two independent external security audits** required before activating **Newsatoshi Mainnet v2** (`RFC-0021` through `RFC-0027`).
 
-> **Honest Pre-Cutover Status:** As of `v0.7.0-trustless-v2`, **0 of 2** external security audits have been completed and **0 of 3** independent real-difficulty Bitcoin AuxPoW merge-mining pools are live on Mainnet. All v2 consensus upgrades remain height-gated (`None`) on `v0.1.0` Mainnet/Testnet until both external audit reports and ≥ 3 independent pools are verified. Live cutover gate: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
+> **Honest Pre-Cutover Status:** As of `v0.7.1-trustless-v2`, **0 of 2** external security audits have been completed and **0 of 3** independent real-difficulty Bitcoin AuxPoW merge-mining pools are live on Mainnet. All v2 consensus upgrades remain height-gated (`None`) on `v0.1.0` Mainnet/Testnet until both external audit reports and ≥ 3 independent pools are verified. Live cutover gate: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
 
 ---
 
@@ -10,7 +10,7 @@ This document is the authoritative, zero-hype engineering scope packet for **two
 
 | Component | File Path | SHA-256 Fingerprint (`shasum -a 256`) | Key Security Invariants to Audit |
 | :--- | :--- | :--- | :--- |
-| **Winterfell 0.13.1 Patch** | `node/vendor/winter-*` (`15` marked `NEWSATOSHI patch` sites) | Verify via `grep -rn "NEWSATOSHI patch" node/vendor/` | Haböck–Al Kindi (ePrint 2024/1037) constraint composition segment masking (ZK soundness & zero-knowledge); hostile-proof allocation DoS bounds |
+| **Winterfell 0.13.1 Patch** | `node/vendor/winter-*` (`18` marked `NEWSATOSHI patch` sites across 6 vendored crates) | Verify via `grep -rn "NEWSATOSHI patch" node/vendor/` | Haböck–Al Kindi (ePrint 2024/1037) constraint composition segment masking; hostile-proof allocation DoS bounds; UB-free raw-pointer concurrent FFT `permute` & Merkle `build_merkle_nodes` (eliminates upstream Winterfell 0.13.1 aliasing `&mut` slices under modern `rustc`/LLVM `noalias`) |
 | **Shielded Spend STARK** | `node/src/spend.rs` | `c550dd3f6cb836e3c91842986ab9382bb24d3ce53859dc5a0cc68ae93adb8528` | `249` Goldilocks AIR constraints, Constraint #247 balance conservation, Constraint #248 `< 2^60` note range check, no mod-`P` wrap-around, 384-bit FRI in `MAIN_V2` |
 | **Universal Trust Bonds (`RFC-0024`)** | `node/src/bond.rs` | `03702b996093f5ec292bacce2b9d0d292913462cbe95216a70a5b2019932485e` | Anti-wash-trading `counterparty_vk != owner_vk`, exact slash conservation (`victim + burn + fee == slash`), ascending distinct arbiter quorum, unbond cooldown |
 | **Sovereign L2 Rollup Vaults (`RFC-0023`)** | `node/src/rollup.rs` | `061a223566649fa07eabe506fecabf0c0850be26e3e9082b39d2f2fca4e354b1` | 128-bit list-decoding pure-SHA-2 STARK (`RollupBatchAir`) AND permissionless on-chain L1 `apply_zkvm_batch` verifying `1..=4` contiguous `ZkVmExecutionAir` STARKs pinned to `vault.post.vk_hash` + canonical `MerkleMap` exit & nullifier lock |

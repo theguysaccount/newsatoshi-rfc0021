@@ -18,6 +18,7 @@ hex = "0.4"
 # the node's patched Winterfell (zero-knowledge segments); see ../node/Cargo.toml
 [patch.crates-io]
 winter-air = { path = "../node/vendor/winter-air" }
+winter-math = { path = "../node/vendor/winter-math" }
 winter-prover = { path = "../node/vendor/winter-prover" }
 winter-verifier = { path = "../node/vendor/winter-verifier" }
 winter-utils = { path = "../node/vendor/winter-utils" }

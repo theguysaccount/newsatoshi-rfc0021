@@ -41,23 +41,45 @@ pub fn build_merkle_nodes<H: Hasher>(leaves: &[H::Digest]) -> Vec<H::Digest> {
     // calculate all other tree nodes, we can't use regular iterators  here because
     // access patterns are rather complicated - so, we use regular threads instead
 
-    // number of sub-trees must always be a power of 2
-    let num_subtrees = rayon::current_num_threads().next_power_of_two();
-    let batch_size = n / num_subtrees;
+    // NEWSATOSHI patch: avoid holding aliasing `&[[H::Digest; 2]]` and multiple `&mut [H::Digest]`
+    // references to `nodes` across rayon threads (UB under Rust/LLVM `noalias`). Use a raw pointer
+    // wrapper; each thread owns a disjoint subtree of `nodes`.
+    struct SendMutPtr<T>(*mut T);
+    impl<T> Clone for SendMutPtr<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<T> Copy for SendMutPtr<T> {}
+    impl<T> SendMutPtr<T> {
+        #[inline]
+        fn as_ptr(self) -> *mut T {
+            self.0
+        }
+    }
+    unsafe impl<T: Send> Send for SendMutPtr<T> {}
 
-    // re-interpret nodes as an array of two nodes fused together
-    let two_nodes = unsafe { slice::from_raw_parts(nodes.as_ptr() as *const [H::Digest; 2], n) };
+    // number of sub-trees must always be a power of 2 and at most n
+    let num_subtrees = rayon::current_num_threads().next_power_of_two().min(n).max(1);
+    let batch_size = n / num_subtrees;
+    let base = SendMutPtr(nodes.as_mut_ptr());
 
     // process each subtree in a separate thread
-    rayon::scope(|s| {
+    rayon::scope(move |s| {
         for i in 0..num_subtrees {
-            let nodes = unsafe { &mut *(&mut nodes[..] as *mut [H::Digest]) };
             s.spawn(move |_| {
+                let ptr = base.as_ptr();
                 let mut batch_size = batch_size / 2;
                 let mut start_idx = n / 2 + batch_size * i;
                 while start_idx >= num_subtrees {
                     for k in (start_idx..(start_idx + batch_size)).rev() {
-                        nodes[k] = H::merge(&two_nodes[k]);
+                        // SAFETY: indices `2*k` and `2*k + 1` were initialized in the prior level
+                        // of this thread's disjoint subtree (or the parallel leaf layer), and `k`
+                        // belongs exclusively to subtree `i`.
+                        unsafe {
+                            let children = &*(ptr.add(2 * k) as *const [H::Digest; 2]);
+                            ptr.add(k).write(H::merge(children));
+                        }
                     }
                     start_idx /= 2;
                     batch_size /= 2;
@@ -67,8 +89,12 @@ pub fn build_merkle_nodes<H: Hasher>(leaves: &[H::Digest]) -> Vec<H::Digest> {
     });
 
     // finish the tip of the tree
+    let ptr = nodes.as_mut_ptr();
     for i in (1..num_subtrees).rev() {
-        nodes[i] = H::merge(&two_nodes[i]);
+        unsafe {
+            let children = &*(ptr.add(2 * i) as *const [H::Digest; 2]);
+            ptr.add(i).write(H::merge(children));
+        }
     }
 
     nodes
