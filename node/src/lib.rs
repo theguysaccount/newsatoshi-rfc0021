@@ -37,3 +37,4 @@ pub mod state;
 pub mod swap;
 pub mod tx;
 pub mod wallet;
+pub mod zkvm;
