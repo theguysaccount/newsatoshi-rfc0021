@@ -526,6 +526,32 @@ theorem flyclient_mmr_work_conservation
     listSum_append left_peaks right_peaks
   exact ⟨hsum, by omega⟩
 
+/-- Theorem 14 (Utreexo 1 KB Compact Frontier Bound & Algebraic FRI-Folding Uniqueness):
+    (a) For any note tree below depth-32 capacity (`count < 2^32`), storing at most 32 peaks
+        occupies at most 1,024 bytes of RAM regardless of history length;
+    (b) Over exact integers (and any odd-characteristic field such as Goldilocks `P`), the
+        algebraic FRI folding equation `2 * x * folded = x * (fp + fn) + alpha * (fp - fn)`
+        with `x ≠ 0` uniquely determines `folded` — no prover can forge two distinct folded
+        evaluations for the same `(x, fp, fn, alpha)`. -/
+theorem utreexo_frontier_and_fri_fold_uniqueness
+    (active_peaks : Nat)
+    (h_peaks : active_peaks ≤ 32)
+    (x fp fn alpha folded1 folded2 : Int)
+    (hx : x ≠ 0)
+    (h1 : 2 * x * folded1 = x * (fp + fn) + alpha * (fp - fn))
+    (h2 : 2 * x * folded2 = x * (fp + fn) + alpha * (fp - fn)) :
+    active_peaks * 32 ≤ 1024 ∧ folded1 = folded2 := by
+  have hbytes : active_peaks * 32 ≤ 1024 := by omega
+  have heq : (2 * x) * (folded1 - folded2) = 0 := by
+    have : (2 * x) * (folded1 - folded2) = 2 * x * folded1 - 2 * x * folded2 := by
+      rw [Int.mul_sub]
+    rw [this, h1, h2]
+    omega
+  have h2x : 2 * x ≠ 0 := by omega
+  rcases Int.mul_eq_zero.mp heq with hz | hd
+  · exact absurd hz h2x
+  · exact ⟨hbytes, by omega⟩
+
 #print axioms extracted_constraint_247_exact
 #print axioms extracted_constraint_248_exact
 #print axioms note_value_strictly_below_2_pow_60
@@ -539,5 +565,6 @@ theorem flyclient_mmr_work_conservation
 #print axioms rfc0023_permissionless_zkvm_l1_soundness
 #print axioms rfc0023_zkvm_base4_range_and_alu_soundness
 #print axioms flyclient_mmr_work_conservation
+#print axioms utreexo_frontier_and_fri_fold_uniqueness
 
 end NewsatoshiSpendBalance

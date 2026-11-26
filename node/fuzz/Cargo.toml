@@ -1,0 +1,33 @@
+[package]
+name = "newsatoshi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+newsatoshi = { path = ".." }
+
+[[bin]]
+name = "fuzz_wire_decode"
+path = "fuzz_targets/fuzz_wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_stark_and_zkvm"
+path = "fuzz_targets/fuzz_stark_and_zkvm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_p2p_and_flyclient"
+path = "fuzz_targets/fuzz_p2p_and_flyclient.rs"
+test = false
+doc = false
+bench = false

@@ -1,8 +1,8 @@
-# Newsatoshi Mainnet v2 External Security Audit Scope & Cutover Packet (`v0.8.1-genesis-ready`)
+# Newsatoshi Mainnet v2 External Security Audit Scope & Cutover Packet (`v0.9.0-frontier`)
 
-This document is the authoritative, zero-hype engineering scope packet for **two independent external security audits** required before activating **Newsatoshi Mainnet v2** (`RFC-0021` through `RFC-0027`).
+This document is the authoritative, zero-hype engineering scope packet for **two independent external security audits** required before activating **Newsatoshi Mainnet v2** (`RFC-0021` through `RFC-0027`). For direct auditor engagement & RFP terms, see [`docs/EXTERNAL_AUDIT_RFP.md`](./EXTERNAL_AUDIT_RFP.md).
 
-> **Honest Pre-Cutover Status:** As of `v0.8.1-genesis-ready`, **0 of 2** external security audits have been completed and **0 of 3** independent real-difficulty Bitcoin AuxPoW merge-mining pools are live on Mainnet. All v2 consensus upgrades remain height-gated (`None`) on `v0.1.0` Mainnet/Testnet until both external audit reports and ≥ 3 independent pools are verified. Live cutover gate: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
+> **Honest Pre-Cutover Status:** As of `v0.9.0-frontier`, **0 of 2** external security audits have been completed and **0 of 3** independent real-difficulty Bitcoin AuxPoW merge-mining pools are live on Mainnet. All v2 consensus upgrades remain height-gated (`None`) on `v0.1.0` Mainnet/Testnet until both external audit reports and ≥ 3 independent pools are verified. Live cutover gate: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
 
 ---
 
@@ -24,7 +24,12 @@ This document is the authoritative, zero-hype engineering scope packet for **two
 | **Eclipse Defense, Compact Blocks & Parallel Verify** | `node/src/peers.rs`, `node/src/node.rs` | `cb09cb9d9e6618edee3a50469aea868ee958d939080628a9d8c1a40d2a0160bb` / `3cbd2ca74ea02871ec4272271ee961c611f8223fb5a258967c52fac6e0a174ce` | `/16` IPv4 & `/32` IPv6 netgroup caps (`32` book, `8` inbound, 1 outbound per non-loopback netgroup), persistent `anchors.txt`, BIP-152-style `CompactBlock` (`>95%` STARK relay reduction), mandatory Mainnet v2 `NSPQ1` P2P encryption, multi-core parallel block STARK verification |
 | **FlyClient MMR & Unified Light Client** | `node/src/light.rs` | `ff9fb5c694a8ca229b7c85a868fd191bfd0b73b43a8620d20d63bb9706ea96b3` | Consensus-committed $O(\log N)$ Merkle Mountain Range (`DigestParts::header_mmr` from Genesis #0 on Mainnet v2, Zcash ZIP-221 style) + Fiat–Shamir difficulty-weighted PoW proofs + unified `NoteTree`/`NfTree`/`MerkleMap` light verification + `GET /api/flyclient` |
 | **Consensus State & Snapshots** | `node/src/state.rs`, `node/src/snapshot.rs` | `1d801f66664d777151b2da1f0bd613acc8b39cb63f5baa48250c5b2b35c09a95` / `70d654639cacca28d277da51508b3816f9df2f480600a5741cecc6f54c8f9090` | Global solvency invariant `pool + locked + burned == issued`, canonical `DigestParts` roots incl. Genesis-#0 `header_mmr`, `nsSNAP04` fast-boot snapshot persistence |
-| **Lean 4.36.0 Formal Proof** | `node/proof/SpendBalance.lean` | `197fc4ace7d759a642133da42b339cc69280942b07ce2da1a9b319d151fea267` | `13` machine-checked theorems (incl. zkVM base-4 range/ALU soundness & FlyClient MMR work conservation), `0 sorry`, zero warnings, zero Mathlib, standard core axioms only |
+| **Utreexo 1 KB Compact Frontier** | `node/src/utreexo.rs` | `2be67b6e95728683bf1ed79512a9b43a45e3245f502767f87ec75d9ce4482585` | Constant `<= 1,024 B` RAM 32-peak accumulator bit-for-bit identical to `NoteTree` + $O(1)$ `TrackedNoteProof` updater feeding directly into `spend::prove` |
+| **Disk-Backed Pruned KV Store** | `node/src/pruned_store.rs` | `971155b93502f07378e7c0ff1e576757b64fd05727fe76efb9aee59133211433` | Crash-safe WAL + sorted on-disk binary-searched SSTable `DiskKvStore` + Bitcoin-Core `-prune`-style `prune_chain_to_disk` / `load_pruned_checkpoint` |
+| **SHA-384 STARK Recursion Primitives** | `node/src/recursion.rs` | `81efa1b60fb6c165428ed54a81e9bb524a0f7fdb9f7c8f451aa1fdc8255c2857` | Bit-exact FIPS 180-4 SHA-256d 80-byte PoW header-chain STARK (`HeaderChainAir`, 236 cols × 1,024 rows, 12 compressions/segment + segment folding) and algebraic FRI-folding verifier STARK (`FriFoldVerifyAir`), both pure SHA-384 (`>= 146`/`158` Goldilocks-cubic LDR bits, `128`-bit QROM) |
+| **Independent Second Verifier Client** | `verifier-ts/newsatoshi_verifier.mjs` | `021fa4e61c28bbabf464878588cd2e55c4c05a23f0543c410c6ce99bc1ae6545` | Zero-dependency Node.js/OpenSSL/BigInt second consensus implementation (shares zero code with Rust `node/src/`) verified differentially against live Rust chains in CI |
+| **Differential & Mutation Fuzz Harness** | `node/tests/differential_fuzz.rs`, `node/fuzz/` | `node/fuzz/fuzz_targets/{fuzz_wire_decode,fuzz_stark_and_zkvm,fuzz_p2p_and_flyclient}.rs` | Continuous Rust ↔ JS/OpenSSL differential cross-check + 10,000-iteration hostile wire/STARK/zkVM/P2P/FlyClient mutation fuzzer + `cargo-fuzz` / libFuzzer targets |
+| **Lean 4.36.0 Formal Proof** | `node/proof/SpendBalance.lean` | `a8b1b4a3a45a43c8e67e4412eb82f89e155bc3d5fc0a353489de4a0c6a868316` | `14` machine-checked theorems (incl. zkVM base-4 range/ALU soundness, FlyClient MMR work conservation, & Theorem 14 `utreexo_frontier_and_fri_fold_uniqueness`), `0 sorry`, zero warnings, zero Mathlib, standard core axioms only |
 
 ---
 
@@ -33,10 +38,11 @@ This document is the authoritative, zero-hype engineering scope packet for **two
 Every claim in this repository can be independently reproduced offline from source:
 
 ```bash
-# 1. Full L1 unit suite (42 tests) + E2E permissionless zkVM/clearinghouse/launchpad + 8-test red-team suite
+# 1. Full L1 unit suite (46 tests) + differential JS/OpenSSL verifier + 10k mutation fuzzer + E2E + 8-test red-team suite
 cd node
 cargo test --release --lib
-cargo test --release --test clearinghouse_substrate --test audit_redteam --test light --test mainnet_params
+cargo test --release --test differential_fuzz --test clearinghouse_substrate --test audit_redteam --test light --test mainnet_params
+node ../verifier-ts/newsatoshi_verifier.mjs --self-test
 
 # 2. Live Turing-complete LogUp zkVM -> 2x 192-bit SHA-384 STARK shards -> 1x 192-bit RFC-0023 L1 RollupBatch STARK demo (~70 ms total)
 cargo run --release --example zkvm_l2_dapp
@@ -49,7 +55,7 @@ cargo run --release --bin newsatoshi -- genesis-v2 \
 cargo run --release --example extract_constraints -- /tmp/constraints.json
 python3 proof/check.py /tmp/constraints.json
 
-# 5. Rust-extracted Lean 4.36.0 formal verification (13 theorems, 0 sorry, 0 warnings)
+# 5. Rust-extracted Lean 4.36.0 formal verification (14 theorems, 0 sorry, 0 warnings)
 cargo run --release --example extract_lean_spend -- proof/SpendBalance.lean
 lean proof/SpendBalance.lean
 
@@ -63,7 +69,7 @@ cd ../walletwasm && ./build.sh
 
 | Gate | Requirement | Current Live Status |
 | :--- | :--- | :--- |
-| **Gate 1 — Audit #1** | Independent cryptography & consensus audit report published with all Critical/High findings remediated | **PENDING (`0/2`)** |
-| **Gate 2 — Audit #2** | Second independent security audit of Winterfell patch, `spend.rs`, `bond.rs`, `rollup.rs`, `zkvm.rs`, `mission.rs`, `pq_transport.rs`, `light.rs` | **PENDING (`0/2`)** |
-| **Gate 3 — Independent AuxPoW Pools** | ≥ 3 independent Bitcoin SHA-256 mining pools merge-mining `chainid = 20051` at real Bitcoin-grade difficulty | **PENDING (`0/3`)** — see `newsatoshi-commons/auxpow-stratum/MULTI_POOL_ONBOARDING.md` |
-| **Gate 4 — Formal & Red-Team Suite** | 13 Lean 4 theorems (`0 sorry`), Z3 `249/249`, 192-bit SHA-384 FRI (`128`-bit QROM) full stack, LogUp ROM-bound Turing-complete zkVM, ML-KEM-768 P2P + eclipse defense + Compact Blocks + FlyClient MMR, 8 adversarial red-team tests, reproducible WASM | **PASSING** |
+| **Gate 1 — Audit #1** | Independent cryptography & consensus audit report published with all Critical/High findings remediated | **PENDING (`0/2`)** — RFP ready in [`EXTERNAL_AUDIT_RFP.md`](./EXTERNAL_AUDIT_RFP.md) |
+| **Gate 2 — Audit #2** | Second independent security audit of Winterfell patch, `spend.rs`, `bond.rs`, `rollup.rs`, `zkvm.rs`, `mission.rs`, `pq_transport.rs`, `light.rs`, `utreexo.rs`, `pruned_store.rs`, `recursion.rs` | **PENDING (`0/2`)** |
+| **Gate 3 — Independent AuxPoW Pools** | ≥ 3 independent Bitcoin SHA-256 mining pools merge-mining `chainid = 20051` at real Bitcoin-grade difficulty | **PENDING (`0/3`)** — see `newsatoshi-commons/auxpow-stratum/POOL_OPERATOR_OUTREACH.md` & `verify-auxpow-pool.sh` |
+| **Gate 4 — Formal, Multi-Client & Red-Team Suite** | 14 Lean 4 theorems (`0 sorry`), Z3 `249/249`, 192-bit SHA-384 FRI (`128`-bit QROM) full stack, LogUp ROM-bound Turing-complete zkVM, Utreexo 1 KB frontier + disk KV pruner, SHA-256d header-chain & FRI-fold STARKs, independent Node.js/OpenSSL verifier + 10k mutation fuzzer, ML-KEM-768 P2P + eclipse defense + Compact Blocks + FlyClient MMR, 8 adversarial red-team tests, reproducible WASM | **PASSING** |
