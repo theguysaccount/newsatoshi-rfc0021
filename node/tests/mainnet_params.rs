@@ -84,16 +84,22 @@ fn mainnet_v2_sha384_proofs_achieve_128_bit_qrom_and_domain_separation() {
     let (pi, proof) = spend::prove_v2_sha384(&wit, bind).unwrap();
     let secs = t0.elapsed().as_secs_f64();
     let bytes = proof.to_bytes();
-    let proven_classical = proof.proven_security::<spend::Hash384>().ldr_bits();
-    // 384-bit SHA-384 Merkle commitments -> 192-bit classical collision, 128-bit BHT QROM!
+    let proven = proof.proven_security::<spend::Hash384>();
+    let proven_classical = proven.ldr_bits();
+    let unclipped_ldr = proven.unclipped_ldr_bits();
+    let qrom_bits = proven.qrom_ldr_bits(384);
     println!(
-        "[MAINNET V2 SHA-384] 128 queries, {} bytes, proved in {secs:.2} s, {proven_classical} proven bits (list decoding; 384-bit SHA-384 => 128-bit QROM collision)",
+        "[MAINNET V2 QUARTIC SHA-384] 152 queries, B=8, g=20, F_p^4 (256-bit), {} bytes, proved in {secs:.2} s | classical_ldr={proven_classical} (unclipped={unclipped_ldr}), conservative_QROM_CMS19={qrom_bits} bits (SHA-384 BHT=128)",
         bytes.len()
     );
     assert!(bytes.len() <= spend::MAIN_V2_MAX_PROOF_BYTES, "{} bytes", bytes.len());
     assert!(
-        proven_classical >= 140,
-        "expected >=140 classical proven bits with SHA-384 (128-bit QROM collision), got {proven_classical}"
+        proven_classical >= 192,
+        "expected 192 classical proven bits with Quartic SHA-384, got {proven_classical}"
+    );
+    assert!(
+        qrom_bits >= 100,
+        "expected >= 100 conservative QROM (CMS19) quantum bits with Quartic SHA-384, got {qrom_bits}"
     );
     spend::verify_v2_sha384_bytes(&pi, &bytes).unwrap();
     // Domain separation: v2 SHA-384 proof MUST NOT verify under v1 SHA-256 profile!

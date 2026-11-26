@@ -67,6 +67,8 @@ impl ConjecturedSecurity {
 pub struct ProvenSecurity {
     unique_decoding: u32,
     list_decoding: u32,
+    // NEWSATOSHI patch: track unclipped algebraic RbR LDR bits for exact CMS19 QROM estimation
+    unclipped_list_decoding: u32,
 }
 
 impl ProvenSecurity {
@@ -113,24 +115,39 @@ impl ProvenSecurity {
             "Should not fail since m_max is larger than m_min for all trace sizes of length greater than 4",
         );
 
-        let list_decoding = cmp::min(
-            proven_security_protocol_for_given_proximity_parameter(
-                options,
-                base_field_bits,
-                trace_domain_size,
-                m_optimal as usize,
-                num_constraints,
-                num_committed_polys,
-            ),
-            collision_resistance as u64,
-        ) as u32;
+        let raw_list_decoding = proven_security_protocol_for_given_proximity_parameter(
+            options,
+            base_field_bits,
+            trace_domain_size,
+            m_optimal as usize,
+            num_constraints,
+            num_committed_polys,
+        );
+        let list_decoding = cmp::min(raw_list_decoding, collision_resistance as u64) as u32;
 
-        Self { unique_decoding, list_decoding }
+        Self {
+            unique_decoding,
+            list_decoding,
+            unclipped_list_decoding: raw_list_decoding as u32,
+        }
     }
 
     /// Returns the proven security level (in bits) in the list decoding regime.
     pub fn ldr_bits(&self) -> u32 {
         self.list_decoding
+    }
+
+    /// NEWSATOSHI patch: returns the unclipped algebraic RbR LDR security bits (before capping
+    /// at classical hash collision resistance).
+    pub fn unclipped_ldr_bits(&self) -> u32 {
+        self.unclipped_list_decoding
+    }
+
+    /// NEWSATOSHI patch: conservative QROM quantum soundness estimate (in bits) combining
+    /// BHT hash collision security (`hash_digest_bits / 3`) and CMS19 QROM square-root loss
+    /// on round-by-round + Grover query soundness (`unclipped_ldr_bits / 2`).
+    pub fn qrom_ldr_bits(&self, hash_digest_bits: u32) -> u32 {
+        cmp::min(hash_digest_bits / 3, self.unclipped_list_decoding / 2)
     }
 
     /// Returns the proven security level (in bits) in the unique decoding regime.

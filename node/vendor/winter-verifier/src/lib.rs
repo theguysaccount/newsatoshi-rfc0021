@@ -45,7 +45,7 @@ use crypto::{ElementHasher, Hasher, RandomCoin, VectorCommitment};
 use fri::FriVerifier;
 pub use math;
 use math::{
-    fields::{CubeExtension, QuadExtension},
+    fields::{CubeExtension, QuadExtension, QuartExtension},
     FieldElement, ToElements,
 };
 pub use utils::{
@@ -134,6 +134,19 @@ where
             let public_coin = RandCoin::new(&public_coin_seed);
             let channel = VerifierChannel::new(&air, proof)?;
             perform_verification::<AIR, CubeExtension<AIR::BaseField>, HashFn, RandCoin, VC>(
+                air,
+                channel,
+                public_coin,
+            )
+        },
+        // NEWSATOSHI patch: 256-bit Quartic Goldilocks extension (`F_{p^4}`)
+        FieldExtension::Quartic => {
+            if !<QuartExtension<AIR::BaseField>>::is_supported() {
+                return Err(VerifierError::UnsupportedFieldExtension(4));
+            }
+            let public_coin = RandCoin::new(&public_coin_seed);
+            let channel = VerifierChannel::new(&air, proof)?;
+            perform_verification::<AIR, QuartExtension<AIR::BaseField>, HashFn, RandCoin, VC>(
                 air,
                 channel,
                 public_coin,

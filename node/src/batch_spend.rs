@@ -43,8 +43,8 @@ pub const MIN_BATCH_SPENDS: usize = 2;
 pub const MAX_BATCH_SPENDS: usize = 16;
 /// 72 active SHA-256 blocks per 2-in/2-out spend + 1 isolating `Kind::Rand` block between spends.
 pub const BLOCKS_PER_SPEND: usize = 73;
-/// Largest serialized `BatchSpend` proof accepted across all networks (fits `K = 16` SHA-384).
-pub const MAX_BATCH_PROOF_BYTES: usize = 1_100_000;
+/// Largest serialized `BatchSpend` proof accepted across all networks (fits `K = 16` Quartic SHA-384).
+pub const MAX_BATCH_PROOF_BYTES: usize = 1_250_000;
 
 /// Trace length (power of 2) for a batch of `k` spends (`2 <= k <= 16`).
 /// Guarantees >= 2,304 unconstrained random rows for zero-knowledge masking at every `k`.

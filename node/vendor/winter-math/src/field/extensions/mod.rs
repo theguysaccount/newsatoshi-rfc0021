@@ -9,4 +9,8 @@ pub use quadratic::QuadExtension;
 mod cubic;
 pub use cubic::CubeExtension;
 
+// NEWSATOSHI patch: 256-bit quartic extension for >= 100-bit QROM FRI soundness
+mod quartic;
+pub use quartic::QuartExtension;
+
 use super::{ExtensibleField, ExtensionOf, FieldElement};

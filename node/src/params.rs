@@ -35,9 +35,9 @@ pub const MAX_TX_BYTES: usize = 400_000;
 /// Largest encoded transaction on the v0.1 main network: its larger proofs, and the same room
 /// for the rest of a payment.
 pub const MAIN_MAX_TX_BYTES: usize = MAX_TX_BYTES - crate::spend::MAX_PROOF_BYTES + crate::spend::MAIN_MAX_PROOF_BYTES;
-/// Largest encoded transaction on Mainnet v2 / Regtest (fits single SHA-384 spends and
-/// up to 16-spend compressed `Tx::BatchSpend` SHA-384 STARK proofs + encrypted memos).
-pub const MAIN_V2_MAX_TX_BYTES: usize = 1_400_000;
+/// Largest encoded transaction on Mainnet v2 / Regtest (fits single Quartic SHA-384 spends and
+/// up to 16-spend compressed `Tx::BatchSpend` Quartic SHA-384 STARK proofs + encrypted memos).
+pub const MAIN_V2_MAX_TX_BYTES: usize = 1_500_000;
 /// Largest encoded transaction any network takes: what a decoder will read, so a block one
 /// node accepts is a block every node can decode.
 pub const TX_BYTES_CAP: usize = MAIN_V2_MAX_TX_BYTES;

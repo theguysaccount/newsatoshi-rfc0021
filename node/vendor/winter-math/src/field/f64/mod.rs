@@ -498,6 +498,51 @@ impl ExtensibleField<3> for BaseElement {
     }
 }
 
+// QUARTIC EXTENSION (NEWSATOSHI patch)
+// ================================================================================================
+
+/// Defines a 256-bit quartic extension of Goldilocks `F_p` over the irreducible binomial
+/// `x^4 - 7` (irreducible because `p ≡ 1 (mod 4)` and `7` is a quadratic non-residue mod `p`).
+/// Frobenius acts diagonally with `γ = 7^((p - 1)/4) = 2^48 mod p` (`γ^2 = -1 mod p`):
+/// `φ^p = γ·φ`, `(φ^2)^p = -φ^2`, `(φ^3)^p = -γ·φ^3`.
+impl ExtensibleField<4> for BaseElement {
+    #[inline(always)]
+    fn mul(a: [Self; 4], b: [Self; 4]) -> [Self; 4] {
+        let c0 = a[0] * b[0] + (a[1] * b[3] + a[2] * b[2] + a[3] * b[1]).mul_small(7);
+        let c1 = a[0] * b[1] + a[1] * b[0] + (a[2] * b[3] + a[3] * b[2]).mul_small(7);
+        let c2 = a[0] * b[2] + a[1] * b[1] + a[2] * b[0] + (a[3] * b[3]).mul_small(7);
+        let c3 = a[0] * b[3] + a[1] * b[2] + a[2] * b[1] + a[3] * b[0];
+        [c0, c1, c2, c3]
+    }
+
+    #[inline(always)]
+    fn square(a: [Self; 4]) -> [Self; 4] {
+        let a0a1 = a[0] * a[1];
+        let a0a2 = a[0] * a[2];
+        let a0a3 = a[0] * a[3];
+        let a1a2 = a[1] * a[2];
+        let a1a3 = a[1] * a[3];
+        let a2a3 = a[2] * a[3];
+        let c0 = a[0].square() + (a1a3.double() + a[2].square()).mul_small(7);
+        let c1 = a0a1.double() + a2a3.double().mul_small(7);
+        let c2 = a0a2.double() + a[1].square() + a[3].square().mul_small(7);
+        let c3 = (a0a3 + a1a2).double();
+        [c0, c1, c2, c3]
+    }
+
+    #[inline(always)]
+    fn mul_base(a: [Self; 4], b: Self) -> [Self; 4] {
+        [a[0] * b, a[1] * b, a[2] * b, a[3] * b]
+    }
+
+    #[inline(always)]
+    fn frobenius(x: [Self; 4]) -> [Self; 4] {
+        // γ = 7^((p-1)/4) mod p = 2^48 = 281474976710656
+        const GAMMA: BaseElement = BaseElement::new(281_474_976_710_656);
+        [x[0], x[1] * GAMMA, -x[2], -(x[3] * GAMMA)]
+    }
+}
+
 // TYPE CONVERSIONS
 // ================================================================================================
 

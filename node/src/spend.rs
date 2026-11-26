@@ -770,6 +770,12 @@ pub fn build_trace(wit: &SpendWitness) -> TraceTable<Felt> {
 pub struct Profile {
     /// Queries per proof.
     pub queries: usize,
+    /// LDE blowup factor (16 for Cubic v0.1, 8 for Quartic 256-bit Mainnet v2).
+    pub blowup: usize,
+    /// Query-seed grinding bits (16 for v0.1, 20 for Mainnet v2).
+    pub grinding: u32,
+    /// Extension field for composition/FRI (`Cubic` 192-bit for v0.1, `Quartic` 256-bit for Mainnet v2).
+    pub extension: FieldExtension,
     /// The network's name inside its proofs: bytes that follow `ZK_META` in the trace's
     /// metadata, which every proof states in its first bytes and binds into its
     /// transcript. A proof made for one network is then no proof on any other, whatever
@@ -784,19 +790,54 @@ pub struct Profile {
 }
 
 /// The test network's proofs (and regtest's): 64 queries, about 249 KB.
-pub const TEST: Profile = Profile { queries: 64, tag: b"", unmasked: true, max_proof_bytes: MAX_PROOF_BYTES, sha384: false };
+pub const TEST: Profile = Profile {
+    queries: 64,
+    blowup: 16,
+    grinding: 16,
+    extension: FieldExtension::Cubic,
+    tag: b"",
+    unmasked: true,
+    max_proof_bytes: MAX_PROOF_BYTES,
+    sha384: false,
+};
 
 /// The main network's proofs: `MAIN_QUERIES` queries, about 460 KB, masked only.
-pub const MAIN: Profile = Profile { queries: MAIN_QUERIES, tag: b"/main", unmasked: false, max_proof_bytes: MAIN_MAX_PROOF_BYTES, sha384: false };
+pub const MAIN: Profile = Profile {
+    queries: MAIN_QUERIES,
+    blowup: 16,
+    grinding: 16,
+    extension: FieldExtension::Cubic,
+    tag: b"/main",
+    unmasked: false,
+    max_proof_bytes: MAIN_MAX_PROOF_BYTES,
+    sha384: false,
+};
 
 /// The rehearsal network's proofs: the main network's in everything but the name.
-pub const DRY: Profile = Profile { queries: MAIN_QUERIES, tag: b"/dry", unmasked: false, max_proof_bytes: MAIN_MAX_PROOF_BYTES, sha384: false };
+pub const DRY: Profile = Profile {
+    queries: MAIN_QUERIES,
+    blowup: 16,
+    grinding: 16,
+    extension: FieldExtension::Cubic,
+    tag: b"/dry",
+    unmasked: false,
+    max_proof_bytes: MAIN_MAX_PROOF_BYTES,
+    sha384: false,
+};
 
 impl Profile {
-    /// Blowup 16, 16 bits of grinding, the cubic extension, FRI folding by 8 (`options`),
-    /// with this network's number of queries.
+    /// Proof options for this profile (FRI folding by 8, remainder degree 31, linear batching).
     pub fn options(&self) -> ProofOptions {
-        ProofOptions::new(self.queries, 16, 16, FieldExtension::Cubic, 8, 31, BatchingMethod::Linear, BatchingMethod::Linear)
+        ProofOptions::new(
+            self.queries,
+            self.blowup,
+            self.grinding,
+            self.extension,
+            8,
+            31,
+            BatchingMethod::Linear,
+            BatchingMethod::Linear,
+        )
     }
 
     /// The trace metadata of this network's proofs.
@@ -1150,7 +1191,15 @@ fn verified_cache() -> &'static std::sync::Mutex<std::collections::HashSet<[u8; 
 }
 
 fn cache_key(profile: &Profile, pi: &SpendPublic, proof: &[u8]) -> [u8; 32] {
-    let rules = [profile.queries as u8, profile.unmasked as u8, profile.sha384 as u8, profile.tag.len() as u8];
+    let rules = [
+        profile.queries as u8,
+        profile.blowup as u8,
+        profile.grinding as u8,
+        profile.extension as u8,
+        profile.unmasked as u8,
+        profile.sha384 as u8,
+        profile.tag.len() as u8,
+    ];
     hash::sha256(&[rules.as_slice(), profile.tag, &(profile.max_proof_bytes as u64).to_le_bytes(), pi.to_bytes().as_slice(), proof].concat())
 }
 
@@ -1191,14 +1240,25 @@ pub fn main_options() -> ProofOptions {
 /// Largest proof the main network accepts. Proofs at its parameters measure about 460 KB.
 pub const MAIN_MAX_PROOF_BYTES: usize = 520_000;
 
-/// Largest Mainnet v2 SHA-384 proof (384-bit FRI commitments + 128 queries + ZK masking).
-pub const MAIN_V2_MAX_PROOF_BYTES: usize = 700_000;
+/// Queries per proof on Mainnet v2: 152 queries at blowup 8, 20-bit grinding, 256-bit
+/// Quartic Goldilocks (`F_{p^4} = F_p[x]/(x^4 - 7)`), and 384-bit SHA-384 commitments.
+/// Achieves >= 200 unclipped algebraic LDR bits (192 classical SHA-384) and **>= 100
+/// conservative QROM (CMS19) quantum bits** across K=1..=16 (104 bits K=1, 101 bits K=8,
+/// 100 bits K=16) alongside 128-bit BHT QROM SHA-384 collision resistance!
+pub const MAIN_V2_QUERIES: usize = 152;
 
-/// Mainnet v2 spend profile: 128 queries, 384-bit SHA-384 FRI/Merkle commitments (192-bit
-/// classical / 128-bit BHT QROM hash collision bound), Haböck–Al Kindi ZK segment masking.
+/// Largest Mainnet v2 Quartic SHA-384 single-spend proof (256-bit Quartic FRI + 152 queries + ZK masking).
+pub const MAIN_V2_MAX_PROOF_BYTES: usize = 850_000;
+
+/// Mainnet v2 spend profile: 152 queries, blowup 8, 20-bit grinding, 256-bit Quartic Goldilocks
+/// extension (`F_{p^4}`), 384-bit SHA-384 FRI/Merkle commitments (`>= 100` conservative CMS19 QROM
+/// quantum bits across `K = 1..=16`, 192-bit classical / 128-bit BHT QROM hash), Haböck–Al Kindi ZK masking.
 pub const MAIN_V2: Profile = Profile {
-    queries: MAIN_QUERIES,
-    tag: b"/main-v2-sha384",
+    queries: MAIN_V2_QUERIES,
+    blowup: 8,
+    grinding: 20,
+    extension: FieldExtension::Quartic,
+    tag: b"/main-v2-qrom100",
     unmasked: false,
     max_proof_bytes: MAIN_V2_MAX_PROOF_BYTES,
     sha384: true,
@@ -1324,4 +1384,38 @@ pub fn verify_with(pi: &SpendPublic, proof: &Proof, options: ProofOptions) -> Re
     }
     let acceptable = winterfell::AcceptableOptions::OptionSet(vec![options]);
     winterfell::verify::<SpendAir, Hash, Coin, Vc>(proof.clone(), pi.clone(), &acceptable).map_err(|e| format!("{e}"))
+}
+
+#[cfg(test)]
+mod quartic_tests {
+    use super::*;
+    use winterfell::math::fields::QuartExtension;
+
+    #[test]
+    fn quartic_goldilocks_field_axioms_frobenius_and_inversion() {
+        let mut rng = rand::thread_rng();
+        let rf = |r: &mut rand::rngs::ThreadRng| {
+            QuartExtension::<Felt>::new(
+                Felt::new(r.gen::<u64>() % Felt::MODULUS),
+                Felt::new(r.gen::<u64>() % Felt::MODULUS),
+                Felt::new(r.gen::<u64>() % Felt::MODULUS),
+                Felt::new(r.gen::<u64>() % Felt::MODULUS),
+            )
+        };
+        for _ in 0..32 {
+            let a = rf(&mut rng);
+            let b = rf(&mut rng);
+            let c = rf(&mut rng);
+            assert_eq!(a * b, b * a);
+            assert_eq!((a * b) * c, a * (b * c));
+            assert_eq!(a * (b + c), a * b + a * c);
+            assert_eq!(a.square(), a * a);
+            if a != QuartExtension::ZERO {
+                assert_eq!(a * a.inv(), QuartExtension::ONE);
+            }
+            assert_eq!(a.conjugate(), a.exp(Felt::MODULUS));
+            assert_eq!((a * b).conjugate(), a.conjugate() * b.conjugate());
+            assert_eq!((a + b).conjugate(), a.conjugate() + b.conjugate());
+        }
+    }
 }

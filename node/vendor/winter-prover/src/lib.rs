@@ -56,7 +56,7 @@ use fri::FriProver;
 pub use math;
 use math::{
     fft::infer_degree,
-    fields::{CubeExtension, QuadExtension},
+    fields::{CubeExtension, QuadExtension, QuartExtension},
     ExtensibleField, FieldElement, StarkField, ToElements,
 };
 use tracing::{event, info_span, instrument, Level};
@@ -126,7 +126,7 @@ const DEFAULT_SEGMENT_WIDTH: usize = 8;
 /// generation can be delegated to non-CPU hardware (e.g., GPUs).
 pub trait Prover {
     /// Base field for the computation described by this prover.
-    type BaseField: StarkField + ExtensibleField<2> + ExtensibleField<3>;
+    type BaseField: StarkField + ExtensibleField<2> + ExtensibleField<3> + ExtensibleField<4>;
 
     /// Algebraic intermediate representation (AIR) for the computation described by this prover.
     type Air: Air<BaseField = Self::BaseField>;
@@ -269,6 +269,13 @@ pub trait Prover {
                     return Err(ProverError::UnsupportedFieldExtension(3));
                 }
                 maybe_await!(self.generate_proof::<CubeExtension<Self::BaseField>>(trace))
+            },
+            // NEWSATOSHI patch: 256-bit Quartic Goldilocks extension (`F_{p^4}`)
+            FieldExtension::Quartic => {
+                if !<QuartExtension<Self::BaseField>>::is_supported() {
+                    return Err(ProverError::UnsupportedFieldExtension(4));
+                }
+                maybe_await!(self.generate_proof::<QuartExtension<Self::BaseField>>(trace))
             },
         }
     }

@@ -236,10 +236,12 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
     let t_single = std::time::Instant::now();
     let (_, single_proof) = spend::prove_for(&params.proof, &base_wit, [1; 8]).unwrap();
     let single_ms = t_single.elapsed().as_millis();
+    let single_qrom = single_proof.proven_security::<spend::Hash384>().qrom_ldr_bits(384);
+    assert!(single_qrom >= 100, "MAIN_V2 K=1 must achieve >= 100 conservative QROM bits, got {single_qrom}");
     let single_bytes = single_proof.to_bytes().len();
 
     // Helper to build a K-spend `Tx::BatchSpend` from Alice's first `k` unspent notes
-    let make_batch = |chain: &Chain, k: usize| -> (Tx, usize, u128, u128) {
+    let make_batch = |chain: &Chain, k: usize| -> (Tx, usize, u128, u128, u32) {
         let mut rng = rand::thread_rng();
         let mut wits = Vec::with_capacity(k);
         let mut binds = Vec::with_capacity(k);
@@ -273,6 +275,8 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
         let t0 = std::time::Instant::now();
         let (bpi, proof) = batch_spend::prove_batch_for(&params.proof, &wits, &binds, prover.a_pk()).unwrap();
         let prove_ms = t0.elapsed().as_millis();
+        let qrom = proof.proven_security::<spend::Hash384>().qrom_ldr_bits(384);
+        assert!(qrom >= 100, "MAIN_V2 K={k} BatchSpend must achieve >= 100 conservative QROM bits, got {qrom}");
         let pbytes = proof.to_bytes();
         let tv = std::time::Instant::now();
         batch_spend::verify_batch_bytes_for(&params.proof, &bpi, &pbytes).unwrap();
@@ -282,13 +286,13 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
             prover_a_pk: prover.a_pk(),
             proof: pbytes.clone(),
         });
-        (tx, pbytes.len(), prove_ms, verify_ms)
+        (tx, pbytes.len(), prove_ms, verify_ms, qrom)
     };
 
     // Benchmark K = 4 SHA-384 BatchSpend
-    let (_batch4_tx, b4_bytes, b4_prove_ms, b4_verify_ms) = make_batch(&chain, 4);
+    let (_batch4_tx, b4_bytes, b4_prove_ms, b4_verify_ms, b4_qrom) = make_batch(&chain, 4);
     println!(
-        "[MAIN_V2 SHA-384 BENCH] K=1: {single_bytes} B ({single_ms} ms) | K=4: {b4_bytes} B ({} B/spend, {:.2}x compression, prove={b4_prove_ms} ms, verify={b4_verify_ms} ms)",
+        "[MAIN_V2 QUARTIC SHA-384 BENCH] K=1: {single_bytes} B ({single_ms} ms, QROM={single_qrom}b) | K=4: {b4_bytes} B ({} B/spend, {:.2}x compression, prove={b4_prove_ms} ms, verify={b4_verify_ms} ms, QROM={b4_qrom}b)",
         b4_bytes / 4,
         (single_bytes * 4) as f64 / b4_bytes as f64
     );
@@ -299,11 +303,11 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
     );
 
     // Benchmark K = 8 SHA-384 BatchSpend (proves 8 full 2-in/2-out spends in ONE SHA-384 STARK!)
-    let (batch8_tx, b8_bytes, b8_prove_ms, b8_verify_ms) = make_batch(&chain, 8);
+    let (batch8_tx, b8_bytes, b8_prove_ms, b8_verify_ms, b8_qrom) = make_batch(&chain, 8);
     let tx8_wire = batch8_tx.to_bytes();
     assert_eq!(Tx::from_bytes(&tx8_wire).unwrap(), batch8_tx);
     println!(
-        "[MAIN_V2 SHA-384 BENCH] K=8: {b8_bytes} B ({} B/spend, {:.2}x compression, wire={} B, prove={b8_prove_ms} ms, verify={b8_verify_ms} ms, fits ~{} spends per 8 MB block!)",
+        "[MAIN_V2 QUARTIC SHA-384 BENCH] K=8: {b8_bytes} B ({} B/spend, {:.2}x compression, wire={} B, prove={b8_prove_ms} ms, verify={b8_verify_ms} ms, QROM={b8_qrom}b, fits ~{} spends per 8 MB block!)",
         b8_bytes / 8,
         (single_bytes * 8) as f64 / b8_bytes as f64,
         tx8_wire.len(),

@@ -375,12 +375,22 @@ fn frontier_utreexo_tracked_proof_spends_in_stark_plus_pruned_kv_and_sha384_recu
     assert_eq!(start_prev, chain.genesis);
     assert_eq!(end_hash, chain.tip().hash);
     assert_eq!(count, 8);
-    assert!(sec >= 140);
+    assert!(sec >= 100, "expected >= 100 conservative QROM (CMS19) bits, got {sec}");
+
+    // Also verify real STARK-in-STARK IVC folding of the two mined header segments into ONE proof!
+    let o1 = newsatoshi::recursion::prove_outer_header_segment(&s1).unwrap();
+    let o2 = newsatoshi::recursion::prove_outer_header_segment(&s2).unwrap();
+    let (rpi, rproof) =
+        newsatoshi::recursion::prove_recursive_chain_fold((&o1.0, &o1.1), (&o2.0, &o2.1)).unwrap();
+    let rqrom = newsatoshi::recursion::verify_recursive_chain_fold(&rpi, &rproof).unwrap();
+    assert!(rqrom >= 100, "recursive STARK-in-STARK IVC must prove >= 100 QROM bits, got {rqrom}");
+    assert_eq!(newsatoshi::hash::words_to_bytes(&rpi.start_prev_words), chain.genesis);
+    assert_eq!(newsatoshi::hash::words_to_bytes(&rpi.end_hash_words), chain.tip().hash);
 
     let mut steps = Vec::new();
     let (mut x, mut fp, mut fn_) = (Felt::new(11), Felt::new(333), Felt::new(777));
     let inv2 = Felt::new(2).inv();
-    for r in 0..8u64 {
+    for r in 0..32u64 {
         let alpha = Felt::new(42 + r * 19);
         steps.push(FriFoldStep { x, f_pos: fp, f_neg: fn_, alpha, next_is_neg: r % 2 == 0 });
         let folded = (fp + fn_) * inv2 + alpha * (fp - fn_) * (Felt::new(2) * x).inv();
@@ -394,5 +404,5 @@ fn frontier_utreexo_tracked_proof_spends_in_stark_plus_pruned_kv_and_sha384_recu
         }
     }
     let (fpi, fproof) = prove_fri_folding(&steps).unwrap();
-    assert!(verify_fri_folding(&fpi, &fproof).unwrap() >= 150);
+    assert!(verify_fri_folding(&fpi, &fproof).unwrap() >= 100);
 }

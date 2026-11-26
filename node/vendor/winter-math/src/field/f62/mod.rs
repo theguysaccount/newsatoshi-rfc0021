@@ -389,6 +389,14 @@ impl ExtensibleField<3> for BaseElement {
     }
 }
 
+// NEWSATOSHI patch: quartic extension stub for f62 (only f64 Goldilocks implements QuartExtension)
+impl ExtensibleField<4> for BaseElement {
+    fn mul(_a: [Self; 4], _b: [Self; 4]) -> [Self; 4] { unimplemented!() }
+    fn mul_base(_a: [Self; 4], _b: Self) -> [Self; 4] { unimplemented!() }
+    fn frobenius(_x: [Self; 4]) -> [Self; 4] { unimplemented!() }
+    fn is_supported() -> bool { false }
+}
+
 // TYPE CONVERSIONS
 // ================================================================================================
 

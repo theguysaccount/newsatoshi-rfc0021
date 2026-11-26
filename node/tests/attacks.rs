@@ -163,7 +163,7 @@ fn f2_padded_and_oversized_transactions_are_refused_everywhere() {
     let huge = respond(20);
     assert!(huge.to_bytes().len() > n.chain.params.max_tx_bytes);
     assert!(huge.to_bytes().len() <= newsatoshi::params::TX_BYTES_CAP);
-    let over_cap = respond(45);
+    let over_cap = respond(50);
     assert!(over_cap.to_bytes().len() > newsatoshi::params::TX_BYTES_CAP);
     assert!(Tx::from_bytes(&over_cap.to_bytes()).is_err());
     let err = n.chain.template(vec![], vec![huge.clone()], vec![]).unwrap_err();
