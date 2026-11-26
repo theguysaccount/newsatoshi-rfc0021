@@ -12,7 +12,6 @@
 //! 4. On any missing file, corruption, or digest mismatch, `Chain::open` transparently falls back
 //!    to replaying `blocks.dat` from genesis.
 
-use crate::bond::TrustBond;
 use crate::chain::Entry;
 use crate::channel::{Channel, ChannelEnd};
 use crate::codec::{Reader, Res, Writer};
@@ -21,10 +20,9 @@ use crate::hash::{sha256, Word8};
 use crate::job::Job;
 use crate::lock::{Lock, LockEnd};
 use crate::merkmap::MerkleMap;
-use crate::mission::MissionPool;
 use crate::nftree::NfTree;
 use crate::note::NoteTree;
-use crate::rollup::RollupVault;
+use crate::prior::{PriorEnd, PriorLock};
 use crate::state::State;
 use crate::tx::PlainOut;
 use primitive_types::U256;
@@ -35,7 +33,7 @@ use std::path::Path;
 
 pub const SNAPSHOT_FILE: &str = "state.snap";
 pub const SNAPSHOT_INTERVAL: u32 = 50;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP04";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP05";
 const MAX_SNAPSHOT_ITEMS: usize = 10_000_000;
 
 /// Metadata for one active block (heights `1..=tip`) stored inside `blocks.dat`.
@@ -207,22 +205,25 @@ fn encode_state(st: &State, w: &mut Writer) {
         }
     }
 
-    // RFC-0024 Universal Trust Bonds (bonds_merkle is canonical & rebuilt on load)
-    w.u32(st.bonds.len() as u32);
-    for b in st.bonds.values() {
-        b.encode(w);
+    // Priorism-FEP open PriorLocks (priors_merkle is canonical & rebuilt on load) + prior_ends
+    w.u32(st.priors.len() as u32);
+    for pl in st.priors.values() {
+        pl.encode(w);
     }
-
-    // RFC-0023 Sovereign L2 Rollup Vaults (rollups_merkle is canonical & rebuilt on load)
-    w.u32(st.rollups.len() as u32);
-    for rv in st.rollups.values() {
-        rv.encode(w);
-    }
-
-    // RFC-0027 Mission Launchpads & Swarm Pools (missions_merkle is canonical & rebuilt on load)
-    w.u32(st.missions.len() as u32);
-    for m in st.missions.values() {
-        m.encode(w);
+    w.u32(st.prior_ends.len() as u32);
+    for (id, e) in &st.prior_ends {
+        w.raw(id);
+        e.prior.encode(w);
+        w.u32(e.height);
+        match &e.disconfirmed {
+            Some((ev, addr, bounty, burned)) => {
+                w.bool(true).raw(ev).word8(addr).u64(*bounty).u64(*burned);
+            }
+            None => {
+                w.bool(false);
+            }
+        }
+        w.u64(e.miner_fee);
     }
 
     // FlyClient consensus Header MMR commitment + last_header
@@ -405,34 +406,28 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         channels_by_tip.insert(tip, ids);
     }
 
-    // RFC-0024 Universal Trust Bonds + canonical MerkleMap
-    let n_bonds = read_count(r)?;
-    let mut bonds = imbl::OrdMap::new();
-    let mut bonds_merkle = MerkleMap::new();
-    for _ in 0..n_bonds {
-        let b = TrustBond::decode(r)?;
-        bonds_merkle.insert(b.id, b.value_hash());
-        bonds.insert(b.id, b);
+    // Priorism-FEP open PriorLocks + canonical MerkleMap + prior_ends
+    let n_priors = read_count(r)?;
+    let mut priors = imbl::OrdMap::new();
+    let mut priors_merkle = MerkleMap::new();
+    for _ in 0..n_priors {
+        let pl = PriorLock::decode(r)?;
+        priors_merkle.insert(pl.id, pl.value_hash());
+        priors.insert(pl.id, pl);
     }
-
-    // RFC-0023 Sovereign L2 Rollup Vaults + canonical MerkleMap
-    let n_rollups = read_count(r)?;
-    let mut rollups = imbl::OrdMap::new();
-    let mut rollups_merkle = MerkleMap::new();
-    for _ in 0..n_rollups {
-        let rv = RollupVault::decode(r)?;
-        rollups_merkle.insert(rv.id, rv.value_hash());
-        rollups.insert(rv.id, rv);
-    }
-
-    // RFC-0027 Mission Launchpads + canonical MerkleMap
-    let n_missions = read_count(r)?;
-    let mut missions = imbl::OrdMap::new();
-    let mut missions_merkle = MerkleMap::new();
-    for _ in 0..n_missions {
-        let m = MissionPool::decode(r)?;
-        missions_merkle.insert(m.id, m.value_hash());
-        missions.insert(m.id, m);
+    let n_pe = read_count(r)?;
+    let mut prior_ends = imbl::HashMap::new();
+    for _ in 0..n_pe {
+        let id = r.arr()?;
+        let prior = PriorLock::decode(r)?;
+        let h = r.u32()?;
+        let disconfirmed = if r.bool()? {
+            Some((r.arr()?, r.word8()?, r.u64()?, r.u64()?))
+        } else {
+            None
+        };
+        let miner_fee = r.u64()?;
+        prior_ends.insert(id, PriorEnd { prior, height: h, disconfirmed, miner_fee });
     }
 
     // FlyClient consensus Header MMR + last_header
@@ -468,12 +463,9 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         channels_merkle,
         channel_ends,
         channels_by_tip,
-        bonds,
-        bonds_merkle,
-        rollups,
-        rollups_merkle,
-        missions,
-        missions_merkle,
+        priors,
+        priors_merkle,
+        prior_ends,
         mmr_committed,
         header_mmr,
         last_header,

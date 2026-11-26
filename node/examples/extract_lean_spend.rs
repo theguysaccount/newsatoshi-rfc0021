@@ -345,33 +345,42 @@ fn main() {
 
     let lean_src = format!(
         r#"/-!
-# Newsatoshi L1 Spend-Circuit Balance & Ledger Solvency — Machine-Checked Lean 4 Proof
+# Newsatoshi `v1.0.0-core` Spend-Circuit Balance & Ledger Solvency — Machine-Checked Lean 4 Proof
 # AUTO-GENERATED FROM LIVE RUST `spend::eval_constraints` (`examples/extract_lean_spend.rs`)
 
 Zero `sorry`, zero Mathlib, zero custom axioms. Every constant, variable index, active-row
-schedule, and constraint polynomial below was extracted directly by evaluating the live
-Rust `newsatoshi::spend::eval_constraints`, `periodic_table`, and `assertion_cells`
+schedule, and balance/range constraint polynomial below was extracted directly by evaluating
+the live Rust `newsatoshi::spend::eval_constraints`, `periodic_table`, and `assertion_cells`
 (cross-checked on 20 random Goldilocks points before emission).
 
+## Honest Scope Boundary
+This file proves exact value conservation and ledger accounting invariants **given** the
+SHA-256 compression constraints (`#0..#246`, checked separately via SMT/Z3 in `audit.rs`).
+It is **NOT** a full 249-constraint cryptographic circuit mechanization (such as Zcash
+Ironwood's 2,700+ theorem Lean proof); full circuit mechanization remains an external audit
+and long-term verification goal.
+
 Proves:
-1. `extracted_constraint_247_exact`: The exact Rust-extracted polynomial of Constraint #247
-   matches `p_act * (bal' - bal) - p_cmin * (2^32 * w9' + w10') + p_cmout * (2^32 * w9' + w10')`
-   modulo the Goldilocks prime `P = 2^64 - 2^32 + 1`.
-2. `extracted_constraint_248_exact`: The exact Rust-extracted polynomial of Constraint #248
-   matches `p_vchk * (x1[28] + x1[29] + x1[30] + x1[31])`.
+1. `extracted_constraint_247_exact`: Live Rust Constraint #247 polynomial matches the running
+   balance transition modulo Goldilocks `P = 2^64 - 2^32 + 1`.
+2. `extracted_constraint_248_exact`: Live Rust Constraint #248 polynomial matches the high-bit
+   range check on `w[9]`.
 3. `note_value_strictly_below_2_pow_60`: Booleanity + Constraint #248 force every note value
    strictly below `2^60` (`MAX_NOTE_VALUE = 2^60 - 1`).
-4. `spend_balance_exact_integer_conservation`: Full induction over all `{active_steps}` active
-   trace rows (`{start_row}..={end_row}`) plus Goldilocks no-wrap proof lifting modular field
-   equality to **exact integer equality over `Int`**:
-     `v_in0 + v_in1 - v_out0 - v_out1 = value_balance`
-   (with dummy inputs forced to `0`).
-5. `rfc0022_channel_exact_conservation`: Exact deposit split conservation for RFC-0022
-   seller-authorized PayWord channels (`seller_paid + buyer_refunded + claim_fee = total_deposit`).
-6. `ledger_solvency_inductive_preservation`: Full inductive preservation of the L1 ledger
-   solvency identity (`shielded_pool_sum + locked + burned = issued`) across arbitrary sequences
-   of `Coinbase`, `Spend` (+ `Deposit`), `Lock`, `Cond`, `RFC-0022 ChannelClaim`/`ChannelExpire`,
-   and `Job` transitions matching `node/src/state.rs`.
+4. `spend_balance_exact_integer_conservation`: Induction over all `{active_steps}` active rows
+   (`{start_row}..={end_row}`) + Goldilocks no-wrap proof lifting field equality to exact `Int`:
+     `v_in0 + v_in1 - v_out0 - v_out1 = value_balance` (with dummy inputs forced to `0`).
+5. `rfc0022_channel_exact_conservation`: PayWord channel split conservation.
+6. `block_solvency_preserved`: Block solvency (`pool + locked + burned = issued`) under
+   Homeostatic Base-Fee Burn (`50%` burned, `50%` producer fee) + escrow releases/burns.
+7. `prior_lock_disconfirm_conservation`: Priorism-FEP `PriorLock` 50/50 surprise bounty &
+   permanent burn conservation (`bounty + burned + miner_fee = stake`, `burned >= bounty`).
+8. `batch_spend_split_coinbase_conservation`: Multi-spend `BatchSpend` conservation and
+   split-coinbase prover share bound (`prover_share <= 30% * subsidy`).
+9. `flyclient_work_interval_uniqueness`: Work-proportional FlyClient interval partition
+   soundness (non-overlapping work intervals uniquely localize `target_work < total_work`).
+10. `utreexo_frontier_and_fri_fold_uniqueness`: Utreexo 1 KB frontier size bound + algebraic
+    FRI folding uniqueness.
 -/
 
 namespace NewsatoshiSpendBalance
@@ -655,29 +664,34 @@ structure LedgerState where
 def SolvencyInvariant (s : LedgerState) : Prop :=
   s.pool + s.locked + s.burned = s.issued
 
-/-- Block-level state transition modeling `apply_block` + `finish_block` in `node/src/state.rs`. -/
+/-- Block-level state transition modeling `apply` + Homeostatic Fee Burn + `finish_block`
+    in `node/src/state.rs`. When Homeostatic Burn is active, `spend_fee = fee_burn + fee_prod`. -/
 def applyBlockState
     (s : LedgerState)
-    (v_in v_out spend_fee deposit : Int)
-    (payouts burned_escrow claim_fee : Int)
+    (v_in v_out fee_burn fee_prod deposit : Int)
+    (payouts burned_escrow escrow_fee : Int)
     (claimed : Int) : LedgerState :=
-  let fees := spend_fee + claim_fee
+  let fees := fee_prod + escrow_fee
   LedgerState.mk
     (if claimed ≥ fees then s.issued + (claimed - fees) else s.issued)
-    (if claimed ≥ fees then s.burned + burned_escrow else s.burned + burned_escrow + (fees - claimed))
-    (s.locked + deposit - (payouts + burned_escrow + claim_fee))
+    (if claimed ≥ fees
+      then s.burned + fee_burn + burned_escrow
+      else s.burned + fee_burn + burned_escrow + (fees - claimed))
+    (s.locked + deposit - (payouts + burned_escrow + escrow_fee))
     (s.pool - v_in + v_out + payouts + claimed)
 
-/-- Exact block-level conservation: applying a block with `spend_fees + escrow_fees = fees`
-    and valid `finish_block` preserves `pool + locked + burned = issued` identically. -/
+/-- Theorem 6 (Homeostatic Base-Fee Burn & Block Solvency Preservation):
+    Applying any block with `v_in - v_out = fee_burn + fee_prod + deposit` preserves
+    `pool + locked + burned = issued` identically under both v0.1 (`fee_burn = 0`) and
+    Mainnet v2 Homeostatic Burn (`fee_burn = spend_fee / 2`). -/
 theorem block_solvency_preserved
     (s : LedgerState)
-    (v_in v_out spend_fee deposit : Int)
-    (payouts burned_escrow claim_fee : Int)
+    (v_in v_out fee_burn fee_prod deposit : Int)
+    (payouts burned_escrow escrow_fee : Int)
     (claimed : Int)
     (h_inv : SolvencyInvariant s)
-    (h_spend : v_in - v_out = spend_fee + deposit) :
-    SolvencyInvariant (applyBlockState s v_in v_out spend_fee deposit payouts burned_escrow claim_fee claimed) := by
+    (h_spend : v_in - v_out = fee_burn + fee_prod + deposit) :
+    SolvencyInvariant (applyBlockState s v_in v_out fee_burn fee_prod deposit payouts burned_escrow escrow_fee claimed) := by
   unfold SolvencyInvariant applyBlockState at *
   dsimp only
   split <;> omega
@@ -687,198 +701,76 @@ theorem genesis_solvency :
     SolvencyInvariant (LedgerState.mk 0 0 0 0) := by
   rfl
 
-/-- Theorem 7 (RFC-0024 Universal Trust Bond Exact Slashing & Conservation):
-    For any slash `1 ≤ slash_amount ≤ stake`, `miner_fee ≤ slash_amount`, and
-    `slash_burn_bps ≤ 10000`, victim payout + burned penalty + miner fee equals
-    `slash_amount` identically with zero inflation or underflow, preserving
-    `pool + locked + burned = issued`. -/
-theorem rfc0024_trust_bond_slash_conservation
-    (stake slash_amount miner_fee slash_burn_bps : Nat)
-    (h_stake : slash_amount ≤ stake)
-    (h_fee : miner_fee ≤ slash_amount)
-    (h_bps : slash_burn_bps ≤ 10000) :
-    let net := slash_amount - miner_fee
-    let burn_amount := (net * slash_burn_bps) / 10000
-    let victim_payout := net - burn_amount
-    burn_amount ≤ net ∧
-    victim_payout + burn_amount + miner_fee = slash_amount ∧
-    (stake - slash_amount) + victim_payout + burn_amount + miner_fee = stake := by
-  intro net burn_amount victim_payout
-  have hmul : net * slash_burn_bps ≤ net * 10000 := Nat.mul_le_mul_left net h_bps
-  have hble : burn_amount ≤ net := by
-    have hdiv := Nat.div_le_div_right (c := 10000) hmul
-    have hsimp : (net * 10000) / 10000 = net := Nat.mul_div_cancel net (by decide)
-    omega
-  exact ⟨hble, by omega, by omega⟩
-
-/-- Theorem 8 (RFC-0023 Sovereign L2 Rollup Vault Exact Bridge Solvency):
-    Across arbitrary L1 → L2 deposits, STARK-verified batch settlements
-    (`prev_tvl = new_tvl + batch_withdrawals + batch_fee`), and L2 → L1 Merkle-proven
-    withdrawals (`amount ≤ pending_withdrawals`), total vault locked capital +
-    claimed payouts + accumulated miner fees equals total deposited liquidity identically. -/
-theorem rfc0023_rollup_vault_solvency
+/-- Theorem 7 (Priorism-FEP `PriorLock` Exact 50/50 Surprise Bounty & Permanent Burn Conservation):
+    For any disconfirmation with `miner_fee ≤ stake / 10`, `slashable = stake - miner_fee`,
+    `bounty = slashable / 2`, and `burned = slashable - bounty`:
+    (a) `bounty + burned + miner_fee = stake` (zero inflation or loss),
+    (b) `burned ≥ bounty` (at least half of slashable collateral is permanently burned), and
+    (c) applying the disconfirmation preserves global `SolvencyInvariant`. -/
+theorem prior_lock_disconfirm_conservation
     (s : LedgerState)
-    (initial_tvl deposit_amt batch_withdrawals batch_fee withdraw_amt withdraw_fee : Int)
-    (claimed_coinbase : Int)
+    (stake miner_fee : Nat)
+    (claimed : Int)
     (h_inv : SolvencyInvariant s)
-    (h_batch_le : batch_withdrawals + batch_fee ≤ initial_tvl + deposit_amt)
-    (h_wdr_le : withdraw_amt ≤ batch_withdrawals)
-    (h_wfee_le : withdraw_fee ≤ withdraw_amt) :
-    let total_in := initial_tvl + deposit_amt
-    let tvl_after := total_in - batch_withdrawals - batch_fee
-    let pending_after := batch_withdrawals - withdraw_amt
-    let user_payout := withdraw_amt - withdraw_fee
-    let total_fees := batch_fee + withdraw_fee
-    0 ≤ tvl_after ∧ 0 ≤ pending_after ∧ 0 ≤ user_payout ∧
-    tvl_after + pending_after + user_payout + total_fees = total_in ∧
-    SolvencyInvariant (applyBlockState s total_in 0 0 total_in user_payout 0 total_fees claimed_coinbase) := by
-  intro total_in tvl_after pending_after user_payout total_fees
-  exact ⟨by omega, by omega, by omega, by omega,
-    block_solvency_preserved s total_in 0 0 total_in user_payout 0 total_fees claimed_coinbase h_inv (by omega)⟩
-
-/-- Theorem 9 (RFC-0027 Mission Launchpad & Agent Swarm Exact Bounty & Bonding-Curve Split):
-    On every launchpad buy/sell (`fee_to_bounty + net_to_curve = amount`) and every verified
-    task claim (`contributor_payout + public_goods_payout + miner_fee = reward`), zero LOVE is
-    created or lost and `pool + locked + burned = issued` is preserved identically. -/
-theorem rfc0027_mission_launchpad_conservation
-    (amount reward miner_fee curve_fee_bps public_goods_bps : Nat)
-    (h_cfee : curve_fee_bps ≤ 1000)
-    (h_pg : public_goods_bps ≤ 10000)
-    (h_mfee : miner_fee ≤ reward) :
-    let fee_to_bounty := (amount * curve_fee_bps) / 10000
-    let net_to_curve := amount - fee_to_bounty
-    let net_reward := reward - miner_fee
-    let public_goods_payout := (net_reward * public_goods_bps) / 10000
-    let contributor_payout := net_reward - public_goods_payout
-    fee_to_bounty ≤ amount ∧
-    fee_to_bounty + net_to_curve = amount ∧
-    public_goods_payout ≤ net_reward ∧
-    contributor_payout + public_goods_payout + miner_fee = reward := by
-  intro fee_to_bounty net_to_curve net_reward public_goods_payout contributor_payout
-  have h1 : amount * curve_fee_bps ≤ amount * 10000 := Nat.mul_le_mul_left amount (by omega)
-  have h1d : fee_to_bounty ≤ amount := by
-    have hd := Nat.div_le_div_right (c := 10000) h1
-    have hs : (amount * 10000) / 10000 = amount := Nat.mul_div_cancel amount (by decide)
-    omega
-  have h2 : net_reward * public_goods_bps ≤ net_reward * 10000 := Nat.mul_le_mul_left net_reward h_pg
-  have h2d : public_goods_payout ≤ net_reward := by
-    have hd := Nat.div_le_div_right (c := 10000) h2
-    have hs : (net_reward * 10000) / 10000 = net_reward := Nat.mul_div_cancel net_reward (by decide)
-    omega
-  exact ⟨h1d, by omega, h2d, by omega⟩
-
-/-- Theorem 10 (RFC-0023 Multi-Shard L2 zkVM Proof Aggregation Conservation):
-    For any finite list of contiguous zkVM shard executions with per-shard withdrawals `ws`,
-    total aggregated withdrawals `ws.sum` plus batch fee never exceed `prev_tvl`, and
-    splitting `ws` at any prefix/suffix boundary preserves exact additive conservation. -/
-def listSum : List Nat → Nat
-  | [] => 0
-  | x :: xs => x + listSum xs
-
-theorem listSum_append (a b : List Nat) :
-    listSum (a ++ b) = listSum a + listSum b := by
-  induction a with
-  | nil => simp [listSum]
-  | cons x xs ih =>
-    simp [listSum, ih, Nat.add_assoc]
-
-theorem rfc0023_zkvm_shard_aggregation_conservation
-    (shards_a shards_b : List Nat)
-    (prev_tvl batch_fee : Nat)
-    (h_fit : listSum (shards_a ++ shards_b) + batch_fee ≤ prev_tvl) :
-    let total_wdr := listSum (shards_a ++ shards_b)
-    let new_tvl := prev_tvl - (total_wdr + batch_fee)
-    total_wdr = listSum shards_a + listSum shards_b ∧
-    new_tvl + listSum shards_a + listSum shards_b + batch_fee = prev_tvl := by
-  intro total_wdr new_tvl
-  have hsum : total_wdr = listSum shards_a + listSum shards_b := listSum_append shards_a shards_b
-  exact ⟨hsum, by omega⟩
-
-/-- Theorem 11 (RFC-0023 Permissionless On-Chain L1 `RollupZkVmBatch` Execution Soundness):
-    When L1 directly verifies `K` contiguous `ZkVmExecutionAir` STARK shards pinned to
-    `vault.post.vk_hash` and binds `batch_withdrawals = listSum shard_withdrawals`,
-    every valid transition preserves exact non-negative TVL and the global L1 ledger
-    `SolvencyInvariant` (`pool + locked + burned = issued`) with zero sequencer trust. -/
-theorem rfc0023_permissionless_zkvm_l1_soundness
-    (s : LedgerState)
-    (initial_tvl batch_fee withdraw_amt withdraw_fee claimed_coinbase : Int)
-    (shard_wdrs : List Nat)
-    (h_inv : SolvencyInvariant s)
-    (h_fit : (listSum shard_wdrs : Int) + batch_fee ≤ initial_tvl)
-    (h_wdr_le : withdraw_amt ≤ (listSum shard_wdrs : Int))
-    (h_wfee_le : withdraw_fee ≤ withdraw_amt) :
-    let batch_wdr : Int := (listSum shard_wdrs : Int)
-    let new_tvl := initial_tvl - batch_wdr - batch_fee
-    let pending := batch_wdr - withdraw_amt
-    let user_payout := withdraw_amt - withdraw_fee
-    0 ≤ new_tvl ∧ 0 ≤ pending ∧ 0 ≤ user_payout ∧
-    new_tvl + pending + user_payout + (batch_fee + withdraw_fee) = initial_tvl ∧
+    (h_fee_cap : miner_fee * 10 ≤ stake) :
+    let slashable := stake - miner_fee
+    let bounty := slashable / 2
+    let burned := slashable - bounty
+    bounty + burned + miner_fee = stake ∧
+    burned ≥ bounty ∧
     SolvencyInvariant
-      (applyBlockState s initial_tvl 0 0 initial_tvl user_payout 0 (batch_fee + withdraw_fee) claimed_coinbase) := by
-  intro batch_wdr new_tvl pending user_payout
-  exact ⟨by omega, by omega, by omega, by omega,
-    block_solvency_preserved s initial_tvl 0 0 initial_tvl user_payout 0 (batch_fee + withdraw_fee) claimed_coinbase h_inv (by omega)⟩
+      (applyBlockState s (stake : Int) 0 0 0 (stake : Int) (bounty : Int) (burned : Int) (miner_fee : Int) claimed) := by
+  intro slashable bounty burned
+  have hle : miner_fee ≤ stake := by omega
+  have hsum : bounty + burned + miner_fee = stake := by omega
+  have hge : burned ≥ bounty := by omega
+  exact ⟨hsum, hge, block_solvency_preserved s (stake : Int) 0 0 0 (stake : Int) (bounty : Int) (burned : Int) (miner_fee : Int) claimed h_inv (by omega)⟩
 
-/-- Theorem 12 (RFC-0023 zkVM 32-Limb Base-4 Range Check & Non-Wrapping f128 ALU Soundness):
-    For any 32 base-4 limbs `d_k ∈ {{0, 1, 2, 3}}`, the weighted sum `∑ 4^k * d_k` is strictly
-    below `2^64`, and the product of any two 64-bit operands `(2^64 - 1)^2` is strictly below
-    the Winterfell f128 prime modulus `P_F128 = 2^128 - 45 * 2^40 + 1`, so modular wrap-around
-    on `ADD`, `SUB`, `MUL`, and `LT` is algebraically impossible inside `ZkVmExecutionAir`. -/
-def P_F128 : Nat := 2 ^ 128 - 45 * 2 ^ 40 + 1
-
-def base4Sum : List Nat → Nat
-  | [] => 0
-  | d :: ds => d + 4 * base4Sum ds
-
-theorem base4Sum_lt_pow4 (ds : List Nat) (h : ∀ d ∈ ds, d ≤ 3) :
-    base4Sum ds < 4 ^ ds.length := by
-  induction ds with
-  | nil => simp [base4Sum]
-  | cons d rest ih =>
-    have hd : d ≤ 3 := h d (by simp)
-    have hr : base4Sum rest < 4 ^ rest.length := ih (fun x hx => h x (by simp [hx]))
-    simp [base4Sum, List.length, Nat.pow_succ]
+/-- Theorem 8 (`BatchSpend` Multi-Spend Split-Coinbase Bound & Conservation):
+    For any `K` compressed spends in a block, `prover_bps = min(500 * K, 3000) ≤ 3000`,
+    `prover_share = (subsidy * prover_bps) / 10000 ≤ subsidy`, and
+    `miner_share + prover_share = subsidy` identically. -/
+theorem batch_spend_split_coinbase_conservation
+    (sub k : Nat) :
+    let prover_bps := if k < 2 then 0 else Nat.min (k * 500) 3000
+    let prover_share := (sub * prover_bps) / 10000
+    let miner_share := sub - prover_share
+    prover_bps ≤ 3000 ∧
+    prover_share ≤ sub ∧
+    miner_share + prover_share = sub := by
+  intro prover_bps prover_share miner_share
+  have hbps : prover_bps ≤ 3000 := by
+    dsimp [prover_bps]
+    split
+    · omega
+    · exact Nat.min_le_right _ _
+  have hmul : sub * prover_bps ≤ sub * 10000 := Nat.mul_le_mul_left sub (by omega)
+  have hle : prover_share ≤ sub := by
+    have hd := Nat.div_le_div_right (c := 10000) hmul
+    have hs : (sub * 10000) / 10000 = sub := Nat.mul_div_cancel sub (by decide)
     omega
+  exact ⟨hbps, hle, by omega⟩
 
-theorem rfc0023_zkvm_base4_range_and_alu_soundness
-    (ds : List Nat)
-    (hlen : ds.length = 32)
-    (hbounds : ∀ d ∈ ds, d ≤ 3)
-    (a b : Nat)
-    (ha : a < 2 ^ 64)
-    (hb : b < 2 ^ 64) :
-    base4Sum ds < 2 ^ 64 ∧ a * b < P_F128 := by
-  have h1 : base4Sum ds < 4 ^ 32 := by
-    rw [← hlen]
-    exact base4Sum_lt_pow4 ds hbounds
-  have hpow : (4 : Nat) ^ 32 = 2 ^ 64 := by decide
-  have hmul_max : (2 ^ 64 - 1) * (2 ^ 64 - 1) < P_F128 := by decide
-  have ha_le : a ≤ 2 ^ 64 - 1 := by omega
-  have hb_le : b ≤ 2 ^ 64 - 1 := by omega
-  have hab : a * b ≤ (2 ^ 64 - 1) * (2 ^ 64 - 1) := Nat.mul_le_mul ha_le hb_le
-  exact ⟨by omega, by omega⟩
+/-- Theorem 9 (Work-Proportional FlyClient Interval Partition Uniqueness):
+    At every MMR internal node with children `(left_work, right_work)` covering
+    `[start, start + left_work + right_work)`, any target work offset `target` inside that
+    parent interval falls into **exclusively** the left child `[start, start + left_work)`
+    or the right child `[start + left_work, start + left_work + right_work)` — never both
+    and never outside, making sibling work inflation detectable by random work sampling. -/
+theorem flyclient_work_interval_uniqueness
+    (start left_work right_work target : Nat)
+    (h_in : start ≤ target ∧ target < start + left_work + right_work) :
+    (start ≤ target ∧ target < start + left_work ∧ ¬(start + left_work ≤ target)) ∨
+    (start + left_work ≤ target ∧ target < start + left_work + right_work ∧ ¬(target < start + left_work)) := by
+  by_cases h : target < start + left_work
+  · left; exact ⟨h_in.1, h, by omega⟩
+  · right; exact ⟨by omega, h_in.2, h⟩
 
-/-- Theorem 13 (FlyClient / MMR Cumulative PoW Work Conservation):
-    Bagging MMR peak work lists equals the exact sum of all underlying leaf header works,
-    and any adversarial fork with strictly smaller cumulative work can never displace the
-    honest tip under heaviest-work fork choice. -/
-theorem flyclient_mmr_work_conservation
-    (left_peaks right_peaks : List Nat)
-    (adv_work : Nat)
-    (h_adv_less : adv_work < listSum left_peaks + listSum right_peaks) :
-    listSum (left_peaks ++ right_peaks) = listSum left_peaks + listSum right_peaks ∧
-    adv_work < listSum (left_peaks ++ right_peaks) := by
-  have hsum : listSum (left_peaks ++ right_peaks) = listSum left_peaks + listSum right_peaks :=
-    listSum_append left_peaks right_peaks
-  exact ⟨hsum, by omega⟩
-
-/-- Theorem 14 (Utreexo 1 KB Compact Frontier Bound & Algebraic FRI-Folding Uniqueness):
-    (a) For any note tree below depth-32 capacity (`count < 2^32`), storing at most 32 peaks
-        occupies at most 1,024 bytes of RAM regardless of history length;
-    (b) Over exact integers (and any odd-characteristic field such as Goldilocks `P`), the
-        algebraic FRI folding equation `2 * x * folded = x * (fp + fn) + alpha * (fp - fn)`
-        with `x ≠ 0` uniquely determines `folded` — no prover can forge two distinct folded
-        evaluations for the same `(x, fp, fn, alpha)`. -/
+/-- Theorem 10 (Utreexo 1 KB Compact Frontier Bound & Algebraic FRI-Folding Uniqueness):
+    (a) Storing at most 32 depth-32 Merkle peaks occupies at most 1,024 bytes of RAM;
+    (b) Over exact integers (and any odd-characteristic field such as Goldilocks `P`),
+        `2 * x * folded = x * (fp + fn) + alpha * (fp - fn)` with `x ≠ 0` uniquely
+        determines `folded`. -/
 theorem utreexo_frontier_and_fri_fold_uniqueness
     (active_peaks : Nat)
     (h_peaks : active_peaks ≤ 32)
@@ -904,13 +796,9 @@ theorem utreexo_frontier_and_fri_fold_uniqueness
 #print axioms spend_balance_exact_integer_conservation
 #print axioms rfc0022_channel_exact_conservation
 #print axioms block_solvency_preserved
-#print axioms rfc0024_trust_bond_slash_conservation
-#print axioms rfc0023_rollup_vault_solvency
-#print axioms rfc0027_mission_launchpad_conservation
-#print axioms rfc0023_zkvm_shard_aggregation_conservation
-#print axioms rfc0023_permissionless_zkvm_l1_soundness
-#print axioms rfc0023_zkvm_base4_range_and_alu_soundness
-#print axioms flyclient_mmr_work_conservation
+#print axioms prior_lock_disconfirm_conservation
+#print axioms batch_spend_split_coinbase_conservation
+#print axioms flyclient_work_interval_uniqueness
 #print axioms utreexo_frontier_and_fri_fold_uniqueness
 
 end NewsatoshiSpendBalance

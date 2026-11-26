@@ -1,4 +1,4 @@
-name: L1 RFC-0021 CI
+name: Newsatoshi L1 CI
 
 on:
   push:
@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  l1-covenant-stark:
-    name: Newsatoshi L1 + OP_VERIFY_COVENANT_STARK (0xb4)
+  l1-core:
+    name: Newsatoshi L1 Core (Priorism-FEP + Pure SHA-2 STARKs)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
         run: |
           node ../verifier-ts/newsatoshi_verifier.mjs --self-test
           cargo test --lib
-          cargo test --release --test payword_channel --test clearinghouse_substrate --test audit_redteam --test differential_fuzz --test attacks --test discovery --test crypto_kats --test covenant_stark_softfork --test conds --test auxpow --test locks --test light --test mainnet_params --test chain
+          cargo test --release --test priorism_fep_core --test payword_channel --test audit_redteam --test differential_fuzz --test attacks --test discovery --test crypto_kats --test conds --test auxpow --test locks --test light --test mainnet_params --test chain
           cargo build --bin newsatoshi --example channel_http_harness --example extract_lean_spend
           cargo run --release --example extract_lean_spend -- /tmp/SpendBalance.lean
           diff -u proof/SpendBalance.lean /tmp/SpendBalance.lean

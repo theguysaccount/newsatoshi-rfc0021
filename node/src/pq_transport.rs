@@ -1,15 +1,18 @@
-//! Post-Quantum Encrypted P2P Transport (`NSPQ1`: NIST FIPS 203 ML-KEM-768 + SHA-256 AEAD).
+//! Opportunistic Post-Quantum Encrypted P2P Transport (`NSPQ1`: ML-KEM-768 + SHA-256 AEAD).
 //!
-//! Strictly stronger than Bitcoin Core BIP-324 (which uses classical secp256k1 ElligatorSwift
-//! ECDH vulnerable to Harvest-Now-Decrypt-Later quantum traffic capture):
-//! - **Key Exchange:** Ephemeral NIST FIPS 203 `ML-KEM-768` (1,184-byte EK, 1,088-byte CT),
-//!   bound to the network's 4-byte `magic` and both sides' 32-byte nonces in the handshake
-//!   transcript hash (`sha256("NSPQ1-KDF" || magic || ss || init_nonce || resp_nonce || ek || ct)`).
-//! - **Directional Authenticated Encryption:** Independent initiator→responder and
-//!   responder→initiator encryption + MAC keys, monotonic 64-bit sequence counters (blocks
-//!   replay & reordering), SHA-256-CTR stream cipher, and Encrypt-then-MAC keyed SHA-256
-//!   with constant-time 32-byte tag verification (`subtle`-free branchless XOR fold).
-//! - **Pure Post-Quantum Stack:** Zero elliptic curves, zero RSA, zero third-party TLS stack.
+//! Threat model (honest scope — matches Bitcoin Core BIP-324's opportunistic model, upgraded
+//! to post-quantum key exchange):
+//! - **What it protects against:** Passive traffic eavesdropping and Harvest-Now-Decrypt-Later
+//!   (HNDL) quantum traffic capture, plus in-session frame tampering/replay/reordering via
+//!   per-direction Encrypt-then-MAC keys and monotonic 64-bit sequence numbers.
+//! - **What it does NOT protect against by itself:** Active man-in-the-middle (MITM) attacks on
+//!   unauthenticated peer connections. Because the ML-KEM-768 handshake is ephemeral and peers
+//!   are not identity-pinned, preventing active MITM requires out-of-band peer key pinning or
+//!   consensus-level validation (which always verifies PoW + STARKs independently of transport).
+//! - **Wire & Crypto:** Ephemeral NIST FIPS 203 `ML-KEM-768` (1,184-byte EK, 1,088-byte CT),
+//!   bound to network `magic` + both 32-byte nonces (`sha256("NSPQ1-KDF" || ...)`), followed by
+//!   SHA-256-CTR + Encrypt-then-MAC keyed SHA-256 with constant-time tag comparison.
+//!   Wired live into `node::handle_peer` and `node::submit_with_pq` when `params.pq_transport = true`.
 
 use crate::hash::sha256;
 use ::kem::Decapsulate;
@@ -363,7 +366,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn mlkem768_p2p_handshake_encrypts_and_blocks_mitm_and_replay() {
+    fn mlkem768_p2p_handshake_encrypts_and_blocks_tampering_and_replay() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let magic = *b"nsM2";

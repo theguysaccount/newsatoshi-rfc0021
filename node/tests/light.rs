@@ -77,9 +77,7 @@ fn committed(port: u16, lc: &HeaderTip, tamper: bool) -> Result<Word8, String> {
         conds: p.get("conds").map(|l| h32(l.as_str().unwrap())),
         nf_root: p.get("nf_root").map(|l| h32(l.as_str().unwrap())),
         channels: p.get("channels").map(|l| h32(l.as_str().unwrap())),
-        bonds: p.get("bonds").map(|l| h32(l.as_str().unwrap())),
-        rollups: p.get("rollups").map(|l| h32(l.as_str().unwrap())),
-        missions: p.get("missions").map(|l| h32(l.as_str().unwrap())),
+        priors: p.get("priors").map(|l| h32(l.as_str().unwrap())),
         header_mmr: p.get("header_mmr").map(|l| h32(l.as_str().unwrap())),
     };
     if tamper {

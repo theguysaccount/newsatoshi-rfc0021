@@ -1,390 +1,121 @@
-//! Adversarial Red-Team & Audit Boundary Suite for Newsatoshi v2 Consensus Primitives.
+//! Adversarial Red-Team & Audit Boundary Suite for Newsatoshi `v1.0.0-core`.
 //!
-//! Explicitly exercises security invariants and exploit attempts across:
-//! 1. RFC-0023 Sovereign L2 Rollup Vaults (tampered STARKs, bit-flipped proofs, 64-bit TVL
-//!    overflow, replay withdrawal nullifiers, forged Merkle withdrawal paths)
-//! 2. General-Purpose L2 zkVM Execution STARKs & Multi-Shard Aggregation (broken state chain,
-//!    forged final register/state slots, failed ASSERT_EQ, overflow/underflow)
-//! 3. RFC-0024 Universal Trust Bonds (self-attestation wash-trading, identical-payload fake
-//!    equivocation slash, below-quorum/duplicate arbiter slash, premature unbond, over-slash)
-//! 4. RFC-0027 Native Mission Launchpads (founder drain / >100% split, >10% curve fee, unbonded
-//!    Sybil worker claim, double-claim task replay, over-redemption > total_shares)
-//! 5. RFC-0026 BIP-9 Signaling & AuxPoW bit non-collision + ASERT Day-1 anti-instamine boundaries.
+//! Exercises exploit attempts across every L1 consensus and network surface:
+//! 1. Priorism-FEP `PriorLock` attacks (SCGS I-3 self-arbitration, identical-payload fake
+//!    equivocation, duplicate arbiter index, >10% fee siphon, premature release, post-window slash)
+//! 2. `BatchSpend` multi-spend STARK attacks (prover_a_pk reward theft, intra-batch double spend,
+//!    sub-minimum batch fee spam, bit-flipped proof, underpaid prover split-coinbase)
+//! 3. Work-Proportional FlyClient attacks (sibling-work inflation `2^100`, unbound tail header,
+//!    missing/tampered header MMR commitment)
+//! 4. P2P Eclipse defense (/16 netgroups), opportunistic ML-KEM-768 `NSPQ1` frame tampering/replay,
+//!    and BIP-152-style Compact Block relay
+//! 5. BIP-9 AuxPoW signaling bit non-collision & ASERT Day-1 launch bounds
+//! 6. Full Mainnet v2 SHA-384 + Homeostatic 50% Fee Burn + `nsSNAP05` + live `NSPQ1` sync.
 
 use newsatoshi::auxpow::{auxpow_version, chain_id, is_auxpow, CHAIN_ID};
-use newsatoshi::bond::{self, BondPost, TrustBond};
+use newsatoshi::chain::{mine, Chain};
 use newsatoshi::hash::{sha256, Word8};
 use newsatoshi::job::JobKey;
-use newsatoshi::merkmap::MerkleMap;
-use newsatoshi::mission::{self, MissionPool, MissionPost};
-use newsatoshi::params::COIN;
-use newsatoshi::pow::{asert_bits_staged, TARGET_SPACING};
-use newsatoshi::rollup::{self, RollupBatchInputs, RollupPost, RollupVault};
+use newsatoshi::light::{bag_mmr_peaks, mmr_leaf_hash, mmr_parent_hash, FlyClientProof, HeaderTip, MmrLeafProof, MmrNode};
+use newsatoshi::node::{self, admit_inbound, lock, release_inbound, CompactBlock, Msg, Node, MAX_PER_NETGROUP};
+use newsatoshi::params::{split_spend_fee, subsidy, Net, Params, COIN, DEFAULT_FEE, MAIN_V2_DEFAULT_FEE};
+use newsatoshi::peers::{AddrBook, MAX_PER_NETGROUP_BOOK};
+use newsatoshi::pow::{self, asert_bits_staged, TARGET_SPACING};
+use newsatoshi::pq_transport::PqSession;
+use newsatoshi::prior::{self, PriorLock, PriorPost};
 use newsatoshi::signal::{self, encode_signal_version, signals_bit, MAX_SIGNAL_BIT, MIN_SIGNAL_BIT};
-use newsatoshi::zkvm::{
-    aggregate_shards_to_l1_batch, compile_l2_program, prove_zkvm_execution, state_slots_root,
-    verify_zkvm_execution,
-};
-use std::collections::BTreeMap;
+use newsatoshi::tx::{Block, PlainOut, Tx};
+use newsatoshi::wallet::Wallet;
+use primitive_types::U256;
+use std::collections::HashSet;
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 #[test]
-fn redteam_rfc0024_bond_attacks_rejected() {
+fn redteam_priorism_fep_prior_lock_attacks_rejected() {
     let owner = JobKey::derive(&[1u8; 32]);
-    let peer = JobKey::derive(&[2u8; 32]);
     let arb0 = JobKey::derive(&[3u8; 32]);
     let arb1 = JobKey::derive(&[4u8; 32]);
     let owner_vk: [u8; 32] = owner.vk().try_into().unwrap();
-    let peer_vk: [u8; 32] = peer.vk().try_into().unwrap();
     let arb0_vk: [u8; 32] = arb0.vk().try_into().unwrap();
     let arb1_vk: [u8; 32] = arb1.vk().try_into().unwrap();
-    let victim: Word8 = [99u32; 8];
+    let disconfirmer: Word8 = [99u32; 8];
+    let falsifier_preimage = [0x55u8; 32];
 
-    // Invalid slash_burn_bps > 10_000 rejected
-    let bad_post = BondPost {
+    // 1. SCGS Invariant I-3: owner listed among arbiters MUST fail!
+    let self_arb = PriorPost {
         owner_vk,
         owner_addr: [1u32; 8],
+        spec_hash: sha256(b"redteam-prior"),
+        falsifier_hash: sha256(&falsifier_preimage),
+        arbiter_vks: vec![owner_vk, arb0_vk],
+        quorum_m: 1,
+        deadline: 50,
+        challenge_window: 10,
+        stake: 5 * COIN,
+    };
+    assert!(prior::check_post(&self_arb, 10).is_err());
+
+    // 2. Duplicate arbiter key MUST fail!
+    let dup_arb = PriorPost {
+        arbiter_vks: vec![arb0_vk, arb0_vk],
+        quorum_m: 2,
+        ..self_arb.clone()
+    };
+    assert!(prior::check_post(&dup_arb, 10).is_err());
+
+    // Valid prior
+    let post = PriorPost {
         arbiter_vks: vec![arb0_vk, arb1_vk],
         quorum_m: 2,
-        unbond_delay: 10,
-        slash_burn_bps: 10_001,
-        stake: 5 * COIN,
-        service_tag: sha256(b"redteam"),
+        ..self_arb
     };
-    assert!(bond::check_post(&bad_post).is_err());
+    prior::check_post(&post, 10).unwrap();
+    let pid = prior::prior_id(&post, &[7u32; 8]);
+    let pl = PriorLock { id: pid, post, created_at: 10, outcome_hash: None, committed_at: None };
 
-    let post = BondPost {
-        slash_burn_bps: 2_000,
-        ..bad_post
-    };
-    bond::check_post(&post).unwrap();
-    let bid = bond::bond_id(&post, &[7u32; 8]);
-    let mut b = TrustBond {
-        id: bid,
-        post,
-        created_at: 10,
-        settled_count: 0,
-        settled_volume: 0,
-        slash_count: 0,
-        slashed_total: 0,
-        unbond_requested_at: None,
-        unbond_amount: 0,
-        action_nonce: 0,
-    };
-
-    // 1. Self-attestation wash trading (counterparty_vk == owner_vk) MUST fail!
-    let rcpt = sha256(b"fake-self-trade");
-    let amsg = bond::attest_message(&bid, 0, &rcpt, 1 * COIN, 10_000);
-    assert!(bond::attest(
-        &mut b,
-        &rcpt,
-        1 * COIN,
-        10_000,
-        &owner.sign(&amsg),
-        &owner_vk,
-        &owner.sign(&amsg),
+    // 3. Identical-payload fake equivocation MUST fail!
+    let same = sha256(b"identical-claim");
+    let sig_same = owner.sign(&prior::statement_message(&pid, 1, &same));
+    assert!(prior::apply_disconfirm_objective(
+        &pl, 1, 1, &same, &sig_same, &same, &sig_same, disconfirmer, 10_000, 55
     )
     .is_err());
 
-    // 2. Identical-payload fake equivocation slash MUST fail!
-    let same = sha256(b"identical-quote");
-    let cmsg = bond::commit_message(&bid, 1, &same);
-    let csig = owner.sign(&cmsg);
-    assert!(bond::slash_equivocation(
-        &mut b, 1, &same, &csig, &same, &csig, victim, 1 * COIN, 5_000
+    // 4. Excessive miner fee (> 10% cap, trying to dodge the 50% burn) MUST fail!
+    let excessive_fee = (5 * COIN) / 10 + 1;
+    assert!(prior::apply_disconfirm_objective(
+        &pl, 0, 0, &falsifier_preimage, &[], &[0; 32], &[], disconfirmer, excessive_fee, 55
     )
     .is_err());
 
-    // 3. Over-slash exceeding stake MUST fail!
-    let p_a = sha256(b"quote-a");
-    let p_b = sha256(b"quote-b");
-    let sig_a = owner.sign(&bond::commit_message(&bid, 2, &p_a));
-    let sig_b = owner.sign(&bond::commit_message(&bid, 2, &p_b));
-    assert!(bond::slash_equivocation(
-        &mut b,
-        2,
-        &p_a,
-        &sig_a,
-        &p_b,
-        &sig_b,
-        victim,
-        6 * COIN,
-        5_000
+    // 5. Duplicate arbiter index trying to turn 1-of-2 into 2-of-2 MUST fail!
+    let ev = sha256(b"falsified-prior-evidence");
+    let qm = prior::quorum_disconfirm_message(&pid, &ev, &disconfirmer, 10_000);
+    let q0 = arb0.sign(&qm);
+    assert!(prior::apply_disconfirm_quorum(
+        &pl, &ev, disconfirmer, 10_000, &[(0, q0.clone()), (0, q0)], 55
     )
     .is_err());
 
-    // 4. Duplicate arbiter index in quorum slash (trying to pass 1-of-2 as 2-of-2) MUST fail!
-    let ev = sha256(b"dispute-evidence");
-    let qmsg = bond::quorum_slash_message(&bid, 0, &ev, &victim, 1 * COIN, 5_000);
-    let qsig0 = arb0.sign(&qmsg);
-    assert!(bond::slash_quorum(
-        &mut b,
-        &ev,
-        victim,
-        1 * COIN,
-        5_000,
-        &[(0, qsig0.clone()), (0, qsig0)],
+    // 6. Post-window disconfirmation (height > deadline + challenge_window = 60) MUST fail!
+    assert!(prior::apply_disconfirm_objective(
+        &pl, 0, 0, &falsifier_preimage, &[], &[0; 32], &[], disconfirmer, 10_000, 61
     )
     .is_err());
 
-    // 5. Premature unbond completion before cooldown MUST fail!
-    let umsg = bond::unbond_request_message(&bid, 0, 2 * COIN);
-    bond::request_unbond(&mut b, 2 * COIN, &owner.sign(&umsg), 20).unwrap();
-    assert!(bond::complete_unbond(&mut b, 5_000, 29).is_err()); // delay=10 => needs >=30
-    let eff = bond::complete_unbond(&mut b, 5_000, 30).unwrap();
-    assert_eq!(eff.payouts[0].v + eff.miner_fee, 2 * COIN);
-    assert_eq!(b.post.stake, 3 * COIN);
-
-    // Legitimate peer attestation succeeds after unbond
-    let amsg2 = bond::attest_message(&bid, b.action_nonce, &rcpt, 1 * COIN, 10_000);
-    bond::attest(
-        &mut b,
-        &rcpt,
-        1 * COIN,
-        10_000,
-        &owner.sign(&amsg2),
-        &peer_vk,
-        &peer.sign(&amsg2),
-    )
-    .unwrap();
-    assert_eq!(b.settled_count, 1);
-}
-
-#[test]
-fn redteam_rfc0023_rollup_and_zkvm_attacks_rejected() {
-    let prog = compile_l2_program(
-        "LOAD_STATE r0, s0\nLOAD_CONST r1, 50000\nSUB r0, r0, r1\nSTORE_STATE s0, r0\nEMIT_WITHDRAW r1\nHALT",
-    )
-    .unwrap();
-
-    // 1. Underflow in zkVM SUB MUST fail proving!
-    assert!(prove_zkvm_execution(&prog, [10_000, 0, 0, 0]).is_err());
-
-    // 2. ASSERT_EQ mismatch MUST fail proving!
-    let bad_assert = compile_l2_program("LOAD_CONST r0, 1\nLOAD_CONST r1, 2\nASSERT_EQ r0, r1\nHALT").unwrap();
-    assert!(prove_zkvm_execution(&bad_assert, [0, 0, 0, 0]).is_err());
-
-    // 3. Bit-flipped zkVM STARK proof MUST fail verification!
-    let shard = prove_zkvm_execution(&prog, [1_000_000, 0, 0, 0]).unwrap();
-    let mut flipped = shard.proof_bytes.clone();
-    let mid = flipped.len() / 2;
-    flipped[mid] ^= 0x01;
-    assert!(verify_zkvm_execution(&shard.pub_inputs, &flipped).is_err());
-
-    // 4. Broken state chain across multi-shard aggregation MUST fail!
-    let disconnected = prove_zkvm_execution(&prog, [999_999, 0, 0, 0]).unwrap();
-    assert!(aggregate_shards_to_l1_batch(
-        sha256(b"vk"),
-        &[shard.clone(), disconnected],
-        [0u8; 32],
-        [0u8; 32],
-        1,
-        1_000_000,
-        1_000,
-    )
-    .is_err());
-
-    // 5. 64-bit TVL overflow (exceeding 63-bit STARK range bound) MUST fail invariant check!
-    let overflow_inputs = RollupBatchInputs {
-        vk_hash: sha256(b"vk"),
-        prev_state_root: shard.pub_inputs.prev_state_root,
-        new_state_root: shard.pub_inputs.new_state_root,
-        deposit_acc: [0u8; 32],
-        withdraw_root: [0u8; 32],
-        batch_seq: 1,
-        batch_tx_count: 1,
-        prev_tvl: (1u64 << 63) + 10,
-        new_tvl: (1u64 << 63),
-        batch_withdrawals: 5,
-        batch_fee: 5,
-    };
-    assert!(overflow_inputs.check_invariants().is_err());
-
-    // 6. Forged Merkle withdrawal proof & double-claim replay MUST fail on RollupVault!
-    let post = RollupPost {
-        vk_hash: sha256(b"vk"),
-        genesis_root: state_slots_root(&[1_000_000, 0, 0, 0]),
-        sequencer_vk: None,
-        initial_tvl: 1_000_000,
-        name_tag: sha256(b"redteam-l2"),
-    };
-    let rid = rollup::rollup_id(&post, &[3u32; 8]);
-    let mut vault = RollupVault {
-        id: rid,
-        post,
-        created_at: 1,
-        state_root: shard.pub_inputs.prev_state_root,
-        deposit_acc: [0u8; 32],
-        deposit_count: 0,
-        batch_seq: 0,
-        total_l2_txs: 0,
-        tvl: 1_000_000,
-        pending_withdrawals: 0,
-        withdraw_roots: vec![],
-        claimed_withdrawals: vec![],
-    };
-    let wid = sha256(b"wdr-real");
-    let alice = [4u32; 8];
-    let mut wmap = MerkleMap::new();
-    wmap.insert(wid, rollup::withdrawal_leaf_hash(&rid, 1, &wid, &alice, 50_000));
-    let wroot = wmap.root();
-
-    let agg = aggregate_shards_to_l1_batch(
-        vault.post.vk_hash,
-        &[shard],
-        vault.deposit_acc,
-        wroot,
-        1,
-        vault.tvl,
-        1_000,
-    )
-    .unwrap();
-
-    // Flip 1 byte in L1 RollupBatch STARK -> rejected!
-    let mut bad_l1_proof = agg.l1_stark_proof.clone();
-    bad_l1_proof[100] ^= 0xff;
-    assert!(rollup::apply_batch(
-        &mut vault,
-        agg.l1_inputs.new_state_root,
-        wroot,
-        agg.l1_inputs.batch_tx_count,
-        agg.l1_inputs.batch_withdrawals,
-        agg.l1_inputs.batch_fee,
-        &[],
-        &bad_l1_proof,
-        true,
-    )
-    .is_err());
-
-    // Honest batch settles
-    rollup::apply_batch(
-        &mut vault,
-        agg.l1_inputs.new_state_root,
-        wroot,
-        agg.l1_inputs.batch_tx_count,
-        agg.l1_inputs.batch_withdrawals,
-        agg.l1_inputs.batch_fee,
-        &[],
-        &agg.l1_stark_proof,
-        true,
-    )
-    .unwrap();
-
-    // Wrong recipient address with valid Merkle proof -> rejected!
-    let mp = wmap.prove(&wid).unwrap();
-    assert!(rollup::apply_withdraw(&mut vault, 1, &wid, [9u32; 8], 50_000, 100, &mp).is_err());
-    // Honest withdrawal succeeds once, replay fails!
-    rollup::apply_withdraw(&mut vault, 1, &wid, alice, 50_000, 100, &mp).unwrap();
-    assert!(rollup::apply_withdraw(&mut vault, 1, &wid, alice, 50_000, 100, &mp).is_err());
-}
-
-#[test]
-fn redteam_rfc0027_mission_launchpad_attacks_rejected() {
-    let orch = JobKey::derive(&[61u8; 32]);
-    let v0 = JobKey::derive(&[62u8; 32]);
-    let trader = JobKey::derive(&[63u8; 32]);
-    let trader_vk: [u8; 32] = trader.vk().try_into().unwrap();
-    let pg_addr = [70u32; 8];
-    let worker_addr = [71u32; 8];
-
-    // 1. Excessive curve_fee_bps (>10%) or invalid public_goods_bps (>100%) MUST fail!
-    let mut bad = MissionPost {
-        orchestrator_vk: orch.vk().try_into().unwrap(),
-        verifier_vks: vec![v0.vk().try_into().unwrap()],
-        verifier_quorum_m: 1,
-        public_goods_addr: pg_addr,
-        public_goods_bps: 10_001,
-        curve_fee_bps: 500,
-        initial_funding: 1 * COIN,
-        min_worker_bond: 1 * COIN,
-        mission_hash: sha256(b"redteam-mission"),
-    };
-    assert!(mission::check_post(&bad).is_err());
-    bad.public_goods_bps = 2_000;
-    bad.curve_fee_bps = 1_001;
-    assert!(mission::check_post(&bad).is_err());
-
-    // Valid launchpad
-    let post = MissionPost {
-        curve_fee_bps: 500,
-        ..bad
-    };
-    mission::check_post(&post).unwrap();
-    let mid = mission::mission_id(&post, &[8u32; 8]);
-    let mut pool = MissionPool {
-        id: mid,
-        post,
-        created_at: 1,
-        bounty_pool: 1 * COIN,
-        curve_reserve: 0,
-        total_shares: 0,
-        shares_by_holder: BTreeMap::new(),
-        tasks: BTreeMap::new(),
-        completed_tasks: 0,
-        total_bounties_paid: 0,
-        action_nonce: 0,
-    };
-
-    // 2. Trader buys 10 LOVE -> tries to redeem MORE shares than minted -> MUST fail!
-    mission::apply_fund(&mut pool, trader_vk, 10 * COIN, false).unwrap();
-    let shares = pool.shares_by_holder[&trader_vk];
-    let rmsg = mission::redeem_message(&mid, pool.action_nonce, shares + 1, &worker_addr, 1_000);
-    assert!(mission::apply_curve_redeem(
-        &mut pool,
-        trader_vk,
-        shares + 1,
-        worker_addr,
-        1_000,
-        &trader.sign(&rmsg),
-    )
-    .is_err());
-
-    // 3. Task claim with insufficient worker bond (anti-Sybil) MUST fail!
-    let spec = sha256(b"lemma-x");
-    let tmsg = mission::post_task_message(&mid, 1, &spec, 50_000_000);
-    mission::apply_post_task(&mut pool, 1, spec, 50_000_000, &orch.sign(&tmsg)).unwrap();
-    let proof = sha256(b"proof-x");
-    let cmsg = mission::claim_task_message(&mid, 1, &spec, &proof, &worker_addr, 1_000);
-    let vsigs = vec![(0, v0.sign(&cmsg))];
-
-    let make_bond = |stake: u64, slashes: u32| TrustBond {
-        id: sha256(b"worker-bond"),
-        post: BondPost {
-            owner_vk: trader_vk,
-            owner_addr: worker_addr,
-            arbiter_vks: vec![],
-            quorum_m: 0,
-            unbond_delay: 5,
-            slash_burn_bps: 2_000,
-            stake,
-            service_tag: sha256(b"worker"),
-        },
-        created_at: 1,
-        settled_count: 0,
-        settled_volume: 0,
-        slash_count: slashes,
-        slashed_total: 0,
-        unbond_requested_at: None,
-        unbond_amount: 0,
-        action_nonce: 0,
-    };
-
-    let low_bond = make_bond(50_000_000, 0);
-    let slashed_bond = make_bond(2 * COIN, 1);
-    let good_bond = make_bond(1 * COIN, 0);
-
-    // Unbonded, under-bonded, and slashed workers MUST all be rejected!
-    assert!(mission::apply_claim_task(&mut pool, 1, proof, worker_addr, None, 1_000, &vsigs, 10).is_err());
-    assert!(mission::apply_claim_task(&mut pool, 1, proof, worker_addr, Some(&low_bond), 1_000, &vsigs, 10).is_err());
-    assert!(mission::apply_claim_task(&mut pool, 1, proof, worker_addr, Some(&slashed_bond), 1_000, &vsigs, 10).is_err());
-
-    // Honest clean bonded claim succeeds ONCE, double-claim replay MUST fail!
-    mission::apply_claim_task(&mut pool, 1, proof, worker_addr, Some(&good_bond), 1_000, &vsigs, 10).unwrap();
-    assert!(mission::apply_claim_task(&mut pool, 1, proof, worker_addr, Some(&good_bond), 1_000, &vsigs, 11).is_err());
+    // 7. Premature release (height <= 60) AND unauthorized non-zero fee release MUST fail!
+    assert!(prior::apply_release(&pl, 0, &[], 60).is_err());
+    assert!(prior::apply_release(&pl, 10_000, &[], 61).is_err());
+    let rel_sig = owner.sign(&prior::release_message(&pid, 10_000));
+    let rel = prior::apply_release(&pl, 10_000, &rel_sig, 61).unwrap();
+    assert_eq!(rel.payouts[0].v + rel.miner_fee, 5 * COIN);
+    assert_eq!(rel.burned, 0);
 }
 
 #[test]
 fn redteam_bip9_auxpow_non_collision_and_asert_bounds() {
-    // Every single subset of BIP-9 signaling bits 1..=7 MUST preserve AuxPoW flag & CHAIN_ID (20051)!
     for mask in 0u32..(1u32 << 7) {
         let mut bits = Vec::new();
         for b in MIN_SIGNAL_BIT..=MAX_SIGNAL_BIT {
@@ -396,18 +127,13 @@ fn redteam_bip9_auxpow_non_collision_and_asert_bounds() {
         assert!(is_auxpow(v), "AuxPoW bit clobbered for mask {mask:#x}");
         assert_eq!(chain_id(v), CHAIN_ID, "CHAIN_ID clobbered for mask {mask:#x}");
         for b in MIN_SIGNAL_BIT..=MAX_SIGNAL_BIT {
-            let expected = bits.contains(&b);
-            assert_eq!(signals_bit(v, b), expected);
+            assert_eq!(signals_bit(v, b), bits.contains(&b));
         }
     }
-
-    // Out-of-range bit 0 or bit 8+ MUST be ignored (never collides with base version or AuxPoW bit 8)
-    let ignored = encode_signal_version(1, &[0, 8, 16, 31]);
-    assert_eq!(ignored, 1);
+    assert_eq!(encode_signal_version(1, &[0, 8, 16, 31]), 1);
     assert!(!signal::signals_bit(0xffff_ffff, 0));
     assert!(!signal::signals_bit(0xffff_ffff, 8));
 
-    // Extreme future/past timestamps in ASERT staged launch MUST stay bounded (never panic or exceed pow_limit)
     let lim = 0x1d00ffffu32;
     let b_far_future = asert_bits_staged(lim, 0, 2016, 3600, None, 10, 10_000_000_000, 172_800, lim, TARGET_SPACING);
     assert_eq!(b_far_future, lim);
@@ -416,65 +142,7 @@ fn redteam_bip9_auxpow_non_collision_and_asert_bounds() {
 }
 
 #[test]
-fn redteam_zkvm_logup_rom_prevents_fake_program_drain_and_overflow() {
-    // Honest L2 vault program: allows withdrawing at most 10_000_000 when s0 >= 10_000_000 via LT + JZ
-    let honest_prog = compile_l2_program(
-        r#"
-        LOAD_STATE r0, s0
-        LOAD_CONST r1, 10000000
-        LT r2, r0, r1
-        JNZ r2, fail
-        SUB r0, r0, r1
-        STORE_STATE s0, r0
-        EMIT_WITHDRAW r1
-        HALT
-    fail:
-        LOAD_CONST r3, 999
-        ASSERT_EQ r2, r3
-        HALT
-        "#,
-    )
-    .unwrap();
-
-    // Attacker writes a fake drain program trying to steal 500_000_000!
-    let evil_prog = compile_l2_program(
-        "LOAD_CONST r0, 500000000\nEMIT_WITHDRAW r0\nHALT",
-    )
-    .unwrap();
-
-    let honest_shard = prove_zkvm_execution(&honest_prog, [50_000_000, 0, 0, 0]).unwrap();
-    assert!(honest_shard.proven_bits >= 128);
-    assert_eq!(honest_shard.pub_inputs.total_withdrawals, 10_000_000);
-
-    // 1. Insufficient balance triggers the conditional branch to `fail:` -> ASSERT_EQ rejects!
-    assert!(prove_zkvm_execution(&honest_prog, [5_000_000, 0, 0, 0]).is_err());
-
-    // 2. Evil drain proof cannot masquerade under honest_prog's vk_hash (LogUp ROM rejects!)
-    let evil_shard = prove_zkvm_execution(&evil_prog, [50_000_000, 0, 0, 0]).unwrap();
-    let mut forged_pub = evil_shard.pub_inputs.clone();
-    forged_pub.program_hash = honest_prog.program_hash;
-    forged_pub.program_bytecode = honest_prog.bytecode.clone();
-    assert!(verify_zkvm_execution(&forged_pub, &evil_shard.proof_bytes).is_err());
-
-    // 3. Even if attacker mutates just program_hash while keeping evil_bytecode, hash check fails!
-    let mut mismatch_pub = evil_shard.pub_inputs.clone();
-    mismatch_pub.program_hash = honest_prog.program_hash;
-    assert!(verify_zkvm_execution(&mismatch_pub, &evil_shard.proof_bytes).is_err());
-}
-
-#[test]
-fn redteam_p2p_eclipse_defense_pq_transport_and_compact_block() {
-    use newsatoshi::chain::{mine, Chain};
-    use newsatoshi::node::{admit_inbound, release_inbound, CompactBlock, MAX_PER_NETGROUP};
-    use newsatoshi::params::{subsidy, Net, Params, DEFAULT_FEE};
-    use newsatoshi::peers::{AddrBook, MAX_PER_NETGROUP_BOOK};
-    use newsatoshi::pq_transport::PqSession;
-    use newsatoshi::tx::PlainOut;
-    use newsatoshi::wallet::Wallet;
-    use std::collections::HashSet;
-    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-
-    // 1. Eclipse attacker controlling a /24 subnet (203.0.113.1..254)
+fn redteam_p2p_eclipse_defense_opportunistic_pq_transport_and_compact_block() {
     let mut book = AddrBook::default();
     let mut accepted = 0usize;
     for host in 1u8..=200 {
@@ -482,23 +150,15 @@ fn redteam_p2p_eclipse_defense_pq_transport_and_compact_block() {
             accepted += 1;
         }
     }
-    assert_eq!(
-        accepted, MAX_PER_NETGROUP_BOOK,
-        "/16 netgroup cap must stop single-subnet address-book flooding"
-    );
-    // Add 3 honest peers from distinct /16 netgroups
+    assert_eq!(accepted, MAX_PER_NETGROUP_BOOK);
     for p in ["198.51.100.1:8444", "192.0.2.1:8444", "1.1.1.1:8444"] {
         assert!(book.heard(p));
         book.good(p);
     }
     let cands = book.candidates(&HashSet::new());
     let attacker_selected = cands.iter().filter(|a| a.starts_with("203.0.113.")).count();
-    assert_eq!(
-        attacker_selected, 1,
-        "eclipse attacker with 200 IPs in one /16 MUST get at most 1 outbound slot"
-    );
+    assert_eq!(attacker_selected, 1);
 
-    // Inbound netgroup cap (public IPs in one /16 capped at MAX_PER_NETGROUP = 8)
     let mut admitted_ips = Vec::new();
     for host in 1u8..=20 {
         let ip = IpAddr::V4(Ipv4Addr::new(198, 18, 0, host));
@@ -511,7 +171,7 @@ fn redteam_p2p_eclipse_defense_pq_transport_and_compact_block() {
         release_inbound(ip);
     }
 
-    // 2. Post-quantum NIST FIPS 203 ML-KEM-768 P2P transport blocks MITM tampering
+    // Opportunistic ML-KEM-768 P2P transport (blocks passive HNDL capture + in-session tampering/replay)
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     let h = std::thread::spawn(move || {
@@ -523,12 +183,11 @@ fn redteam_p2p_eclipse_defense_pq_transport_and_compact_block() {
     let mut resp = h.join().unwrap();
     let mut frame = init.seal_frame(b"compact-block-payload").unwrap();
     assert_eq!(resp.open_raw_frame(&frame).unwrap(), b"compact-block-payload");
-    // Replay or bit-flip rejected
     assert!(resp.open_raw_frame(&frame).is_err());
     frame[4] ^= 0x80;
     assert!(resp.open_raw_frame(&frame).is_err());
 
-    // 3. Compact Block relay reconstructs full STARK block from mempool with >95% bandwidth savings
+    // Compact Block relay reconstructs full STARK block from mempool with >95% bandwidth savings
     let mut chain = Chain::open(Params::get(Net::Reg).unwrap(), None).unwrap();
     let mut alice = Wallet::generate();
     let miner = Wallet::generate();
@@ -551,30 +210,21 @@ fn redteam_p2p_eclipse_defense_pq_transport_and_compact_block() {
     let mut w = newsatoshi::codec::Writer::new();
     cb.encode(&mut w);
     let compact_bytes = w.0.len();
-    assert!(
-        compact_bytes * 20 < full_bytes,
-        "compact block ({compact_bytes} B) should be >95% smaller than full STARK block ({full_bytes} B)"
-    );
-    // Empty mempool reports exact missing index [1]; warm mempool reconstructs exact full block!
+    assert!(compact_bytes * 20 < full_bytes);
     assert_eq!(cb.reconstruct(&[]).unwrap_err(), vec![1]);
     let rebuilt = cb.reconstruct(&[spend_tx]).unwrap();
     assert_eq!(rebuilt.hash(), b2.hash());
-    assert_eq!(rebuilt.txs.len(), b2.txs.len());
 }
 
 #[test]
-fn redteam_flyclient_mmr_and_trustless_light_client_proofs() {
-    use newsatoshi::chain::{mine, Chain};
-    use newsatoshi::light::{FlyClientProof, HeaderTip};
-    use newsatoshi::params::{subsidy, Net, Params, DEFAULT_FEE};
-    use newsatoshi::tx::PlainOut;
-    use newsatoshi::wallet::Wallet;
-
-    let params = Params::get(Net::Reg).unwrap();
+fn redteam_work_proportional_flyclient_and_trustless_light_client_proofs() {
+    let mut params = Params::main_v2_with(1_762_473_600, u32::MAX, 0x207fffff);
+    params.pow_limit = 0x207fffff;
+    params.coinbase_maturity = 1;
     let mut chain = Chain::open(params.clone(), None).unwrap();
     let mut alice = Wallet::generate();
     let bob = Wallet::generate();
-    let mut headers = vec![chain.block_at(0).unwrap().clone()];
+    let mut headers = vec![chain.block_at(0).unwrap()];
 
     for i in 1..=20u32 {
         let out = PlainOut { a_pk: alice.a_pk(), v: subsidy(i), rho: [i; 5] };
@@ -583,87 +233,83 @@ fn redteam_flyclient_mmr_and_trustless_light_client_proofs() {
         chain.add_block(b.clone()).unwrap();
         headers.push(b);
     }
-    let (tx, _) = alice.spend(&chain, Some((bob.a_pk(), 2 * COIN)), DEFAULT_FEE, None, vec![]).unwrap();
+    let (tx, _) = alice
+        .spend(&chain, Some((bob.a_pk(), 2 * COIN)), MAIN_V2_DEFAULT_FEE, None, vec![])
+        .unwrap();
     let spent_nf = match &tx {
-        newsatoshi::tx::Tx::Spend(s) => s.nf[0],
+        Tx::Spend(s) => s.nf[0],
         _ => unreachable!(),
     };
-    let out_tip = PlainOut { a_pk: bob.a_pk(), v: subsidy(22) + DEFAULT_FEE, rho: [99; 5] };
+    let (_, producer_fee) = split_spend_fee(MAIN_V2_DEFAULT_FEE, true);
+    let out_tip = PlainOut { a_pk: bob.a_pk(), v: subsidy(21) + producer_fee, rho: [99; 5] };
     let mut b_tip = chain.template(vec![out_tip], vec![tx], vec![]).unwrap();
     assert!(mine(&mut b_tip.header, u64::MAX));
     chain.add_block(b_tip.clone()).unwrap();
     headers.push(b_tip.clone());
 
-    // 1. O(log N) FlyClient MMR chain proof verification & forgery rejection
-    let fc = FlyClientProof::prove(&headers, 4, 8).unwrap();
-    let (tip_h, work) = fc.verify(headers[0].hash(), 8).unwrap();
+    // 1. Work-proportional O(log N) FlyClient proof bound directly to tip header_mmr!
+    let parts = chain.state.digest_parts();
+    let fc = FlyClientProof::prove(&headers, b_tip.tx_root(), parts.clone(), 4, 12).unwrap();
+    let (tip_h, work) = fc.verify(headers[0].hash(), 12, true).unwrap();
     assert_eq!(tip_h, chain.tip().hash);
     assert_eq!(work, chain.tip().work);
+
+    // Sibling-work inflation attack (2^100 fake work) MUST be rejected!
     let mut forged = fc.clone();
-    forged.peaks[0].work += primitive_types::U256::from(1u64);
-    assert!(forged.verify(headers[0].hash(), 8).is_err());
+    let g_leaf = MmrNode {
+        hash: mmr_leaf_hash(0, &headers[0].hash(), pow::work(headers[0].header.bits)),
+        work: pow::work(headers[0].header.bits),
+        height: 0,
+    };
+    let fake_sib = MmrNode { hash: [0xde; 32], work: U256::from(1u128 << 100), height: 0 };
+    let (fake_peak, _) = mmr_parent_hash(&g_leaf, &fake_sib);
+    forged.peaks = vec![fake_peak];
+    let (r, w) = bag_mmr_peaks(&forged.peaks);
+    forged.mmr_root = r;
+    forged.ancestor_work = w;
+    forged.total_work = w + pow::work(b_tip.header.bits);
+    forged.tip_height = 2;
+    forged.samples[0].mmr_proof = MmrLeafProof { leaf_height: 0, peak_height: 1, siblings: vec![(true, fake_sib)] };
+    assert!(forged.verify(headers[0].hash(), 8, false).is_err());
 
     // 2. Trustless NoteTree + NfTree verification against committed HeaderTip
     let mut light = HeaderTip::genesis(&params);
     let hdr_only: Vec<_> = headers[1..]
         .iter()
-        .map(|b| newsatoshi::tx::Block { header: b.header, auxpow: b.auxpow.clone(), digest: [0u8; 32], txs: vec![] })
+        .map(|b| Block { header: b.header, auxpow: b.auxpow.clone(), digest: [0u8; 32], txs: vec![] })
         .collect();
     light.extend(&params, &hdr_only, newsatoshi::chain::now()).unwrap();
-    let parts = chain.state.digest_parts();
     let cm0 = chain.state.tree.leaf(0).unwrap();
     let path0 = chain.state.tree.path(0);
     let nf_spent_proof = chain.state.nf_tree.prove(&spent_nf);
-    let is_spent = light
-        .verify_note_and_nullifier(
-            &b_tip.header,
-            &b_tip.tx_root(),
-            &parts,
-            &cm0,
-            0,
-            &path0,
-            Some((&spent_nf, &nf_spent_proof)),
-        )
-        .unwrap();
-    assert_eq!(is_spent, Some(true), "light client must prove nullifier is spent");
-
+    assert_eq!(
+        light
+            .verify_note_and_nullifier(&b_tip.header, &b_tip.tx_root(), &parts, &cm0, 0, &path0, Some((&spent_nf, &nf_spent_proof)))
+            .unwrap(),
+        Some(true)
+    );
     let unspent_nf: Word8 = [77u32; 8];
     let nf_unspent_proof = chain.state.nf_tree.prove(&unspent_nf);
-    let is_unspent = light
-        .verify_note_and_nullifier(
-            &b_tip.header,
-            &b_tip.tx_root(),
-            &parts,
-            &cm0,
-            0,
-            &path0,
-            Some((&unspent_nf, &nf_unspent_proof)),
-        )
-        .unwrap();
-    assert_eq!(is_unspent, Some(false), "light client must prove fresh nullifier is unspent");
+    assert_eq!(
+        light
+            .verify_note_and_nullifier(&b_tip.header, &b_tip.tx_root(), &parts, &cm0, 0, &path0, Some((&unspent_nf, &nf_unspent_proof)))
+            .unwrap(),
+        Some(false)
+    );
 }
 
 #[test]
-fn redteam_mainnet_v2_sha384_end_to_end_chain_spend() {
-    use newsatoshi::chain::{mine, Chain};
-    use newsatoshi::node::{self, lock, Msg, Node};
-    use newsatoshi::params::{subsidy, Params, MAIN_V2_DEFAULT_FEE};
-    use newsatoshi::tx::{Block, PlainOut, Tx};
-    use newsatoshi::wallet::Wallet;
-    use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
-    use std::time::{Duration, Instant};
-
-    // Boot a live Mainnet v2 chain (nsM2 magic, 384-bit SHA-384 FRI, Day-1 ASERT ramp,
-    // consensus-committed FlyClient Header MMR, mandatory ML-KEM-768 NSPQ1 P2P, RFC-0021..0027)
-    // using regtest-level mining target & maturity=1 so full-chain proving + P2P sync runs in ~3s!
+fn redteam_mainnet_v2_sha384_homeostatic_burn_and_live_nspq1_sync() {
     let mut p = Params::main_v2_with(1_762_473_600, u32::MAX, 0x207fffff);
     assert_eq!(p.magic, *b"nsM2");
     assert_eq!(p.default_port, 8_445);
     assert_eq!(p.default_fee, MAIN_V2_DEFAULT_FEE);
     assert_eq!(p.mmr_from, Some(0));
+    assert_eq!(p.prior_from, Some(0));
+    assert_eq!(p.homeostatic_burn_from, Some(0));
+    assert_eq!(p.batch_spend_from, Some(0));
     assert!(p.pq_transport);
-    assert!(p.proof.sha384, "MAIN_V2 profile must enable 384-bit SHA-384 FRI");
+    assert!(p.proof.sha384);
     p.pow_limit = 0x207fffff;
     p.coinbase_maturity = 1;
 
@@ -675,88 +321,74 @@ fn redteam_mainnet_v2_sha384_end_to_end_chain_spend() {
             .as_nanos()
     ));
     let mut chain = Chain::open(p.clone(), Some(&dir)).unwrap();
-    // Genesis commits to empty FlyClient MMR root
     assert!(chain.state.digest_parts().header_mmr.is_some());
     assert_eq!(chain.state.header_mmr.leaf_count, 0);
 
     let mut alice = Wallet::generate();
     let bob = Wallet::generate();
-
-    // Mine 2 blocks so Alice has a matured coinbase note
     for i in 1..=2u32 {
         let out = PlainOut { a_pk: alice.a_pk(), v: subsidy(i), rho: [i + 10; 5] };
         let mut b = chain.template(vec![out], vec![], vec![]).unwrap();
         assert!(mine(&mut b.header, u64::MAX));
         chain.add_block(b).unwrap();
     }
-    assert_eq!(chain.state.header_mmr.leaf_count, 2);
 
-    // Wallet::spend automatically dispatches SpendProver384 via prove_for(&params.proof, ...)
     let (tx, note_str) = alice
         .spend(&chain, Some((bob.a_pk(), 5 * COIN)), MAIN_V2_DEFAULT_FEE, None, vec![])
         .unwrap();
     assert!(note_str.is_some());
-
-    // CRITICAL WIRE TEST: Mainnet v2 SHA-384 spend (~515–545 KB vs ~460 KB SHA-256) MUST
-    // round-trip cleanly through Tx::from_bytes & Block::decode under PROOF_BYTES_CAP = 700_000!
     let tx_bytes = tx.to_bytes();
     assert!(tx_bytes.len() > 490_000, "expected SHA-384 spend > 490 KB, got {}", tx_bytes.len());
-    let tx_decoded = Tx::from_bytes(&tx_bytes).expect("MAIN_V2 SHA-384 tx must decode cleanly");
+    let tx_decoded = Tx::from_bytes(&tx_bytes).unwrap();
     assert_eq!(tx_decoded, tx);
 
-    let out3 = PlainOut { a_pk: bob.a_pk(), v: subsidy(3) + MAIN_V2_DEFAULT_FEE, rho: [33; 5] };
+    // Homeostatic 50% fee burn: trying to claim 100% of fee in coinbase MUST be rejected!
+    let greedy_out = PlainOut { a_pk: bob.a_pk(), v: subsidy(3) + MAIN_V2_DEFAULT_FEE, rho: [33; 5] };
+    assert!(chain.template(vec![greedy_out], vec![tx_decoded.clone()], vec![]).is_err());
+
+    let (burned_fee, producer_fee) = split_spend_fee(MAIN_V2_DEFAULT_FEE, true);
+    assert_eq!(burned_fee, MAIN_V2_DEFAULT_FEE / 2);
+    let out3 = PlainOut { a_pk: bob.a_pk(), v: subsidy(3) + producer_fee, rho: [33; 5] };
     let mut b3 = chain.template(vec![out3], vec![tx_decoded], vec![]).unwrap();
     assert!(mine(&mut b3.header, u64::MAX));
-    let b3_decoded = Block::decode(&b3.encode()).expect("MAIN_V2 SHA-384 block must decode cleanly");
-    assert_eq!(b3_decoded, b3);
-
-    // Chain::add_block verifies the 384-bit SHA-384 FRI spend proof AND commits ancestor MMR!
+    let b3_decoded = Block::decode(&b3.encode()).unwrap();
     chain.add_block(b3_decoded).unwrap();
+
     assert_eq!(chain.height(), 3);
+    assert_eq!(chain.state.burned, burned_fee as u128);
     assert_eq!(chain.state.header_mmr.leaf_count, 3);
     let committed_mmr = chain.state.digest_parts().header_mmr.unwrap();
     assert_eq!(committed_mmr, chain.state.header_mmr.root());
-    assert_ne!(committed_mmr, [0u8; 32]);
 
-    // Verify fast-boot nsSNAP04 snapshot preserves consensus HeaderMmr + exact tip digest!
+    // Fast-boot nsSNAP05 snapshot preserves HeaderMmr, burned counter & tip digest
     chain.save_snapshot().unwrap();
     let tip_hash = chain.tip().hash;
     let tip_digest = chain.state.digest();
     drop(chain);
     let reopened = Chain::open(p.clone(), Some(&dir)).unwrap();
-    assert!(reopened.fast_boot, "MAIN_V2 nsSNAP04 snapshot must fast-boot cleanly");
+    assert!(reopened.fast_boot);
     assert_eq!(reopened.tip().hash, tip_hash);
     assert_eq!(reopened.state.digest(), tip_digest);
-    assert_eq!(reopened.state.header_mmr.leaf_count, 3);
+    assert_eq!(reopened.state.burned, burned_fee as u128);
     let _ = std::fs::remove_dir_all(&dir);
 
-    // LIVE POST-QUANTUM NSPQ1 P2P SYNC TEST:
-    // Node A holds the height-3 SHA-384 chain; Node B starts at genesis and syncs over mandatory
-    // ML-KEM-768 NSPQ1 encryption! Meanwhile a plaintext downgrade probe MUST be rejected.
+    // Live NSPQ1 ML-KEM-768 P2P sync & plaintext rejection
     let port_a = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let node_a = Node::new(reopened);
     lock(&node_a).log = false;
     node::listen(node_a.clone(), port_a).unwrap();
 
-    // Plaintext downgrade attack against Mainnet v2 listener MUST fail immediately
     let mut probe = TcpStream::connect(("127.0.0.1", port_a)).unwrap();
     probe.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let _ = probe.write_all(&Msg::Hello { height: 0, tip: [0u8; 32] }.encode(p.magic));
-    assert!(
-        Msg::read(&mut probe, p.magic, p.max_block_bytes).is_err(),
-        "Mainnet v2 listener MUST reject plaintext downgrade probes"
-    );
+    assert!(Msg::read(&mut probe, p.magic, p.max_block_bytes).is_err());
 
-    // Honest Mainnet v2 peer B dials A over ML-KEM-768 NSPQ1 and syncs all 3 blocks (incl. SHA-384 spend)!
     let node_b = Node::new(Chain::open(p.clone(), None).unwrap());
     lock(&node_b).log = false;
     node::keep_connected(node_b.clone(), format!("127.0.0.1:{port_a}"));
     let deadline = Instant::now() + Duration::from_secs(15);
     while lock(&node_b).chain.height() < 3 {
-        assert!(
-            Instant::now() < deadline,
-            "Node B failed to sync height-3 SHA-384 chain over live NSPQ1 ML-KEM-768 P2P"
-        );
+        assert!(Instant::now() < deadline, "Node B failed to sync over NSPQ1");
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(lock(&node_b).chain.tip().hash, tip_hash);

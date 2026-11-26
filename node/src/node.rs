@@ -583,7 +583,7 @@ struct PoolEntry {
 
 impl PoolEntry {
     fn is_spend(&self) -> bool {
-        matches!(self.tx, Tx::Spend(_))
+        matches!(self.tx, Tx::Spend(_) | Tx::BatchSpend(_))
     }
     /// Does `self` pay a strictly lower fee per byte than `other`?
     fn cheaper_than(&self, other: &PoolEntry) -> bool {
@@ -746,6 +746,16 @@ impl Node {
                 }
                 spend::verify_bytes_cached(&params.proof, &sp.public()?, &sp.proof)
             }
+            Tx::BatchSpend(bs) => {
+                let total_fee = bs.total_fee()?;
+                if total_fee < min_relay_fee(size) {
+                    return Err(format!(
+                        "batch fee {total_fee} below the minimum relay fee {} for {size} bytes",
+                        min_relay_fee(size)
+                    ));
+                }
+                crate::batch_spend::verify_batch_bytes_cached(&params.proof, &bs.public()?, &bs.proof)
+            }
             Tx::Act(_) => Ok(()),
         }
     }
@@ -794,19 +804,14 @@ impl Node {
         let size = tx.to_bytes().len();
         let fee = match &tx {
             Tx::Spend(s) => s.fee,
+            Tx::BatchSpend(bs) => bs.total_fee().unwrap_or(0),
             Tx::Act(crate::job::Action::ChannelClaim { channel, .. })
             | Tx::Act(crate::job::Action::ChannelExpire { channel }) => {
                 self.pool_state.channels.get(channel).map(|c| c.post.claim_fee).unwrap_or(0)
             }
-            Tx::Act(crate::job::Action::BondAttest { fee, .. }) => *fee,
-            Tx::Act(crate::job::Action::BondSlashEquivocation { miner_fee, .. })
-            | Tx::Act(crate::job::Action::BondSlashQuorum { miner_fee, .. })
-            | Tx::Act(crate::job::Action::BondUnbondComplete { miner_fee, .. })
-            | Tx::Act(crate::job::Action::RollupWithdraw { miner_fee, .. })
-            | Tx::Act(crate::job::Action::MissionClaimTask { miner_fee, .. })
-            | Tx::Act(crate::job::Action::MissionCurveRedeem { miner_fee, .. }) => *miner_fee,
-            Tx::Act(crate::job::Action::RollupBatch { batch_fee, .. })
-            | Tx::Act(crate::job::Action::RollupZkVmBatch { batch_fee, .. }) => *batch_fee,
+            Tx::Act(crate::job::Action::PriorDisconfirmObjective { miner_fee, .. })
+            | Tx::Act(crate::job::Action::PriorDisconfirmQuorum { miner_fee, .. })
+            | Tx::Act(crate::job::Action::PriorRelease { miner_fee, .. }) => *miner_fee,
             _ => 0,
         };
         let mut new = PoolEntry { tx, id, size, fee, seq: self.seq };
@@ -829,17 +834,7 @@ impl Node {
             }
         }
         let h = self.next_height();
-        let admit_checks = crate::state::Checks {
-            verify_proofs: matches!(
-                &new.tx,
-                Tx::Act(
-                    crate::job::Action::RollupBatch { .. }
-                        | crate::job::Action::RollupZkVmBatch { .. }
-                )
-            ),
-            check_commit: false,
-        };
-        let applied_fee = self.pool_state.apply_tx(&new.tx, h, &self.chain.params, admit_checks)?;
+        let applied_fee = self.pool_state.apply_tx(&new.tx, h, &self.chain.params, NO_PROOFS)?;
         new.fee = applied_fee;
         self.seq += 1;
         self.pool_bytes += size;
@@ -970,8 +965,8 @@ impl Node {
 /// headers follow from a block this node has, and which would outweigh its tip, are
 /// checked: making one costs all the work the chain has behind it.
 ///
-/// Multi-core parallel STARK verification: verifies all `Tx::Spend`, `RollupBatch`, and
-/// `RollupZkVmBatch` STARK proofs across CPU cores simultaneously (4×–16× faster block sync).
+/// Multi-core parallel STARK verification: verifies all `Tx::Spend` and `Tx::BatchSpend`
+/// STARK proofs across CPU cores simultaneously.
 fn prewarm(shared: &Shared, blocks: &[Block]) {
     let Some(first) = blocks.first() else { return };
     let (params, base, tip_work) = {
@@ -981,7 +976,11 @@ fn prewarm(shared: &Shared, blocks: &[Block]) {
     };
     let (mut prev, mut times) = base;
     let now = crate::chain::now();
-    let mut spend_jobs: Vec<(spend::SpendPublic, &[u8])> = Vec::new();
+    enum ProofJob<'a> {
+        Single(spend::SpendPublic, &'a [u8]),
+        Batch(crate::batch_spend::BatchSpendPublic, &'a [u8]),
+    }
+    let mut jobs: Vec<ProofJob<'_>> = Vec::new();
     for b in blocks {
         match crate::chain::check_run(&params, prev, times, std::slice::from_ref(b), now) {
             Ok((e, t)) => {
@@ -994,29 +993,45 @@ fn prewarm(shared: &Shared, blocks: &[Block]) {
             continue;
         }
         for t in &b.txs {
-            if let Tx::Spend(sp) = t {
-                if let Ok(pi) = sp.public() {
-                    spend_jobs.push((pi, sp.proof.as_slice()));
+            match t {
+                Tx::Spend(sp) => {
+                    if let Ok(pi) = sp.public() {
+                        jobs.push(ProofJob::Single(pi, sp.proof.as_slice()));
+                    }
                 }
+                Tx::BatchSpend(bs) => {
+                    if let Ok(pi) = bs.public() {
+                        jobs.push(ProofJob::Batch(pi, bs.proof.as_slice()));
+                    }
+                }
+                _ => {}
             }
         }
     }
-    if spend_jobs.len() <= 1 {
-        for (pi, proof) in spend_jobs {
-            let _ = spend::verify_bytes_cached(&params.proof, &pi, proof);
+    let run_one = |job: &ProofJob<'_>, profile: &spend::Profile| match job {
+        ProofJob::Single(pi, proof) => {
+            let _ = spend::verify_bytes_cached(profile, pi, proof);
+        }
+        ProofJob::Batch(pi, proof) => {
+            let _ = crate::batch_spend::verify_batch_bytes_cached(profile, pi, proof);
+        }
+    };
+    if jobs.len() <= 1 {
+        for job in &jobs {
+            run_one(job, &params.proof);
         }
     } else {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2)
-            .min(spend_jobs.len());
-        let chunk_size = spend_jobs.len().div_ceil(workers);
+            .min(jobs.len());
+        let chunk_size = jobs.len().div_ceil(workers);
         let profile = &params.proof;
         std::thread::scope(|s| {
-            for chunk in spend_jobs.chunks(chunk_size) {
+            for chunk in jobs.chunks(chunk_size) {
                 s.spawn(move || {
-                    for (pi, proof) in chunk {
-                        let _ = spend::verify_bytes_cached(profile, pi, proof);
+                    for job in chunk {
+                        run_one(job, profile);
                     }
                 });
             }
@@ -1583,13 +1598,25 @@ pub fn submit_with_pq(addr: &str, magic: [u8; 4], tx: &Tx, pq: bool) -> Result<(
 /// Mine forever on the tip, paying `a_pk`. Re-templates when the tip changes.
 /// `interval` spaces blocks out on regtest, where the target is trivial.
 impl Node {
-    /// A block on the tip paying `a_pk` the subsidy and the fees of the transactions the
-    /// pool would put in it. The direct miner and the merged-mining RPC both use it.
+    /// A block on the tip paying `a_pk` the AuxPoW miner share (plus any mandatory consensus
+    /// `BatchSpend` prover split outputs) and unburned fees.
     pub fn block_template(&self, a_pk: crate::hash::Word8, extra: &[u8]) -> Result<(Block, u64), String> {
+        let next_h = self.chain.height() + 1;
         let (txs, fees) = self.select_with_fees();
-        let value = subsidy(self.chain.height() + 1) + fees;
-        let out = PlainOut { a_pk, v: value, rho: rand::thread_rng().gen() };
-        Ok((self.chain.template(vec![out], txs, extra.to_vec())?, value))
+        let total_value = subsidy(next_h) + fees;
+        let prover_reqs = crate::state::required_prover_payouts(next_h, &txs, &self.chain.params);
+        let mut rng = rand::thread_rng();
+        let mut outs = Vec::with_capacity(1 + prover_reqs.len());
+        let mut prover_total: u64 = 0;
+        for (p_apk, req) in prover_reqs {
+            prover_total = prover_total.saturating_add(req);
+            outs.push(PlainOut { a_pk: p_apk, v: req, rho: rng.gen() });
+        }
+        let miner_value = total_value.saturating_sub(prover_total);
+        if miner_value > 0 || outs.is_empty() {
+            outs.insert(0, PlainOut { a_pk, v: miner_value, rho: rng.gen() });
+        }
+        Ok((self.chain.template(outs, txs, extra.to_vec())?, total_value))
     }
 }
 

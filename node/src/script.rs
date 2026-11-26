@@ -16,16 +16,13 @@
 use crate::hash::sha256;
 
 pub const MAX_PROGRAM: usize = 10_000;
-/// Largest stack/witness item: accommodates SLH-DSA-SHA2-128s signatures (7,856 bytes)
-/// and 128-bit proven RFC-0021 `OP_VERIFY_COVENANT_STARK` (0xb4) Winterfell proofs (up to 128 KiB).
-pub const MAX_ITEM: usize = 131_072;
-/// Total witness byte budget across all witness items (anti-DoS bound well below `MAX_TX_BYTES`).
-pub const MAX_WITNESS_BYTES: usize = 196_608;
+/// Largest stack/witness item: accommodates SLH-DSA-SHA2-128s signatures (7,856 bytes).
+pub const MAX_ITEM: usize = 8_192;
+/// Total witness byte budget across all witness items (anti-DoS bound).
+pub const MAX_WITNESS_BYTES: usize = 131_072;
 pub const MAX_STACK: usize = 64;
 pub const MAX_STEPS: usize = 1_000;
 pub const MAX_SIGCHECKS: usize = 16;
-/// Maximum `OP_VERIFY_COVENANT_STARK` verifications allowed in one condition script execution.
-pub const MAX_STARK_CHECKS: usize = 2;
 pub const MAX_WITNESS: usize = 32;
 const MAX_KEYS: usize = 16;
 
@@ -65,9 +62,6 @@ pub mod op {
     pub const BEFORE: u8 = 0xb2;
     /// Push the index of the payout being chosen.
     pub const PAYOUT: u8 = 0xb3;
-    /// RFC-0021: Pop `<expected_rule_hash_32>`, `<public_inputs_175B>`, `<stark_proof_bytes>`,
-    /// verify pure-SHA-256 Winterfell 0.13 Covenant STARK & recursive rule continuity, push bool.
-    pub const VERIFY_COVENANT_STARK: u8 = 0xb4;
 }
 
 /// What a program can see of the world: the height of the block that runs it, the payout
@@ -110,7 +104,6 @@ struct Machine<'a> {
     stack: Vec<Vec<u8>>,
     ctx: &'a Ctx<'a>,
     sigchecks: usize,
-    starkchecks: usize,
 }
 
 impl Machine<'_> {
@@ -166,18 +159,8 @@ impl Machine<'_> {
     }
 }
 
-/// Run `program` with `witness` on the stack (`rfc0021_active = true`). `Ok` means the condition is met.
+/// Run `program` with `witness` on the stack. `Ok` means the condition is met.
 pub fn run(program: &[u8], witness: &[Vec<u8>], ctx: &Ctx) -> Result<(), String> {
-    run_with_rfc0021(program, witness, ctx, true)
-}
-
-/// Run `program` with explicit height-gated RFC-0021 hard-fork activation control.
-pub fn run_with_rfc0021(
-    program: &[u8],
-    witness: &[Vec<u8>],
-    ctx: &Ctx,
-    rfc0021_active: bool,
-) -> Result<(), String> {
     if program.len() > MAX_PROGRAM {
         return Err("program too long".into());
     }
@@ -188,7 +171,7 @@ pub fn run_with_rfc0021(
     if total_witness_bytes > MAX_WITNESS_BYTES {
         return Err("witness bytes exceed limit".into());
     }
-    let mut m = Machine { stack: vec![], ctx, sigchecks: 0, starkchecks: 0 };
+    let mut m = Machine { stack: vec![], ctx, sigchecks: 0 };
     for w in witness {
         m.push(w.clone())?;
     }
@@ -253,9 +236,6 @@ pub fn run_with_rfc0021(
         }
         if !running {
             // check the opcode exists even in a branch that does not run
-            if o == op::VERIFY_COVENANT_STARK && !rfc0021_active {
-                return Err("RFC-0021 OP_VERIFY_COVENANT_STARK is not active at this height".into());
-            }
             if !known(o) {
                 return Err(format!("unknown opcode {o:#04x}"));
             }
@@ -351,29 +331,6 @@ pub fn run_with_rfc0021(
                 m.push(boolean(if o == op::AFTER { h >= n } else { h < n }))?;
             }
             op::PAYOUT => m.push(num_bytes(ctx.payout as u64))?,
-            op::VERIFY_COVENANT_STARK => {
-                if !rfc0021_active {
-                    return Err("RFC-0021 OP_VERIFY_COVENANT_STARK is not active at this height".into());
-                }
-                m.starkchecks += 1;
-                if m.starkchecks > MAX_STARK_CHECKS {
-                    return Err("too many covenant STARK checks".into());
-                }
-                let expected_rule = m.pop()?;
-                let pub_inputs = m.pop()?;
-                let proof_bytes = m.pop()?;
-                let ok = if let Ok(rule_hash) = <[u8; 32]>::try_from(expected_rule.as_slice()) {
-                    crate::covenant_stark::verify_covenant_stark_bytes(
-                        &rule_hash,
-                        &pub_inputs,
-                        &proof_bytes,
-                    )
-                    .is_ok()
-                } else {
-                    false
-                };
-                m.push(boolean(ok))?;
-            }
             _ => return Err(format!("unknown opcode {o:#04x}")),
         }
     }
@@ -420,7 +377,6 @@ const NAMES: &[(&str, u8)] = &[
     ("AFTER", op::AFTER),
     ("BEFORE", op::BEFORE),
     ("PAYOUT", op::PAYOUT),
-    ("VERIFY_COVENANT_STARK", op::VERIFY_COVENANT_STARK),
 ];
 
 /// The bytes that push `data`.

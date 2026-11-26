@@ -57,7 +57,8 @@ pub type Hash = Sha2_256<Felt>;
 pub type Coin = DefaultRandomCoin<Hash>;
 pub type Vc = MerkleTree<Hash>;
 
-/// Mainnet v2 384-bit SHA-2 STARK commitment stack (192-bit classical / 128-bit QROM collision).
+/// Mainnet v2 384-bit SHA-384 STARK commitment stack (192-bit classical / 128-bit BHT QROM
+/// hash collision bound; overall FRI soundness also depends on Goldilocks cubic extension & queries).
 pub type Hash384 = Sha2_384<Felt>;
 pub type Coin384 = DefaultRandomCoin<Hash384>;
 pub type Vc384 = MerkleTree<Hash384>;
@@ -91,21 +92,21 @@ pub const COL_RND: usize = 244; // 3 masking columns
 pub const WIDTH: usize = 247;
 
 // ---- periodic columns ----------------------------------------------------------------
-const P_K: usize = 0; // K_{t+1} on row t, cycle 64
-const P_ROUND: usize = 1;
-const P_BND: usize = 2;
-const P_ADDR: usize = 3;
-const P_CMIN: usize = 4;
-const P_MERKLE: usize = 5;
-const P_NF: usize = 6;
-const P_CMOUT: usize = 7;
-const P_W: usize = 8;
-const P_VCHK: usize = 9;
-const P_ACTROW: usize = 10;
-const P_ACT: usize = 11;
-const P_SKC: usize = 12;
-const P_RHOC: usize = 13;
-const N_PERIODIC: usize = 14;
+pub(crate) const P_K: usize = 0; // K_{t+1} on row t, cycle 64
+pub(crate) const P_ROUND: usize = 1;
+pub(crate) const P_BND: usize = 2;
+pub(crate) const P_ADDR: usize = 3;
+pub(crate) const P_CMIN: usize = 4;
+pub(crate) const P_MERKLE: usize = 5;
+pub(crate) const P_NF: usize = 6;
+pub(crate) const P_CMOUT: usize = 7;
+pub(crate) const P_W: usize = 8;
+pub(crate) const P_VCHK: usize = 9;
+pub(crate) const P_ACTROW: usize = 10;
+pub(crate) const P_ACT: usize = 11;
+pub(crate) const P_SKC: usize = 12;
+pub(crate) const P_RHOC: usize = 13;
+pub(crate) const N_PERIODIC: usize = 14;
 
 pub const N_CONSTRAINTS: usize = 2 + 2 + 64 + 2 + 16 + 2 + 8 + 137 + 15 + 1;
 
@@ -229,7 +230,7 @@ pub struct SpendPublic {
     pub bind: Word8,
 }
 
-fn signed(v: i64) -> Felt {
+pub(crate) fn signed(v: i64) -> Felt {
     if v >= 0 {
         Felt::new(v as u64)
     } else {
@@ -663,16 +664,16 @@ impl SpendWitness {
     }
 }
 
-fn rand_felt<R: Rng>(rng: &mut R) -> Felt {
+pub(crate) fn rand_felt<R: Rng>(rng: &mut R) -> Felt {
     Felt::new(rng.gen_range(0..Felt::MODULUS))
 }
 
-struct Cols(Vec<Vec<Felt>>);
+pub(crate) struct Cols(pub(crate) Vec<Vec<Felt>>);
 impl Cols {
-    fn set(&mut self, col: usize, row: usize, v: u64) {
+    pub(crate) fn set(&mut self, col: usize, row: usize, v: u64) {
         self.0[col][row] = Felt::new(v);
     }
-    fn bits(&mut self, col: usize, row: usize, x: u32) {
+    pub(crate) fn bits(&mut self, col: usize, row: usize, x: u32) {
         for j in 0..32 {
             self.0[col + j][row] = Felt::new(((x >> j) & 1) as u64);
         }
@@ -680,7 +681,7 @@ impl Cols {
 }
 
 /// Fill one compression's 64 rows and return its digest.
-fn fill_block<R: Rng>(cols: &mut Cols, b: usize, m: &[u32; 16], rng: &mut R) -> Word8 {
+pub(crate) fn fill_block<R: Rng>(cols: &mut Cols, b: usize, m: &[u32; 16], rng: &mut R) -> Word8 {
     let w = hash::schedule(m);
     let [mut a, mut bb, mut c, mut d, mut e, mut f, mut g, mut h] = IV;
     let mut digest = [0u32; 8];
@@ -778,7 +779,7 @@ pub struct Profile {
     pub unmasked: bool,
     /// Largest proof taken.
     pub max_proof_bytes: usize,
-    /// Use 384-bit SHA-384 FRI/Merkle commitments (192-bit classical / 128-bit QROM soundness).
+    /// Use 384-bit SHA-384 FRI/Merkle commitments (192-bit classical / 128-bit BHT QROM hash bound).
     pub sha384: bool,
 }
 
@@ -927,7 +928,7 @@ pub struct SpendProver {
 }
 
 /// `k` field elements drawn uniformly at random.
-fn random_elements<E: FieldElement>(k: usize) -> Vec<E> {
+pub(crate) fn random_elements<E: FieldElement>(k: usize) -> Vec<E> {
     use rand::RngCore;
     let mut rng = rand::thread_rng();
     let mut buf = vec![0u8; E::ELEMENT_BYTES];
@@ -1193,8 +1194,8 @@ pub const MAIN_MAX_PROOF_BYTES: usize = 520_000;
 /// Largest Mainnet v2 SHA-384 proof (384-bit FRI commitments + 128 queries + ZK masking).
 pub const MAIN_V2_MAX_PROOF_BYTES: usize = 700_000;
 
-/// Mainnet v2 spend profile: 128 queries, 384-bit SHA-384 FRI/Merkle commitments (128-bit
-/// QROM post-quantum collision resistance, 192-bit classical), Haböck–Al Kindi ZK masking.
+/// Mainnet v2 spend profile: 128 queries, 384-bit SHA-384 FRI/Merkle commitments (192-bit
+/// classical / 128-bit BHT QROM hash collision bound), Haböck–Al Kindi ZK segment masking.
 pub const MAIN_V2: Profile = Profile {
     queries: MAIN_QUERIES,
     tag: b"/main-v2-sha384",
@@ -1263,7 +1264,7 @@ impl Prover for SpendProver384 {
     }
 }
 
-/// Prove a Mainnet v2 spend with 384-bit SHA-384 FRI commitments (>= 128-bit QROM soundness).
+/// Prove a Mainnet v2 spend with 384-bit SHA-384 FRI/Merkle commitments.
 pub fn prove_v2_sha384(wit: &SpendWitness, bind: Word8) -> Result<(SpendPublic, Proof), String> {
     let pi = wit.public(bind)?;
     let trace = build_trace_with(wit, &MAIN_V2.meta());

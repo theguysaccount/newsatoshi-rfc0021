@@ -601,11 +601,14 @@ pub fn status(shared: &Shared) -> J {
         ("best_header".into(), J::num(n.best_header.max(c.height()))),
         ("mempool".into(), J::num(n.mempool_len())),
         ("issued".into(), J::num(s.issued)),
+        ("burned".into(), J::num(s.burned)),
+        ("locked".into(), J::num(s.locked)),
         ("notes".into(), J::num(s.tree.len())),
         ("nullifiers".into(), J::num(s.nullifiers.len())),
         ("locks".into(), J::num(s.locks.len())),
         ("conditions".into(), J::num(s.conds.len())),
         ("channels".into(), J::num(s.channels.len())),
+        ("priors".into(), J::num(s.priors.len())),
         ("auxpow_chainid".into(), J::num(auxpow::CHAIN_ID)),
         ("recent".into(), J::Arr(recent)),
     ])
@@ -928,173 +931,100 @@ fn merkle_proof_json(mp: &crate::merkmap::MerkleProof, root: [u8; 32]) -> J {
     ])
 }
 
-/// One RFC-0024 Universal Trust Bond, by bond id, with its canonical Merkle inclusion proof.
-pub fn bond_info(shared: &Shared, id: &[u8; 32]) -> J {
+/// One Priorism-FEP `PriorLock`, by id, with canonical Merkle inclusion proof when open.
+pub fn prior_info(shared: &Shared, id: &[u8; 32]) -> J {
     let n = lock(shared);
     let tip = n.chain.height();
     let st = &n.chain.state;
     let pool = n.pool_state();
-    let (b, confirmed, mp) = if let Some(b) = st.bonds.get(id) {
-        let proof = st.bonds_merkle.prove(id).map(|p| (p, st.bonds_merkle.root()));
-        (Some(b), true, proof)
-    } else if let Some(b) = pool.bonds.get(id) {
-        (Some(b), false, None)
-    } else {
-        (None, false, None)
-    };
-    let Some(b) = b else {
-        return J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))]);
-    };
-    let mut kv = vec![
-        ("found".into(), J::Bool(true)),
-        ("height".into(), J::num(tip)),
-        ("confirmed".into(), J::Bool(confirmed)),
-        ("id".into(), J::str(hex::encode(b.id))),
-        ("owner_vk".into(), J::str(hex::encode(b.post.owner_vk))),
-        ("owner_address".into(), J::str(encode_address(&b.post.owner_addr))),
-        ("arbiter_vks".into(), J::Arr(b.post.arbiter_vks.iter().map(|v| J::str(hex::encode(v))).collect())),
-        ("quorum_m".into(), J::num(b.post.quorum_m as u64)),
-        ("unbond_delay".into(), J::num(b.post.unbond_delay as u64)),
-        ("slash_burn_bps".into(), J::num(b.post.slash_burn_bps as u64)),
-        ("stake".into(), J::num(b.post.stake)),
-        ("service_tag".into(), J::str(hex::encode(b.post.service_tag))),
-        ("created_at".into(), J::num(b.created_at as u64)),
-        ("settled_count".into(), J::num(b.settled_count)),
-        ("settled_volume".into(), J::str(b.settled_volume.to_string())),
-        ("slash_count".into(), J::num(b.slash_count as u64)),
-        ("slashed_total".into(), J::str(b.slashed_total.to_string())),
-        ("unbond_amount".into(), J::num(b.unbond_amount)),
-        ("action_nonce".into(), J::num(b.action_nonce)),
-    ];
-    if let Some(h) = b.unbond_requested_at {
-        kv.push(("unbond_requested_at".into(), J::num(h as u64)));
-    }
-    if let Some((p, root)) = mp {
-        kv.push(("merkle_proof".into(), merkle_proof_json(&p, root)));
-    }
-    J::Obj(kv)
-}
-
-/// One RFC-0023 Sovereign L2 Rollup Vault, by rollup id, with canonical Merkle inclusion proof.
-pub fn rollup_info(shared: &Shared, id: &[u8; 32]) -> J {
-    let n = lock(shared);
-    let tip = n.chain.height();
-    let st = &n.chain.state;
-    let pool = n.pool_state();
-    let (rv, confirmed, mp) = if let Some(rv) = st.rollups.get(id) {
-        let proof = st.rollups_merkle.prove(id).map(|p| (p, st.rollups_merkle.root()));
-        (Some(rv), true, proof)
-    } else if let Some(rv) = pool.rollups.get(id) {
-        (Some(rv), false, None)
-    } else {
-        (None, false, None)
-    };
-    let Some(rv) = rv else {
-        return J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))]);
-    };
-    let mut kv = vec![
-        ("found".into(), J::Bool(true)),
-        ("height".into(), J::num(tip)),
-        ("confirmed".into(), J::Bool(confirmed)),
-        ("id".into(), J::str(hex::encode(rv.id))),
-        ("vk_hash".into(), J::str(hex::encode(rv.post.vk_hash))),
-        ("genesis_root".into(), J::str(hex::encode(rv.post.genesis_root))),
-        ("state_root".into(), J::str(hex::encode(rv.state_root))),
-        ("deposit_acc".into(), J::str(hex::encode(rv.deposit_acc))),
-        ("deposit_count".into(), J::num(rv.deposit_count)),
-        ("batch_seq".into(), J::num(rv.batch_seq)),
-        ("total_l2_txs".into(), J::num(rv.total_l2_txs)),
-        ("tvl".into(), J::num(rv.tvl)),
-        ("pending_withdrawals".into(), J::num(rv.pending_withdrawals)),
-        ("name_tag".into(), J::str(hex::encode(rv.post.name_tag))),
-        ("created_at".into(), J::num(rv.created_at as u64)),
-        (
-            "withdraw_roots".into(),
-            J::Arr(
-                rv.withdraw_roots
-                    .iter()
-                    .map(|(seq, root)| {
-                        J::Obj(vec![
-                            ("batch_seq".into(), J::num(*seq)),
-                            ("withdraw_root".into(), J::str(hex::encode(root))),
-                        ])
-                    })
-                    .collect(),
+    let render = |pl: &crate::prior::PriorLock,
+                  state: &str,
+                  confirmed: bool,
+                  end: Option<&crate::prior::PriorEnd>,
+                  mp: Option<(&crate::merkmap::MerkleProof, [u8; 32])>| {
+        let mut kv = vec![
+            ("found".into(), J::Bool(true)),
+            ("height".into(), J::num(tip)),
+            ("state".into(), J::str(state)),
+            ("confirmed".into(), J::Bool(confirmed)),
+            ("id".into(), J::str(hex::encode(pl.id))),
+            ("owner_vk".into(), J::str(hex::encode(pl.post.owner_vk))),
+            ("owner_address".into(), J::str(encode_address(&pl.post.owner_addr))),
+            ("spec_hash".into(), J::str(hex::encode(pl.post.spec_hash))),
+            ("falsifier_hash".into(), J::str(hex::encode(pl.post.falsifier_hash))),
+            (
+                "arbiter_vks".into(),
+                J::Arr(pl.post.arbiter_vks.iter().map(|v| J::str(hex::encode(v))).collect()),
             ),
-        ),
-        ("claimed_withdrawals_count".into(), J::num(rv.claimed_withdrawals.len() as u64)),
-    ];
-    if let Some(vk) = &rv.post.sequencer_vk {
-        kv.push(("sequencer_vk".into(), J::str(hex::encode(vk))));
+            ("quorum_m".into(), J::num(pl.post.quorum_m as u64)),
+            ("deadline".into(), J::num(pl.post.deadline as u64)),
+            ("challenge_window".into(), J::num(pl.post.challenge_window as u64)),
+            ("unlock_after".into(), J::num(pl.unlock_after() as u64)),
+            ("stake".into(), J::num(pl.post.stake)),
+            ("created_at".into(), J::num(pl.created_at as u64)),
+        ];
+        if let Some(oh) = pl.outcome_hash {
+            kv.push(("outcome_hash".into(), J::str(hex::encode(oh))));
+        }
+        if let Some(ca) = pl.committed_at {
+            kv.push(("committed_at".into(), J::num(ca as u64)));
+        }
+        if let Some(e) = end {
+            kv.push(("ended_at".into(), J::num(e.height as u64)));
+            kv.push(("miner_fee".into(), J::num(e.miner_fee)));
+            if let Some((ev, disc, bounty, burned)) = &e.disconfirmed {
+                kv.push(("evidence_hash".into(), J::str(hex::encode(ev))));
+                kv.push(("disconfirmer".into(), J::str(encode_address(disc))));
+                kv.push(("surprise_bounty".into(), J::num(*bounty)));
+                kv.push(("burned".into(), J::num(*burned)));
+            }
+        }
+        if let Some((p, root)) = mp {
+            kv.push(("merkle_proof".into(), merkle_proof_json(p, root)));
+        }
+        J::Obj(kv)
+    };
+    let end_label = |e: &crate::prior::PriorEnd| {
+        if e.disconfirmed.is_some() { "disconfirmed" } else { "released" }
+    };
+    if let Some(e) = st.prior_ends.get(id) {
+        render(&e.prior, end_label(e), true, Some(e), None)
+    } else if let Some(e) = pool.prior_ends.get(id) {
+        render(&e.prior, end_label(e), false, Some(e), None)
+    } else if let Some(pl) = st.priors.get(id) {
+        let mp = st.priors_merkle.prove(id).map(|p| (p, st.priors_merkle.root()));
+        render(pl, "open", true, None, mp.as_ref().map(|(p, r)| (p, *r)))
+    } else if let Some(pl) = pool.priors.get(id) {
+        render(pl, "open", false, None, None)
+    } else {
+        J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))])
     }
-    if let Some((p, root)) = mp {
-        kv.push(("merkle_proof".into(), merkle_proof_json(&p, root)));
-    }
-    J::Obj(kv)
 }
 
-/// One RFC-0027 Mission Launchpad & Agent Swarm Pool, by mission id, with canonical Merkle proof.
-pub fn mission_info(shared: &Shared, id: &[u8; 32]) -> J {
+/// Homeostatic Supply Thermostat telemetry (`issued`, `burned`, `locked`, `shielded_supply`).
+pub fn supply_info(shared: &Shared) -> J {
     let n = lock(shared);
     let tip = n.chain.height();
-    let st = &n.chain.state;
-    let pool = n.pool_state();
-    let (m, confirmed, mp) = if let Some(m) = st.missions.get(id) {
-        let proof = st.missions_merkle.prove(id).map(|p| (p, st.missions_merkle.root()));
-        (Some(m), true, proof)
-    } else if let Some(m) = pool.missions.get(id) {
-        (Some(m), false, None)
-    } else {
-        (None, false, None)
-    };
-    let Some(m) = m else {
-        return J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))]);
-    };
-    let tasks: Vec<J> = m
-        .tasks
-        .values()
-        .map(|t| {
-            let mut tkv = vec![
-                ("task_id".into(), J::num(t.task_id as u64)),
-                ("spec_hash".into(), J::str(hex::encode(t.spec_hash))),
-                ("reward".into(), J::num(t.reward)),
-            ];
-            match &t.status {
-                crate::mission::TaskStatus::Open => {
-                    tkv.push(("status".into(), J::str("open")));
-                }
-                crate::mission::TaskStatus::Completed { contributor_addr, proof_hash, height } => {
-                    tkv.push(("status".into(), J::str("completed")));
-                    tkv.push(("contributor_address".into(), J::str(encode_address(contributor_addr))));
-                    tkv.push(("proof_hash".into(), J::str(hex::encode(proof_hash))));
-                    tkv.push(("completed_height".into(), J::num(*height as u64)));
-                }
-            }
-            J::Obj(tkv)
-        })
-        .collect();
-    let mut kv = vec![
-        ("found".into(), J::Bool(true)),
-        ("height".into(), J::num(tip)),
-        ("confirmed".into(), J::Bool(confirmed)),
-        ("id".into(), J::str(hex::encode(m.id))),
-        ("mission_hash".into(), J::str(hex::encode(m.post.mission_hash))),
-        ("public_goods_address".into(), J::str(encode_address(&m.post.public_goods_addr))),
-        ("public_goods_bps".into(), J::num(m.post.public_goods_bps as u64)),
-        ("contributor_bps".into(), J::num((10_000 - m.post.public_goods_bps) as u64)),
-        ("curve_fee_bps".into(), J::num(m.post.curve_fee_bps as u64)),
-        ("min_worker_bond".into(), J::num(m.post.min_worker_bond)),
-        ("bounty_pool".into(), J::num(m.bounty_pool)),
-        ("curve_reserve".into(), J::num(m.curve_reserve)),
-        ("total_shares".into(), J::num(m.total_shares)),
-        ("completed_tasks".into(), J::num(m.completed_tasks)),
-        ("total_bounties_paid".into(), J::str(m.total_bounties_paid.to_string())),
-        ("tasks".into(), J::Arr(tasks)),
-    ];
-    if let Some((p, root)) = mp {
-        kv.push(("merkle_proof".into(), merkle_proof_json(&p, root)));
-    }
-    J::Obj(kv)
+    let s = &n.chain.state;
+    let p = &n.chain.params;
+    let burn_active = p.homeostatic_burn_from.is_some_and(|f| tip >= f);
+    J::Obj(vec![
+        ("ok".into(), J::Bool(true)),
+        ("height".into(), J::num(tip as u64)),
+        ("issued".into(), J::str(s.issued.to_string())),
+        ("burned".into(), J::str(s.burned.to_string())),
+        ("locked".into(), J::str(s.locked.to_string())),
+        ("shielded_supply".into(), J::str(s.shielded_supply().to_string())),
+        ("next_subsidy".into(), J::num(crate::params::subsidy(tip + 1))),
+        ("subsidy_floor".into(), J::num(crate::params::SUBSIDY_FLOOR)),
+        ("homeostatic_burn_active".into(), J::Bool(burn_active)),
+        (
+            "base_fee_burn_bps".into(),
+            J::num(if burn_active { crate::params::BASE_FEE_BURN_BPS } else { 0 }),
+        ),
+        ("open_priors".into(), J::num(s.priors.len() as u64)),
+        ("open_channels".into(), J::num(s.channels.len() as u64)),
+    ])
 }
 
 /// RFC-0026: Live BIP-9 collective protocol steering & ossification signaling telemetry.
@@ -1177,16 +1107,29 @@ pub fn submit_tx(shared: &Shared, bytes: &[u8]) -> J {
 pub fn envelopes(shared: &Shared, from: u32) -> J {
     const PAGE: usize = 200;
     fn items<'a>(txs: impl IntoIterator<Item = &'a crate::tx::Tx>, h: Option<u32>, out: &mut Vec<J>) {
-        for t in txs {
-            let crate::tx::Tx::Spend(sp) = t else { continue };
-            let (env, _) = crate::deliver::unpack_memo(&sp.memo);
+        let mut push_memo = |cm_out: &[Word8; 2], memo: &[u8]| {
+            let (env, _) = crate::deliver::unpack_memo(memo);
             for (i, e) in env.iter().enumerate() {
                 let Some(e) = e else { continue };
-                let mut kv = vec![("cm".into(), J::str(hex::encode(crate::hash::words_to_bytes(&sp.cm_out[i])))), ("env".into(), J::str(hex::encode(e)))];
+                let mut kv = vec![
+                    ("cm".into(), J::str(hex::encode(crate::hash::words_to_bytes(&cm_out[i])))),
+                    ("env".into(), J::str(hex::encode(e))),
+                ];
                 if let Some(h) = h {
                     kv.insert(0, ("h".into(), J::num(h as u64)));
                 }
                 out.push(J::Obj(kv));
+            }
+        };
+        for t in txs {
+            match t {
+                crate::tx::Tx::Spend(sp) => push_memo(&sp.cm_out, &sp.memo),
+                crate::tx::Tx::BatchSpend(bs) => {
+                    for s in &bs.spends {
+                        push_memo(&s.cm_out, &s.memo);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1272,14 +1215,8 @@ pub fn state_commitment(shared: &Shared) -> J {
     if let Some(ch) = &p.channels {
         parts.push(("channels".into(), h32(ch)));
     }
-    if let Some(b) = &p.bonds {
-        parts.push(("bonds".into(), h32(b)));
-    }
-    if let Some(rv) = &p.rollups {
-        parts.push(("rollups".into(), h32(rv)));
-    }
-    if let Some(m) = &p.missions {
-        parts.push(("missions".into(), h32(m)));
+    if let Some(pr) = &p.priors {
+        parts.push(("priors".into(), h32(pr)));
     }
     if let Some(f) = &p.header_mmr {
         parts.push(("header_mmr".into(), h32(f)));
@@ -1405,17 +1342,27 @@ fn flyclient_proof_json(shared: &Shared, tail: usize, samples: usize) -> J {
             return err_json("chain header unavailable");
         }
     }
+    let tip_tx_root = headers.last().unwrap().tx_root();
+    let tip_parts = n.chain.state.digest_parts();
     drop(n);
-    match crate::light::FlyClientProof::prove(&headers, tail.clamp(1, 32), samples.clamp(1, 64)) {
+    match crate::light::FlyClientProof::prove(
+        &headers,
+        tip_tx_root,
+        tip_parts,
+        tail.clamp(2, 32),
+        samples.clamp(1, 64),
+    ) {
         Ok(p) => J::Obj(vec![
             ("ok".into(), J::Bool(true)),
             ("genesis_hash".into(), J::str(hash_hex(&p.genesis_hash))),
             ("tip_height".into(), J::num(p.tip_height)),
             ("mmr_root".into(), J::str(hash_hex(&p.mmr_root))),
+            ("ancestor_work".into(), J::str(p.ancestor_work.to_string())),
             ("total_work".into(), J::str(p.total_work.to_string())),
             ("peak_count".into(), J::num(p.peaks.len())),
             ("tail_count".into(), J::num(p.tail_headers.len())),
             ("sample_count".into(), J::num(p.samples.len())),
+            ("header_mmr_bound".into(), J::Bool(p.tip_digest_parts.header_mmr == Some(p.mmr_root))),
             (
                 "peaks".into(),
                 J::Arr(
@@ -1533,18 +1480,11 @@ pub fn serve_public_with(shared: Shared, bind: &str, port: u16, faucet: Option<A
                                     _ => (400, err_json("give id= or tip=, 64 hex characters")),
                                 }
                             }
-                            ("GET", "/api/bond") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
-                                Some(Some(id)) => (200, bond_info(&sh, &id)),
+                            ("GET", "/api/prior") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
+                                Some(Some(id)) => (200, prior_info(&sh, &id)),
                                 _ => (400, err_json("id= takes 64 hex characters")),
                             },
-                            ("GET", "/api/rollup") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
-                                Some(Some(id)) => (200, rollup_info(&sh, &id)),
-                                _ => (400, err_json("id= takes 64 hex characters")),
-                            },
-                            ("GET", "/api/mission") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
-                                Some(Some(id)) => (200, mission_info(&sh, &id)),
-                                _ => (400, err_json("id= takes 64 hex characters")),
-                            },
+                            ("GET", "/api/supply") => (200, supply_info(&sh)),
                             ("GET", "/api/signaling") => (200, signaling_info(&sh)),
                             ("GET", "/api/cond") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
                                 Some(Some(id)) => (200, cond_info(&sh, &id)),

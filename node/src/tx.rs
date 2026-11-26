@@ -1,6 +1,7 @@
 //! Transactions and blocks.
 
 use crate::auxpow::{self, AuxPow};
+use crate::batch_spend::{BatchSpendPublic, MAX_BATCH_PROOF_BYTES, MAX_BATCH_SPENDS, MIN_BATCH_SPENDS};
 use crate::codec::{Reader, Res, Writer};
 use crate::hash::{bytes_to_words, sha256, sha256d, Word8};
 use crate::job::{Action, Deposit};
@@ -81,11 +82,81 @@ pub fn bind_of(fee: u64, deposit: &Option<Deposit>, memo: &[u8]) -> Word8 {
     bytes_to_words(&sha256(&w.0))
 }
 
+/// One shielded 2-in/2-out sub-spend inside a compressed `BatchSpend` STARK transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchSpendItem {
+    pub anchor: Word8,
+    pub nf: [Word8; 2],
+    pub cm_out: [Word8; 2],
+    pub dummy: [bool; 2],
+    pub fee: u64,
+    pub deposit: Option<Deposit>,
+    pub memo: Vec<u8>,
+}
+
+impl BatchSpendItem {
+    pub fn bind(&self) -> Word8 {
+        bind_of(self.fee, &self.deposit, &self.memo)
+    }
+
+    pub fn value_balance(&self) -> Res<i64> {
+        let d = match &self.deposit {
+            Some(dep) => dep.checked_amount()?,
+            None => 0,
+        };
+        let total = self.fee.checked_add(d).ok_or("value overflow")?;
+        i64::try_from(total).map_err(|_| "value overflow".into())
+    }
+
+    pub fn public(&self) -> Res<SpendPublic> {
+        Ok(SpendPublic {
+            root: self.anchor,
+            nf: self.nf,
+            cm_out: self.cm_out,
+            value_balance: self.value_balance()?,
+            dummy: self.dummy,
+            bind: self.bind(),
+        })
+    }
+}
+
+/// Multi-spend compressed shielded transaction: `K ∈ 2..=16` spends proved in ONE pure-SHA-2
+/// Winterfell STARK, paying the Negentropy Prover (`prover_a_pk`) a consensus split of block
+/// subsidy proportional to `K` (capped at 30%).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchSpend {
+    pub spends: Vec<BatchSpendItem>,
+    pub prover_a_pk: Word8,
+    pub proof: Vec<u8>,
+}
+
+impl BatchSpend {
+    pub fn public(&self) -> Res<BatchSpendPublic> {
+        let mut spends = Vec::with_capacity(self.spends.len());
+        for item in &self.spends {
+            spends.push(item.public()?);
+        }
+        Ok(BatchSpendPublic {
+            spends,
+            prover_a_pk: self.prover_a_pk,
+        })
+    }
+
+    pub fn total_fee(&self) -> Res<u64> {
+        let mut sum: u64 = 0;
+        for item in &self.spends {
+            sum = sum.checked_add(item.fee).ok_or("batch fee overflow")?;
+        }
+        Ok(sum)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tx {
     Coinbase(Coinbase),
     Spend(Spend),
     Act(Action),
+    BatchSpend(BatchSpend),
 }
 
 impl Tx {
@@ -112,6 +183,21 @@ impl Tx {
             Tx::Act(a) => {
                 w.u8(2);
                 a.encode(w);
+            }
+            Tx::BatchSpend(bs) => {
+                w.u8(3).u8(bs.spends.len() as u8).word8(&bs.prover_a_pk);
+                for s in &bs.spends {
+                    w.word8(&s.anchor).word8(&s.nf[0]).word8(&s.nf[1]);
+                    w.word8(&s.cm_out[0]).word8(&s.cm_out[1]).bool(s.dummy[0]).bool(s.dummy[1]).u64(s.fee);
+                    match &s.deposit {
+                        None => {
+                            w.u8(0);
+                        }
+                        Some(d) => d.encode(w),
+                    }
+                    w.bytes(&s.memo);
+                }
+                w.bytes(&bs.proof);
             }
         }
     }
@@ -142,6 +228,29 @@ impl Tx {
                 Tx::Spend(Spend { anchor, nf, cm_out, dummy, fee, deposit, memo: r.bytes(MAX_MEMO)?, proof: r.bytes(crate::spend::PROOF_BYTES_CAP)? })
             }
             2 => Tx::Act(Action::decode(r)?),
+            3 => {
+                let n = r.u8()? as usize;
+                if !(MIN_BATCH_SPENDS..=MAX_BATCH_SPENDS).contains(&n) {
+                    return Err("batch spend count out of range".into());
+                }
+                let prover_a_pk = r.word8()?;
+                let mut spends = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let anchor = r.word8()?;
+                    let nf = [r.word8()?, r.word8()?];
+                    let cm_out = [r.word8()?, r.word8()?];
+                    let dummy = [r.bool()?, r.bool()?];
+                    let fee = r.u64()?;
+                    let deposit = match r.u8()? {
+                        0 => None,
+                        tag => Some(Deposit::decode_body(tag, r)?),
+                    };
+                    let memo = r.bytes(MAX_MEMO)?;
+                    spends.push(BatchSpendItem { anchor, nf, cm_out, dummy, fee, deposit, memo });
+                }
+                let proof = r.bytes(MAX_BATCH_PROOF_BYTES)?;
+                Tx::BatchSpend(BatchSpend { spends, prover_a_pk, proof })
+            }
             _ => return Err("bad tx tag".into()),
         })
     }

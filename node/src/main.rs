@@ -674,8 +674,9 @@ fn run() -> Result<(), String> {
                 None
             };
             let json_out = format!(
-                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"magic\": \"nsM2\",\n  \"default_port\": {},\n  \"pq_transport\": true,\n  \"flyclient_mmr_from\": 0,\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_security_profile\": \"MAIN_V2_384_BIT_PURE_SHA2\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"rfc_activation_height\": 0,\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
+                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"release\": \"v1.0.0-core\",\n  \"magic\": \"nsM2\",\n  \"default_port\": {},\n  \"opportunistic_pq_transport\": true,\n  \"flyclient_mmr_from\": 0,\n  \"prior_lock_from\": 0,\n  \"homeostatic_fee_burn_bps\": {},\n  \"batch_spend_from\": 0,\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_hash_profile\": \"MAIN_V2_SHA384_128_QUERIES\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
                 p.default_port,
+                newsatoshi::params::BASE_FEE_BURN_BPS,
                 p.launch_blocks,
                 p.launch_half_life,
                 p.half_life,

@@ -1,15 +1,13 @@
-//! RFC-0026: Collective Protocol Steering (BIP-9 Version-Bits Signaling) & Hard Ossification.
+//! Collective Protocol Steering (BIP-9 Version-Bits Signaling) & Base-Layer Ossification.
 //!
-//! Enables miners, bonded verifiers, and full nodes to coordinate non-plutocratic protocol
-//! upgrades transparently using `Header::version` bits `1..=7` — preserving full Namecoin/Bitcoin
-//! AuxPoW compatibility (`auxpow::auxpow_version` keeps `(base & 0xff)` intact alongside
-//! `VERSION_AUXPOW = 1 << 8` and `CHAIN_ID = 0x4e53` in bits `16..=31`).
+//! Enables miners and full nodes to coordinate protocol upgrades transparently using
+//! `Header::version` bits `1..=7` — preserving full Namecoin/Bitcoin AuxPoW compatibility
+//! (`auxpow::auxpow_version` keeps `(base & 0xff)` intact alongside `VERSION_AUXPOW = 1 << 8`
+//! and `CHAIN_ID = 0x4e53` in bits `16..=31`).
 //!
-//! Includes a verifiable **Base-Layer Ossification Covenant**: once the `OSSIFY_MONETARY_BASE`
-//! deployment locks in and activates, core monetary supply (`subsidy`, `SUBSIDY_FLOOR`),
-//! pure SHA-2 spend conservation, and zero-premine invariants are permanently frozen while all
-//! future application innovation lives permissionlessly inside RFC-0023 L2 Rollups, RFC-0021
-//! Covenants, and RFC-0024 Trust Bonds.
+//! Includes a verifiable **Base-Layer Ossification Covenant**: once `ossify_monetary_base`
+//! locks in and activates, core monetary supply (`subsidy`, `SUBSIDY_FLOOR`, Homeostatic Burn),
+//! pure SHA-2 spend conservation, and zero-premine invariants are frozen.
 
 /// Valid version-bit indices usable alongside AuxPoW (`base = 1`, bits `1..=7`).
 pub const MIN_SIGNAL_BIT: u8 = 1;
@@ -72,11 +70,11 @@ pub struct DeploymentStatus {
     pub ossifies_monetary_base: bool,
 }
 
-/// Standard v2 collective deployments advertised by Newsatoshi nodes.
+/// Standard `v1.0.0-core` collective deployments advertised by Newsatoshi nodes.
 pub fn standard_deployments(window: u32, threshold: u32) -> Vec<Deployment> {
     vec![
         Deployment {
-            name: "rfc0021_covenant_stark_128",
+            name: "payword_channels",
             bit: 1,
             window,
             threshold,
@@ -85,7 +83,7 @@ pub fn standard_deployments(window: u32, threshold: u32) -> Vec<Deployment> {
             ossifies_monetary_base: false,
         },
         Deployment {
-            name: "rfc0022_payword_channels",
+            name: "priorism_fep_prior_lock",
             bit: 2,
             window,
             threshold,
@@ -94,7 +92,7 @@ pub fn standard_deployments(window: u32, threshold: u32) -> Vec<Deployment> {
             ossifies_monetary_base: false,
         },
         Deployment {
-            name: "rfc0023_sovereign_l2_rollups",
+            name: "homeostatic_fee_burn",
             bit: 3,
             window,
             threshold,
@@ -103,7 +101,7 @@ pub fn standard_deployments(window: u32, threshold: u32) -> Vec<Deployment> {
             ossifies_monetary_base: false,
         },
         Deployment {
-            name: "rfc0024_universal_trust_bonds",
+            name: "batch_spend_compression",
             bit: 4,
             window,
             threshold,
@@ -112,16 +110,7 @@ pub fn standard_deployments(window: u32, threshold: u32) -> Vec<Deployment> {
             ossifies_monetary_base: false,
         },
         Deployment {
-            name: "rfc0027_mission_launchpads",
-            bit: 5,
-            window,
-            threshold,
-            start_height: 0,
-            timeout_height: window.saturating_mul(52),
-            ossifies_monetary_base: false,
-        },
-        Deployment {
-            name: "rfc0026_ossify_monetary_base",
+            name: "ossify_monetary_base",
             bit: 7,
             window,
             threshold,

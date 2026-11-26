@@ -1,25 +1,23 @@
 //! Ledger state and the block validity rules.
 
-use crate::bond::{self, TrustBond};
+use crate::batch_spend::{self, MAX_BATCH_PROOF_BYTES, MAX_BATCH_SPENDS, MIN_BATCH_SPENDS};
 use crate::channel::{self, Channel, ChannelEnd, MAX_BLOCK_CHANNEL_HASHES};
 use crate::codec::Writer;
+use crate::cond::{self, Cond, CondEnd};
 use crate::hash::{sha256, Word8};
 use crate::job::{self, Action, Deposit, Job, Payout, Phase};
-use crate::cond::{self, Cond, CondEnd};
 use crate::lock::{self, Lock, LockEnd};
 use crate::merkmap::MerkleMap;
-use crate::mission::{self, MissionPool};
 use crate::nftree::NfTree;
 use crate::note::{self, NoteTree, MAX_NOTE_VALUE};
-use crate::params::{subsidy, Params, MAX_COINBASE_EXTRA, MAX_MEMO};
-use crate::rollup::{self, RollupVault};
+use crate::params::{
+    prover_subsidy_share, split_spend_fee, subsidy, Params, MAX_COINBASE_EXTRA, MAX_MEMO,
+    MIN_BATCH_SPEND_FEE,
+};
+use crate::prior::{self, PriorEnd, PriorLock};
 use crate::spend;
 use crate::tx::{header_commit, Block, Coinbase, PlainOut, Tx};
 use std::collections::{BTreeMap, VecDeque};
-// The state is kept in persistent collections: a copy shares everything it has in common
-// with the state it was copied from. A node keeps the state after each of its last blocks,
-// to step back to on a reorganisation, and copies the state to apply each new block; with
-// these, each kept state costs what its block changed, not the whole state again.
 use imbl::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -32,27 +30,21 @@ pub struct State {
     pub nullifiers: HashSet<Word8>,
     /// The same nullifiers, sorted in a Merkle tree (`crate::nftree`).
     pub nf_tree: NfTree,
-    /// Whether this state's digest includes the nullifier tree's root (from
-    /// `Params::nf_tree_from`).
+    /// Whether this state's digest includes the nullifier tree's root (`Params::nf_tree_from`).
     pub nf_committed: bool,
     /// Note-tree roots at the end of every block: the anchors a spend may prove against.
     pub roots: HashSet<Word8>,
     pub nf_acc: [u8; 32],
     pub jobs: BTreeMap<[u8; 32], Job>,
-    /// Open hash- and time-locked payments. A lock leaves this map when it is claimed or
-    /// refunded.
+    /// Open hash- and time-locked payments. A lock leaves this map when it is claimed or refunded.
     pub locks: BTreeMap<[u8; 32], Lock>,
-    /// Coinbase outputs wait here until they mature, then join the note tree. Delaying the
-    /// insertion enforces maturity without linking the later, private spend to the reward.
+    /// Coinbase outputs wait here until they mature, then join the note tree.
     pub pending_coinbase: VecDeque<(u32, Vec<PlainOut>)>,
     pub issued: u128,
     pub burned: u128,
     pub locked: u128,
     /// Openings that are public by construction (coinbase rewards, job payouts), by address.
-    /// Derived data for wallets; not part of the state digest.
     pub public_notes: HashMap<Word8, Vec<(u64, crate::note::Rho)>>,
-    /// How each closed lock ended, and the locks made for each payment hash. Derived data
-    /// for wallets and swap servers; not part of the state digest.
     pub lock_ends: HashMap<[u8; 32], LockEnd>,
     /// Coins under conditions (`crate::cond`), and how the finished ones ended.
     pub conds: BTreeMap<[u8; 32], Cond>,
@@ -60,26 +52,18 @@ pub struct State {
     pub locks_by_hash: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// RFC-0022: Open unilateral partial-claim PayWord payment channels (`crate::channel`).
     pub channels: imbl::OrdMap<[u8; 32], Channel>,
-    /// O(log N) incremental canonical SHA-256 Merkle map committing to open channels.
     pub channels_merkle: MerkleMap,
     pub channel_ends: HashMap<[u8; 32], ChannelEnd>,
     pub channels_by_tip: HashMap<[u8; 32], Vec<[u8; 32]>>,
-    /// RFC-0024: Persistent Universal Trust Bonds (`crate::bond`) + canonical Merkle map.
-    pub bonds: imbl::OrdMap<[u8; 32], TrustBond>,
-    pub bonds_merkle: MerkleMap,
-    /// RFC-0023: Sovereign L2 Rollup Vaults (`crate::rollup`) + canonical Merkle map.
-    pub rollups: imbl::OrdMap<[u8; 32], RollupVault>,
-    pub rollups_merkle: MerkleMap,
-    /// RFC-0027: Mission Launchpads & Decentralized Agent Swarm Pools + canonical Merkle map.
-    pub missions: imbl::OrdMap<[u8; 32], MissionPool>,
-    pub missions_merkle: MerkleMap,
-    /// Whether this state's digest commits to the ancestor FlyClient Header MMR root
-    /// (`Params::mmr_from`, `Some(0)` on Mainnet v2).
+    /// Priorism-FEP: Open falsifiable `PriorLock`s (`crate::prior`) + O(log N) Merkle map.
+    pub priors: imbl::OrdMap<[u8; 32], PriorLock>,
+    pub priors_merkle: MerkleMap,
+    pub prior_ends: HashMap<[u8; 32], PriorEnd>,
+    /// Whether this state's digest commits to the ancestor FlyClient Header MMR root.
     pub mmr_committed: bool,
     /// Consensus FlyClient Header MMR over ancestor block headers `[0..height-1]`.
     pub header_mmr: crate::light::HeaderMmr,
     /// Last applied block header (pushed into `header_mmr` when applying `height + 1`).
-    /// Derived continuity field; not directly part of `digest()`.
     pub last_header: Option<crate::tx::Header>,
 }
 
@@ -97,6 +81,44 @@ impl Default for State {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Compute mandatory consensus split-coinbase payouts to `BatchSpend` provers for a block at
+/// height `h` containing `txs`. Returns `(prover_a_pk, min_required_payout)` sorted by address.
+/// Returns empty when `batch_spend_from` is inactive or no `Tx::BatchSpend` is included.
+pub fn required_prover_payouts(h: u32, txs: &[Tx], params: &Params) -> Vec<(Word8, u64)> {
+    if h == 0 || !params.batch_spend_from.is_some_and(|f| h >= f) {
+        return vec![];
+    }
+    let mut counts: BTreeMap<Word8, u64> = BTreeMap::new();
+    let mut total: u64 = 0;
+    for tx in txs {
+        if let Tx::BatchSpend(bs) = tx {
+            let k = bs.spends.len() as u64;
+            *counts.entry(bs.prover_a_pk).or_insert(0) += k;
+            total = total.saturating_add(k);
+        }
+    }
+    if total < 2 {
+        return vec![];
+    }
+    let total_share = prover_subsidy_share(subsidy(h), total);
+    counts
+        .into_iter()
+        .filter_map(|(a_pk, c)| {
+            let req = ((total_share as u128 * c as u128) / total as u128) as u64;
+            (req > 0).then_some((a_pk, req))
+        })
+        .collect()
+}
+
+struct PendingSpendEffects {
+    job_after: Option<Job>,
+    cond_after: Option<Cond>,
+    lock_after: Option<Lock>,
+    channels_after: Vec<Channel>,
+    prior_after: Option<PriorLock>,
+    dep_amt: u64,
 }
 
 impl State {
@@ -128,19 +150,15 @@ impl State {
             channels_merkle: MerkleMap::new(),
             channel_ends: HashMap::new(),
             channels_by_tip: HashMap::new(),
-            bonds: imbl::OrdMap::new(),
-            bonds_merkle: MerkleMap::new(),
-            rollups: imbl::OrdMap::new(),
-            rollups_merkle: MerkleMap::new(),
-            missions: imbl::OrdMap::new(),
-            missions_merkle: MerkleMap::new(),
+            priors: imbl::OrdMap::new(),
+            priors_merkle: MerkleMap::new(),
+            prior_ends: HashMap::new(),
             mmr_committed: false,
             header_mmr: crate::light::HeaderMmr::new(),
             last_header: None,
         }
     }
 
-    /// Add a note commitment to the tree (and the index wallets look it up by).
     pub fn append(&mut self, cm: Word8) {
         let pos = self.tree.append(cm);
         self.cm_pos.entry(cm).or_default().push(pos);
@@ -150,8 +168,6 @@ impl State {
         self.digest_parts().digest()
     }
 
-    /// What the digest is made of, so a light client can check that a block commits to a
-    /// note-tree root without holding the state (`crate::light`).
     pub fn digest_parts(&self) -> DigestParts {
         let mut jw = Writer::new();
         for j in self.jobs.values() {
@@ -164,8 +180,6 @@ impl State {
                 pw.word8(&o.cm());
             }
         }
-        // Open locks enter the digest while there are any, so the commitments of blocks
-        // made before locks existed are unchanged.
         let locks = (!self.locks.is_empty()).then(|| {
             let mut lw = Writer::new();
             lw.raw(b"nsLOCKS");
@@ -174,7 +188,6 @@ impl State {
             }
             sha256(&lw.0)
         });
-        // conditions likewise, while any are open
         let conds = (!self.conds.is_empty()).then(|| {
             let mut cw = Writer::new();
             cw.raw(b"nsCONDS");
@@ -183,15 +196,8 @@ impl State {
             }
             sha256(&cw.0)
         });
-        // RFC-0022 PayWord channels: O(1) incremental Merkle root while any are open
         let channels = (!self.channels.is_empty()).then(|| self.channels_merkle.root());
-        // RFC-0024 Universal Trust Bonds: O(1) incremental Merkle root while any exist
-        let bonds = (!self.bonds.is_empty()).then(|| self.bonds_merkle.root());
-        // RFC-0023 Sovereign L2 Rollup Vaults: O(1) incremental Merkle root while any exist
-        let rollups = (!self.rollups.is_empty()).then(|| self.rollups_merkle.root());
-        // RFC-0027 Mission Launchpads: O(1) incremental Merkle root while any exist
-        let missions = (!self.missions.is_empty()).then(|| self.missions_merkle.root());
-        // FlyClient Header MMR root over ancestor headers [0..height-1] (Mainnet v2 from Genesis #0)
+        let priors = (!self.priors.is_empty()).then(|| self.priors_merkle.root());
         let header_mmr = self.mmr_committed.then(|| self.header_mmr.root());
         DigestParts {
             height: self.height,
@@ -206,27 +212,24 @@ impl State {
             conds,
             nf_root: self.nf_committed.then(|| crate::hash::words_to_bytes(&self.nf_tree.root())),
             channels,
-            bonds,
-            rollups,
-            missions,
+            priors,
             header_mmr,
         }
     }
 
-    /// Pay out of escrow: the value leaves `locked`, and the note joins the tree with its
-    /// opening public. Checked before anything changes.
     fn pay_out(&mut self, payouts: &[Payout], burned: u64) -> Result<(), String> {
         self.pay_out_with_fee(payouts, burned, 0)
     }
 
-    /// Pay out of escrow while also routing an explicit pre-funded `miner_fee` into the
-    /// block's fee pool (`locked` decreases by `payouts + burned + miner_fee`).
     fn pay_out_with_fee(&mut self, payouts: &[Payout], burned: u64, miner_fee: u64) -> Result<(), String> {
         let out: u128 = payouts.iter().map(|p| p.v as u128).sum::<u128>()
             + burned as u128
             + miner_fee as u128;
         let locked = self.locked.checked_sub(out).ok_or("escrow accounting underflow")?;
-        let cms = payouts.iter().map(|p| note::try_commit(&p.a_pk, p.v, &p.rho)).collect::<Result<Vec<_>, _>>()?;
+        let cms = payouts
+            .iter()
+            .map(|p| note::try_commit(&p.a_pk, p.v, &p.rho))
+            .collect::<Result<Vec<_>, _>>()?;
         self.locked = locked;
         self.burned += burned as u128;
         for (p, cm) in payouts.iter().zip(cms) {
@@ -236,15 +239,11 @@ impl State {
         Ok(())
     }
 
-    /// Issued − burned − locked: what the shielded pool holds *if every rule held*, counting
-    /// coinbase outputs still maturing. It is a public counter identity, not an audit of the
-    /// pool, which is private: a flaw in the circuit or the verifier could inflate the pool
-    /// without moving this number.
+    /// Issued − burned − locked: public counter identity (not an audit of private note values).
     pub fn shielded_supply(&self) -> u128 {
         self.issued - self.burned - self.locked
     }
 
-    /// First step of a block at height `h`: matured coinbase outputs join the note tree.
     pub fn begin_block(&mut self, h: u32, params: &Params) {
         while let Some((ch, _)) = self.pending_coinbase.front() {
             if *ch + params.coinbase_maturity <= h {
@@ -259,9 +258,180 @@ impl State {
         }
     }
 
-    /// Check one non-coinbase transaction against this state and apply it; returns its fee.
-    /// Every check runs before anything changes, so on error the state is exactly as it was
-    /// and a block builder or the mempool can try transactions one at a time.
+    fn validate_spend_fields(
+        &self,
+        anchor: &Word8,
+        nf: &[Word8; 2],
+        dummy: &[bool; 2],
+        deposit: &Option<Deposit>,
+        memo: &[u8],
+        h: u32,
+        params: &Params,
+    ) -> Result<PendingSpendEffects, String> {
+        if !self.roots.contains(anchor) {
+            return Err("unknown anchor".into());
+        }
+        if dummy[0] && dummy[1] {
+            return Err("a spend needs at least one real input".into());
+        }
+        for k in 0..2 {
+            if !dummy[k] && self.nullifiers.contains(&nf[k]) {
+                return Err("double spend".into());
+            }
+        }
+        if !dummy[0] && !dummy[1] && nf[0] == nf[1] {
+            return Err("double spend".into());
+        }
+        if memo.len() > MAX_MEMO {
+            return Err("memo too long".into());
+        }
+        let first_nf = if dummy[0] { nf[1] } else { nf[0] };
+        let job_after = match deposit {
+            Some(Deposit::Post(p)) => {
+                job::check_post(p, h)?;
+                let id = job::job_id(p, &first_nf);
+                if self.jobs.contains_key(&id) {
+                    return Err("duplicate job".into());
+                }
+                Some(Job { id, post: p.clone(), posted_at: h, phase: Phase::Open })
+            }
+            Some(Deposit::Claim(c)) => {
+                let mut j = self.jobs.get(&c.job).ok_or("unknown job")?.clone();
+                job::apply_claim(&mut j, c, h)?;
+                Some(j)
+            }
+            _ => None,
+        };
+        let cond_after = match deposit {
+            Some(Deposit::Cond(p)) => {
+                cond::check_post(p, h)?;
+                let id = cond::cond_id(p, &first_nf);
+                if self.conds.contains_key(&id) {
+                    return Err("duplicate condition".into());
+                }
+                Some(Cond { id, post: p.clone(), at: h })
+            }
+            _ => None,
+        };
+        let lock_after = match deposit {
+            Some(Deposit::Lock(p)) => {
+                lock::check_post(p, h)?;
+                let id = lock::lock_id(p, &first_nf);
+                if self.locks.contains_key(&id) {
+                    return Err("duplicate lock".into());
+                }
+                Some(Lock { id, post: p.clone(), at: h })
+            }
+            _ => None,
+        };
+        let channels_after = match deposit {
+            Some(Deposit::Channel(p)) => {
+                if !params.rfc0022_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0022 PayWord channels are not active at this height".into());
+                }
+                channel::check_post(p, h)?;
+                let id = channel::channel_id(p, &first_nf, 0);
+                if self.channels.contains_key(&id) {
+                    return Err("duplicate channel".into());
+                }
+                vec![Channel { id, post: p.clone(), at: h }]
+            }
+            Some(Deposit::ChannelBatch(list)) => {
+                if !params.rfc0022_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0022 PayWord channels are not active at this height".into());
+                }
+                channel::check_batch(list, h)?;
+                let mut out = Vec::with_capacity(list.len());
+                for (idx, p) in list.iter().enumerate() {
+                    let id = channel::channel_id(p, &first_nf, idx as u32);
+                    if self.channels.contains_key(&id) {
+                        return Err("duplicate channel".into());
+                    }
+                    out.push(Channel { id, post: p.clone(), at: h });
+                }
+                out
+            }
+            _ => vec![],
+        };
+        let prior_after = match deposit {
+            Some(Deposit::Prior(p)) => {
+                if !params.prior_from.is_some_and(|f| h >= f) {
+                    return Err("PriorLock is not active at this height".into());
+                }
+                prior::check_post(p, h)?;
+                let id = prior::prior_id(p, &first_nf);
+                if self.priors.contains_key(&id) || self.prior_ends.contains_key(&id) {
+                    return Err("duplicate prior".into());
+                }
+                Some(PriorLock {
+                    id,
+                    post: p.clone(),
+                    created_at: h,
+                    outcome_hash: None,
+                    committed_at: None,
+                })
+            }
+            _ => None,
+        };
+        let dep_amt = match deposit {
+            Some(d) => d.checked_amount()?,
+            None => 0,
+        };
+        Ok(PendingSpendEffects {
+            job_after,
+            cond_after,
+            lock_after,
+            channels_after,
+            prior_after,
+            dep_amt,
+        })
+    }
+
+    fn commit_spend_effects(
+        &mut self,
+        nf: &[Word8; 2],
+        cm_out: &[Word8; 2],
+        dummy: &[bool; 2],
+        fee: u64,
+        fx: PendingSpendEffects,
+        burn_active: bool,
+    ) -> u64 {
+        for k in 0..2 {
+            if !dummy[k] {
+                self.nullifiers.insert(nf[k]);
+                self.nf_tree.insert(nf[k]);
+                self.nf_acc = sha256(&[self.nf_acc.as_slice(), &crate::hash::words_to_bytes(&nf[k])].concat());
+            }
+        }
+        self.append(cm_out[0]);
+        self.append(cm_out[1]);
+        if let Some(j) = fx.job_after {
+            self.jobs.insert(j.id, j);
+        }
+        if let Some(l) = fx.lock_after {
+            self.locks_by_hash.entry(l.post.hash).or_default().push(l.id);
+            self.locks.insert(l.id, l);
+        }
+        if let Some(c) = fx.cond_after {
+            self.conds.insert(c.id, c);
+        }
+        for ch in fx.channels_after {
+            self.channels_by_tip.entry(ch.post.tip).or_default().push(ch.id);
+            self.channels_merkle.insert(ch.id, ch.value_hash());
+            self.channels.insert(ch.id, ch);
+        }
+        if let Some(pl) = fx.prior_after {
+            self.priors_merkle.insert(pl.id, pl.value_hash());
+            self.priors.insert(pl.id, pl);
+        }
+        self.locked += fx.dep_amt as u128;
+        let (burned_fee, producer_fee) = split_spend_fee(fee, burn_active);
+        self.burned += burned_fee as u128;
+        producer_fee
+    }
+
+    /// Check one non-coinbase transaction against this state and apply it; returns the
+    /// producer-claimable fee (after any Homeostatic Base-Fee Burn). Atomic on error.
     pub fn apply_tx(&mut self, tx: &Tx, h: u32, params: &Params, checks: Checks) -> Result<u64, String> {
         let size = tx.to_bytes().len();
         if size > params.max_tx_bytes {
@@ -271,267 +441,83 @@ impl State {
     }
 
     fn apply_tx_sized(&mut self, tx: &Tx, h: u32, params: &Params, checks: Checks) -> Result<u64, String> {
+        let burn_active = params.homeostatic_burn_from.is_some_and(|f| h >= f);
         match tx {
             Tx::Coinbase(_) => Err("a coinbase may only come first".into()),
             Tx::Spend(sp) => {
-                // `roots` changes only at the end of a block, so this is the set of anchors
-                // as of the previous block
-                if !self.roots.contains(&sp.anchor) {
-                    return Err("unknown anchor".into());
-                }
-                if sp.dummy[0] && sp.dummy[1] {
-                    return Err("a spend needs at least one real input".into());
-                }
-                for k in 0..2 {
-                    if !sp.dummy[k] && self.nullifiers.contains(&sp.nf[k]) {
-                        return Err("double spend".into());
-                    }
-                }
-                if !sp.dummy[0] && !sp.dummy[1] && sp.nf[0] == sp.nf[1] {
-                    return Err("double spend".into());
-                }
-                if sp.memo.len() > MAX_MEMO {
-                    return Err("memo too long".into());
-                }
                 if sp.proof.len() > params.proof.max_proof_bytes {
                     return Err("proof too large".into());
                 }
                 let pi = sp.public()?;
-                // job deposits: validate before paying for proof verification
-                let job_after = match &sp.deposit {
-                    Some(Deposit::Post(p)) => {
-                        job::check_post(p, h)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let id = job::job_id(p, &first_nf);
-                        if self.jobs.contains_key(&id) {
-                            return Err("duplicate job".into());
-                        }
-                        Some(Job { id, post: p.clone(), posted_at: h, phase: Phase::Open })
-                    }
-                    Some(Deposit::Claim(c)) => {
-                        let mut j = self.jobs.get(&c.job).ok_or("unknown job")?.clone();
-                        job::apply_claim(&mut j, c, h)?;
-                        Some(j)
-                    }
-                    Some(Deposit::Lock(_))
-                    | Some(Deposit::Cond(_))
-                    | Some(Deposit::Channel(_))
-                    | Some(Deposit::ChannelBatch(_))
-                    | Some(Deposit::Bond(_))
-                    | Some(Deposit::BondTopUp { .. })
-                    | Some(Deposit::RollupRegister(_))
-                    | Some(Deposit::RollupDeposit { .. })
-                    | Some(Deposit::MissionLaunch(_))
-                    | Some(Deposit::MissionFund { .. })
-                    | None => None,
-                };
-                let cond_after = match &sp.deposit {
-                    Some(Deposit::Cond(p)) => {
-                        cond::check_post(p, h)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let id = cond::cond_id(p, &first_nf);
-                        if self.conds.contains_key(&id) {
-                            return Err("duplicate condition".into());
-                        }
-                        Some(Cond { id, post: p.clone(), at: h })
-                    }
-                    _ => None,
-                };
-                let lock_after = match &sp.deposit {
-                    Some(Deposit::Lock(p)) => {
-                        lock::check_post(p, h)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let id = lock::lock_id(p, &first_nf);
-                        // the funding nullifier is new, so the id is too; checked anyway
-                        if self.locks.contains_key(&id) {
-                            return Err("duplicate lock".into());
-                        }
-                        Some(Lock { id, post: p.clone(), at: h })
-                    }
-                    _ => None,
-                };
-                let channels_after = match &sp.deposit {
-                    Some(Deposit::Channel(p)) => {
-                        if !params.rfc0022_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0022 PayWord channels are not active at this height".into());
-                        }
-                        channel::check_post(p, h)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let id = channel::channel_id(p, &first_nf, 0);
-                        if self.channels.contains_key(&id) {
-                            return Err("duplicate channel".into());
-                        }
-                        vec![Channel { id, post: p.clone(), at: h }]
-                    }
-                    Some(Deposit::ChannelBatch(list)) => {
-                        if !params.rfc0022_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0022 PayWord channels are not active at this height".into());
-                        }
-                        channel::check_batch(list, h)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let mut out = Vec::with_capacity(list.len());
-                        for (idx, p) in list.iter().enumerate() {
-                            let id = channel::channel_id(p, &first_nf, idx as u32);
-                            if self.channels.contains_key(&id) {
-                                return Err("duplicate channel".into());
-                            }
-                            out.push(Channel { id, post: p.clone(), at: h });
-                        }
-                        out
-                    }
-                    _ => vec![],
-                };
-                let bond_after = match &sp.deposit {
-                    Some(Deposit::Bond(p)) => {
-                        if !params.rfc0024_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0024 Trust Bonds are not active at this height".into());
-                        }
-                        bond::check_post(p)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let id = bond::bond_id(p, &first_nf);
-                        if self.bonds.contains_key(&id) {
-                            return Err("duplicate trust bond".into());
-                        }
-                        Some(TrustBond {
-                            id,
-                            post: p.clone(),
-                            created_at: h,
-                            settled_count: 0,
-                            settled_volume: 0,
-                            slash_count: 0,
-                            slashed_total: 0,
-                            unbond_requested_at: None,
-                            unbond_amount: 0,
-                            action_nonce: 0,
-                        })
-                    }
-                    Some(Deposit::BondTopUp { bond: id, amount }) => {
-                        if !params.rfc0024_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0024 Trust Bonds are not active at this height".into());
-                        }
-                        let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
-                        bond::apply_topup(&mut b, *amount)?;
-                        Some(b)
-                    }
-                    _ => None,
-                };
-                let rollup_after = match &sp.deposit {
-                    Some(Deposit::RollupRegister(p)) => {
-                        if !params.rfc0023_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
-                        }
-                        rollup::check_post(p)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let id = rollup::rollup_id(p, &first_nf);
-                        if self.rollups.contains_key(&id) {
-                            return Err("duplicate rollup vault".into());
-                        }
-                        Some(RollupVault {
-                            id,
-                            post: p.clone(),
-                            created_at: h,
-                            state_root: p.genesis_root,
-                            deposit_acc: [0u8; 32],
-                            deposit_count: 0,
-                            batch_seq: 0,
-                            total_l2_txs: 0,
-                            tvl: p.initial_tvl,
-                            pending_withdrawals: 0,
-                            withdraw_roots: vec![],
-                            claimed_withdrawals: vec![],
-                        })
-                    }
-                    Some(Deposit::RollupDeposit { rollup: id, l2_recipient, amount }) => {
-                        if !params.rfc0023_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
-                        }
-                        let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
-                        rollup::apply_deposit(&mut rv, l2_recipient, *amount)?;
-                        Some(rv)
-                    }
-                    _ => None,
-                };
-                let mission_after = match &sp.deposit {
-                    Some(Deposit::MissionLaunch(p)) => {
-                        if !params.rfc0027_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0027 Mission Launchpads are not active at this height".into());
-                        }
-                        mission::check_post(p)?;
-                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
-                        let id = mission::mission_id(p, &first_nf);
-                        if self.missions.contains_key(&id) {
-                            return Err("duplicate mission launchpad".into());
-                        }
-                        Some(MissionPool {
-                            id,
-                            post: p.clone(),
-                            created_at: h,
-                            bounty_pool: p.initial_funding,
-                            curve_reserve: 0,
-                            total_shares: 0,
-                            shares_by_holder: BTreeMap::new(),
-                            tasks: BTreeMap::new(),
-                            completed_tasks: 0,
-                            total_bounties_paid: 0,
-                            action_nonce: 0,
-                        })
-                    }
-                    Some(Deposit::MissionFund { mission: id, holder_vk, amount, direct_to_bounty }) => {
-                        if !params.rfc0027_from.is_some_and(|f| h >= f) {
-                            return Err("RFC-0027 Mission Launchpads are not active at this height".into());
-                        }
-                        let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
-                        mission::apply_fund(&mut m, *holder_vk, *amount, *direct_to_bounty)?;
-                        Some(m)
-                    }
-                    _ => None,
-                };
+                let fx = self.validate_spend_fields(
+                    &sp.anchor,
+                    &sp.nf,
+                    &sp.dummy,
+                    &sp.deposit,
+                    &sp.memo,
+                    h,
+                    params,
+                )?;
                 if checks.verify_proofs {
-                    spend::verify_bytes_cached(&params.proof, &pi, &sp.proof).map_err(|e| format!("proof rejected: {e}"))?;
+                    spend::verify_bytes_cached(&params.proof, &pi, &sp.proof)
+                        .map_err(|e| format!("proof rejected: {e}"))?;
                 }
-                // every check passed: apply
-                for k in 0..2 {
-                    if !sp.dummy[k] {
-                        self.nullifiers.insert(sp.nf[k]);
-                        self.nf_tree.insert(sp.nf[k]);
-                        self.nf_acc = sha256(&[self.nf_acc.as_slice(), &crate::hash::words_to_bytes(&sp.nf[k])].concat());
+                Ok(self.commit_spend_effects(&sp.nf, &sp.cm_out, &sp.dummy, sp.fee, fx, burn_active))
+            }
+            Tx::BatchSpend(bs) => {
+                if !params.batch_spend_from.is_some_and(|f| h >= f) {
+                    return Err("BatchSpend is not active at this height".into());
+                }
+                let k = bs.spends.len();
+                if !(MIN_BATCH_SPENDS..=MAX_BATCH_SPENDS).contains(&k) {
+                    return Err("batch spend count out of range".into());
+                }
+                if bs.proof.len() > MAX_BATCH_PROOF_BYTES {
+                    return Err("batch proof too large".into());
+                }
+                for (idx, item) in bs.spends.iter().enumerate() {
+                    if item.fee < MIN_BATCH_SPEND_FEE {
+                        return Err(format!(
+                            "batch item {idx}: fee {} below minimum {MIN_BATCH_SPEND_FEE}",
+                            item.fee
+                        ));
                     }
                 }
-                self.append(sp.cm_out[0]);
-                self.append(sp.cm_out[1]);
-                if let Some(j) = job_after {
-                    self.jobs.insert(j.id, j);
+                let pi = bs.public()?;
+                // Apply sequentially onto a scratch clone so intra-batch double spends or
+                // duplicate deposits are caught atomically before mutating `self`.
+                let mut scratch = self.clone();
+                let mut producer_fees: u64 = 0;
+                for (idx, item) in bs.spends.iter().enumerate() {
+                    let fx = scratch
+                        .validate_spend_fields(
+                            &item.anchor,
+                            &item.nf,
+                            &item.dummy,
+                            &item.deposit,
+                            &item.memo,
+                            h,
+                            params,
+                        )
+                        .map_err(|e| format!("batch item {idx}: {e}"))?;
+                    let pf = scratch.commit_spend_effects(
+                        &item.nf,
+                        &item.cm_out,
+                        &item.dummy,
+                        item.fee,
+                        fx,
+                        burn_active,
+                    );
+                    producer_fees = producer_fees
+                        .checked_add(pf)
+                        .ok_or("batch producer fee overflow")?;
                 }
-                if let Some(l) = lock_after {
-                    self.locks_by_hash.entry(l.post.hash).or_default().push(l.id);
-                    self.locks.insert(l.id, l);
+                if checks.verify_proofs {
+                    batch_spend::verify_batch_bytes_cached(&params.proof, &pi, &bs.proof)
+                        .map_err(|e| format!("batch proof rejected: {e}"))?;
                 }
-                if let Some(c) = cond_after {
-                    self.conds.insert(c.id, c);
-                }
-                for ch in channels_after {
-                    self.channels_by_tip.entry(ch.post.tip).or_default().push(ch.id);
-                    self.channels_merkle.insert(ch.id, ch.value_hash());
-                    self.channels.insert(ch.id, ch);
-                }
-                if let Some(b) = bond_after {
-                    self.bonds_merkle.insert(b.id, b.value_hash());
-                    self.bonds.insert(b.id, b);
-                }
-                if let Some(rv) = rollup_after {
-                    self.rollups_merkle.insert(rv.id, rv.value_hash());
-                    self.rollups.insert(rv.id, rv);
-                }
-                if let Some(m) = mission_after {
-                    self.missions_merkle.insert(m.id, m.value_hash());
-                    self.missions.insert(m.id, m);
-                }
-                let dep_amt = match &sp.deposit {
-                    Some(d) => d.checked_amount()? as u128,
-                    None => 0,
-                };
-                self.locked += dep_amt;
-                Ok(sp.fee)
+                *self = scratch;
+                Ok(producer_fees)
             }
             Tx::Act(Action::Unlock { lock: id, preimage }) => {
                 let l = self.locks.get(id).ok_or("unknown lock")?;
@@ -550,8 +536,7 @@ impl State {
             }
             Tx::Act(Action::Fulfil { cond: id, payout, salt, program, witness }) => {
                 let c = self.conds.get(id).ok_or("unknown condition")?;
-                let rfc0021_active = params.rfc0021_from.is_some_and(|f| h >= f);
-                let p = cond::fulfil_at(c, *payout, salt, program, witness, h, rfc0021_active)?;
+                let p = cond::fulfil(c, *payout, salt, program, witness, h)?;
                 self.pay_out(&[p], 0)?;
                 let c = self.conds.remove(id).expect("checked above");
                 self.cond_ends.insert(*id, CondEnd { cond: c, height: h, fulfilled: Some((*payout, program.clone())) });
@@ -609,254 +594,108 @@ impl State {
                 );
                 Ok(res.miner_fee)
             }
-            Tx::Act(Action::BondAttest {
-                bond: id,
-                receipt_hash,
-                settled_amount,
-                fee,
-                owner_sig,
-                counterparty_vk,
-                counterparty_sig,
-            }) => {
-                if !params.rfc0024_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+            Tx::Act(Action::PriorCommit { prior: id, outcome_hash, sig }) => {
+                if !params.prior_from.is_some_and(|f| h >= f) {
+                    return Err("PriorLock is not active at this height".into());
                 }
-                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
-                let eff = bond::attest(
-                    &mut b,
-                    receipt_hash,
-                    *settled_amount,
-                    *fee,
-                    owner_sig,
-                    counterparty_vk,
-                    counterparty_sig,
-                )?;
-                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
-                self.bonds_merkle.insert(b.id, b.value_hash());
-                self.bonds.insert(b.id, b);
-                Ok(eff.miner_fee)
+                let mut pl = self.priors.get(id).ok_or("unknown prior")?.clone();
+                prior::apply_commit(&mut pl, *outcome_hash, sig, h)?;
+                self.priors_merkle.insert(pl.id, pl.value_hash());
+                self.priors.insert(pl.id, pl);
+                Ok(0)
             }
-            Tx::Act(Action::BondSlashEquivocation {
-                bond: id,
+            Tx::Act(Action::PriorDisconfirmObjective {
+                prior: id,
+                evidence_kind,
                 context_nonce,
                 payload_a,
                 sig_a,
                 payload_b,
                 sig_b,
-                victim_addr,
-                slash_amount,
+                disconfirmer_addr,
                 miner_fee,
             }) => {
-                if !params.rfc0024_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                if !params.prior_from.is_some_and(|f| h >= f) {
+                    return Err("PriorLock is not active at this height".into());
                 }
-                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
-                let eff = bond::slash_equivocation(
-                    &mut b,
+                let pl = self.priors.get(id).ok_or("unknown prior")?;
+                let eff = prior::apply_disconfirm_objective(
+                    pl,
+                    *evidence_kind,
                     *context_nonce,
                     payload_a,
                     sig_a,
                     payload_b,
                     sig_b,
-                    *victim_addr,
-                    *slash_amount,
+                    *disconfirmer_addr,
                     *miner_fee,
+                    h,
                 )?;
                 self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
-                self.bonds_merkle.insert(b.id, b.value_hash());
-                self.bonds.insert(b.id, b);
+                let pl = self.priors.remove(id).expect("checked above");
+                self.priors_merkle.remove(id);
+                self.prior_ends.insert(
+                    *id,
+                    PriorEnd {
+                        prior: pl,
+                        height: h,
+                        disconfirmed: eff.disconfirmed,
+                        miner_fee: eff.miner_fee,
+                    },
+                );
                 Ok(eff.miner_fee)
             }
-            Tx::Act(Action::BondSlashQuorum {
-                bond: id,
-                dispute_hash,
-                victim_addr,
-                slash_amount,
+            Tx::Act(Action::PriorDisconfirmQuorum {
+                prior: id,
+                evidence_hash,
+                disconfirmer_addr,
                 miner_fee,
                 sigs,
             }) => {
-                if !params.rfc0024_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                if !params.prior_from.is_some_and(|f| h >= f) {
+                    return Err("PriorLock is not active at this height".into());
                 }
-                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
-                let eff = bond::slash_quorum(
-                    &mut b,
-                    dispute_hash,
-                    *victim_addr,
-                    *slash_amount,
+                let pl = self.priors.get(id).ok_or("unknown prior")?;
+                let eff = prior::apply_disconfirm_quorum(
+                    pl,
+                    evidence_hash,
+                    *disconfirmer_addr,
                     *miner_fee,
                     sigs,
-                )?;
-                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
-                self.bonds_merkle.insert(b.id, b.value_hash());
-                self.bonds.insert(b.id, b);
-                Ok(eff.miner_fee)
-            }
-            Tx::Act(Action::BondUnbondRequest { bond: id, amount, sig }) => {
-                if !params.rfc0024_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
-                }
-                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
-                bond::request_unbond(&mut b, *amount, sig, h)?;
-                self.bonds_merkle.insert(b.id, b.value_hash());
-                self.bonds.insert(b.id, b);
-                Ok(0)
-            }
-            Tx::Act(Action::BondUnbondComplete { bond: id, miner_fee }) => {
-                if !params.rfc0024_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
-                }
-                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
-                let eff = bond::complete_unbond(&mut b, *miner_fee, h)?;
-                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
-                self.bonds_merkle.insert(b.id, b.value_hash());
-                self.bonds.insert(b.id, b);
-                Ok(eff.miner_fee)
-            }
-            Tx::Act(Action::RollupBatch {
-                rollup: id,
-                new_state_root,
-                withdraw_root,
-                batch_tx_count,
-                batch_withdrawals,
-                batch_fee,
-                sequencer_sig,
-                proof,
-            }) => {
-                if !params.rfc0023_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
-                }
-                let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
-                let fee = rollup::apply_batch(
-                    &mut rv,
-                    *new_state_root,
-                    *withdraw_root,
-                    *batch_tx_count,
-                    *batch_withdrawals,
-                    *batch_fee,
-                    sequencer_sig,
-                    proof,
-                    checks.verify_proofs,
-                )?;
-                self.pay_out_with_fee(&[], 0, fee)?;
-                self.rollups_merkle.insert(rv.id, rv.value_hash());
-                self.rollups.insert(rv.id, rv);
-                Ok(fee)
-            }
-            Tx::Act(Action::RollupZkVmBatch {
-                rollup: id,
-                withdraw_root,
-                batch_fee,
-                sequencer_sig,
-                shards,
-            }) => {
-                if !params.rfc0023_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
-                }
-                let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
-                let fee = rollup::apply_zkvm_batch(
-                    &mut rv,
-                    *withdraw_root,
-                    *batch_fee,
-                    sequencer_sig,
-                    shards,
-                    checks.verify_proofs,
-                )?;
-                self.pay_out_with_fee(&[], 0, fee)?;
-                self.rollups_merkle.insert(rv.id, rv.value_hash());
-                self.rollups.insert(rv.id, rv);
-                Ok(fee)
-            }
-            Tx::Act(Action::RollupWithdraw {
-                rollup: id,
-                batch_seq,
-                withdrawal_id,
-                recipient_addr,
-                amount,
-                miner_fee,
-                proof,
-            }) => {
-                if !params.rfc0023_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
-                }
-                let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
-                let (payout, fee) = rollup::apply_withdraw(
-                    &mut rv,
-                    *batch_seq,
-                    withdrawal_id,
-                    *recipient_addr,
-                    *amount,
-                    *miner_fee,
-                    proof,
-                )?;
-                let payouts = if payout.v > 0 { vec![payout] } else { vec![] };
-                self.pay_out_with_fee(&payouts, 0, fee)?;
-                self.rollups_merkle.insert(rv.id, rv.value_hash());
-                self.rollups.insert(rv.id, rv);
-                Ok(fee)
-            }
-            Tx::Act(Action::MissionPostTask { mission: id, task_id, spec_hash, reward, sig }) => {
-                if !params.rfc0027_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0027 Mission Launchpads are not active at this height".into());
-                }
-                let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
-                mission::apply_post_task(&mut m, *task_id, *spec_hash, *reward, sig)?;
-                self.missions_merkle.insert(m.id, m.value_hash());
-                self.missions.insert(m.id, m);
-                Ok(0)
-            }
-            Tx::Act(Action::MissionClaimTask {
-                mission: id,
-                task_id,
-                proof_hash,
-                contributor_addr,
-                contributor_bond_id,
-                miner_fee,
-                verifier_sigs,
-            }) => {
-                if !params.rfc0027_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0027 Mission Launchpads are not active at this height".into());
-                }
-                let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
-                let worker_bond = contributor_bond_id.and_then(|bid| self.bonds.get(&bid));
-                let eff = mission::apply_claim_task(
-                    &mut m,
-                    *task_id,
-                    *proof_hash,
-                    *contributor_addr,
-                    worker_bond,
-                    *miner_fee,
-                    verifier_sigs,
                     h,
                 )?;
-                self.pay_out_with_fee(&eff.payouts, 0, eff.miner_fee)?;
-                self.missions_merkle.insert(m.id, m.value_hash());
-                self.missions.insert(m.id, m);
+                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
+                let pl = self.priors.remove(id).expect("checked above");
+                self.priors_merkle.remove(id);
+                self.prior_ends.insert(
+                    *id,
+                    PriorEnd {
+                        prior: pl,
+                        height: h,
+                        disconfirmed: eff.disconfirmed,
+                        miner_fee: eff.miner_fee,
+                    },
+                );
                 Ok(eff.miner_fee)
             }
-            Tx::Act(Action::MissionCurveRedeem {
-                mission: id,
-                holder_vk,
-                shares,
-                recipient_addr,
-                miner_fee,
-                sig,
-            }) => {
-                if !params.rfc0027_from.is_some_and(|f| h >= f) {
-                    return Err("RFC-0027 Mission Launchpads are not active at this height".into());
+            Tx::Act(Action::PriorRelease { prior: id, miner_fee, owner_sig }) => {
+                if !params.prior_from.is_some_and(|f| h >= f) {
+                    return Err("PriorLock is not active at this height".into());
                 }
-                let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
-                let eff = mission::apply_curve_redeem(
-                    &mut m,
-                    *holder_vk,
-                    *shares,
-                    *recipient_addr,
-                    *miner_fee,
-                    sig,
-                )?;
-                self.pay_out_with_fee(&eff.payouts, 0, eff.miner_fee)?;
-                self.missions_merkle.insert(m.id, m.value_hash());
-                self.missions.insert(m.id, m);
+                let pl = self.priors.get(id).ok_or("unknown prior")?;
+                let eff = prior::apply_release(pl, *miner_fee, owner_sig, h)?;
+                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
+                let pl = self.priors.remove(id).expect("checked above");
+                self.priors_merkle.remove(id);
+                self.prior_ends.insert(
+                    *id,
+                    PriorEnd {
+                        prior: pl,
+                        height: h,
+                        disconfirmed: None,
+                        miner_fee: eff.miner_fee,
+                    },
+                );
                 Ok(eff.miner_fee)
             }
             Tx::Act(a) => {
@@ -869,15 +708,34 @@ impl State {
         }
     }
 
-    /// Last step: the coinbase claim, issuance, the maturity queue and the new anchor.
-    fn finish_block(&mut self, cb: &Coinbase, fees: u128, h: u32, genesis: bool) -> Result<(), String> {
+    /// Last step: coinbase cap + mandatory Negentropy Prover split, issuance, maturity queue, anchor.
+    fn finish_block(
+        &mut self,
+        cb: &Coinbase,
+        fees: u128,
+        prover_reqs: &[(Word8, u64)],
+        h: u32,
+        genesis: bool,
+    ) -> Result<(), String> {
         let claimed: u128 = cb.outs.iter().map(|o| o.v as u128).sum();
         let allowed = if genesis { 0 } else { subsidy(h) as u128 + fees };
         if claimed > allowed {
             return Err(format!("coinbase claims {claimed}, allowed {allowed}"));
         }
-        // fees left the shielded pool when paid and return through the coinbase; fees not
-        // claimed are burned, and the subsidy portion is issuance
+        // Split-coinbase enforcement: every BatchSpend prover MUST receive its consensus share.
+        for (prover_a_pk, req) in prover_reqs {
+            let paid: u128 = cb
+                .outs
+                .iter()
+                .filter(|o| &o.a_pk == prover_a_pk)
+                .map(|o| o.v as u128)
+                .sum();
+            if paid < *req as u128 {
+                return Err(format!(
+                    "coinbase underpays BatchSpend prover: paid {paid}, required {req}"
+                ));
+            }
+        }
         if claimed >= fees {
             self.issued += claimed - fees;
         } else {
@@ -891,16 +749,12 @@ impl State {
         Ok(())
     }
 
-    /// Apply a block on top of this state and return the new state. Genesis blocks are
-    /// applied to `State::new()` at height 0.
     pub fn apply(&self, block: &Block, params: &Params, checks: Checks) -> Result<State, String> {
         let genesis = block.header.prev == [0u8; 32];
         let h = if genesis { 0 } else { self.height + 1 };
         if genesis && (self.height != 0 || !self.tree.is_empty()) {
             return Err("genesis applied to a non-empty state".into());
         }
-        // every limit `Block::decode` enforces is enforced here too, so a block this node
-        // accepts is a block every node can decode
         block.check_limits(params.max_block_bytes, params.max_tx_bytes)?;
 
         let mut s = self.clone();
@@ -943,9 +797,12 @@ impl State {
                     ));
                 }
             }
-            fees += s.apply_tx_sized(tx, h, params, checks).map_err(|e| format!("tx {i}: {e}"))? as u128;
+            fees += s
+                .apply_tx_sized(tx, h, params, checks)
+                .map_err(|e| format!("tx {i}: {e}"))? as u128;
         }
-        s.finish_block(cb, fees, h, genesis)?;
+        let prover_reqs = required_prover_payouts(h, &block.txs[1..], params);
+        s.finish_block(cb, fees, &prover_reqs, h, genesis)?;
         if checks.check_commit {
             let digest = s.digest();
             if block.digest != digest || block.header.commit != header_commit(&block.tx_root(), &digest) {
@@ -957,9 +814,7 @@ impl State {
     }
 }
 
-/// The parts of the state digest a block header commits to: the height, the note-tree root,
-/// the nullifier accumulator, hashes of the jobs, the maturing coinbases and the open locks,
-/// and the supply counters.
+/// The parts of the state digest a block header commits to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigestParts {
     pub height: u32,
@@ -972,16 +827,10 @@ pub struct DigestParts {
     pub locked: u128,
     pub locks: Option<[u8; 32]>,
     pub conds: Option<[u8; 32]>,
-    /// The nullifier tree's root, from `Params::nf_tree_from`.
     pub nf_root: Option<[u8; 32]>,
-    /// RFC-0022: Open PayWord channels digest (present only while any channels are open).
     pub channels: Option<[u8; 32]>,
-    /// RFC-0024: Universal Trust Bonds Merkle root (present only while any bonds exist).
-    pub bonds: Option<[u8; 32]>,
-    /// RFC-0023: Sovereign L2 Rollup Vaults Merkle root (present only while any rollups exist).
-    pub rollups: Option<[u8; 32]>,
-    /// RFC-0027: Mission Launchpads & Swarm Pools Merkle root (present only while any exist).
-    pub missions: Option<[u8; 32]>,
+    /// Priorism-FEP: Open `PriorLock` Merkle root (present only while any priors are open).
+    pub priors: Option<[u8; 32]>,
     /// FlyClient Header MMR root over ancestor headers `[0..height-1]` (`Params::mmr_from`).
     pub header_mmr: Option<[u8; 32]>,
 }
@@ -991,11 +840,12 @@ impl DigestParts {
         let mut w = Writer::new();
         w.raw(b"nsSTATE").u32(self.height).word8(&self.tree_root).raw(&self.nf_acc);
         w.raw(&self.jobs).raw(&self.pending);
-        w.raw(&self.issued.to_le_bytes()).raw(&self.burned.to_le_bytes()).raw(&self.locked.to_le_bytes());
+        w.raw(&self.issued.to_le_bytes())
+            .raw(&self.burned.to_le_bytes())
+            .raw(&self.locked.to_le_bytes());
         if let Some(l) = &self.locks {
             w.raw(l);
         }
-        // marked, so that open conditions and open locks can never hash alike
         if let Some(c) = &self.conds {
             w.raw(b"C").raw(c);
         }
@@ -1005,14 +855,8 @@ impl DigestParts {
         if let Some(ch) = &self.channels {
             w.raw(b"P").raw(ch);
         }
-        if let Some(b) = &self.bonds {
-            w.raw(b"B").raw(b);
-        }
-        if let Some(r) = &self.rollups {
-            w.raw(b"R").raw(r);
-        }
-        if let Some(m) = &self.missions {
-            w.raw(b"M").raw(m);
+        if let Some(pr) = &self.priors {
+            w.raw(b"K").raw(pr);
         }
         if let Some(f) = &self.header_mmr {
             w.raw(b"F").raw(f);
@@ -1025,7 +869,6 @@ impl DigestParts {
 mod tests {
     use super::*;
 
-    /// The digest before locks existed: blocks made then must keep their commitments.
     fn digest_without_locks(s: &State) -> [u8; 32] {
         let mut w = Writer::new();
         w.raw(b"nsSTATE").u32(s.height).word8(&s.tree.root()).raw(&s.nf_acc);
@@ -1042,7 +885,9 @@ mod tests {
             }
         }
         w.raw(&sha256(&pw.0));
-        w.raw(&s.issued.to_le_bytes()).raw(&s.burned.to_le_bytes()).raw(&s.locked.to_le_bytes());
+        w.raw(&s.issued.to_le_bytes())
+            .raw(&s.burned.to_le_bytes())
+            .raw(&s.locked.to_le_bytes());
         sha256(&w.0)
     }
 
@@ -1053,9 +898,16 @@ mod tests {
         s.issued = 123;
         s.locked = 5;
         s.append([1; 8]);
-        s.pending_coinbase.push_back((7, vec![PlainOut { a_pk: [2; 8], v: 9, rho: [3; 5] }]));
+        s.pending_coinbase
+            .push_back((7, vec![PlainOut { a_pk: [2; 8], v: 9, rho: [3; 5] }]));
         assert_eq!(s.digest(), digest_without_locks(&s));
-        let post = lock::LockPost { hash: [4; 32], timeout: 20, claim_addr: [5; 8], refund_addr: [6; 8], amount: 5 };
+        let post = lock::LockPost {
+            hash: [4; 32],
+            timeout: 20,
+            claim_addr: [5; 8],
+            refund_addr: [6; 8],
+            amount: 5,
+        };
         s.locks.insert([8; 32], Lock { id: [8; 32], post, at: 7 });
         assert_ne!(s.digest(), digest_without_locks(&s), "an open lock is committed to");
         s.locks.clear();

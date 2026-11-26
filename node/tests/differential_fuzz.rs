@@ -1,15 +1,16 @@
-//! Multi-Client Differential Verification (Rust L1 ↔ Independent Node.js/OpenSSL/BigInt Verifier)
+//! Multi-Client Differential Verification (Rust L1 <-> Independent Node.js/OpenSSL/BigInt Verifier)
 //! + Deterministic 10,000-Iteration Adversarial Mutation Fuzzer
-//! + Frontier E2E (Utreexo Tracked Proofs -> Spend STARK, Pruned Disk KV, SHA-256d HeaderChain STARK, FRI Folding STARK).
+//! + Frontier E2E (Utreexo 1 KB Tracked Proofs -> Spend STARK, Pruned Disk KV, SHA-256d HeaderChain STARK, FRI Folding STARK).
 
 use newsatoshi::auxpow::AuxPow;
+use newsatoshi::batch_spend::{verify_batch_bytes_for, BatchSpendPublic};
 use newsatoshi::chain::{mine, Chain};
 use newsatoshi::codec::Reader;
 use newsatoshi::hash::{sha256, words_to_bytes};
 use newsatoshi::job::{Action, Deposit};
 use newsatoshi::light::HeaderMmr;
 use newsatoshi::node::CompactBlock;
-use newsatoshi::params::{subsidy, Net, Params, DEFAULT_FEE, MAIN_V2_DEFAULT_FEE};
+use newsatoshi::params::{split_spend_fee, subsidy, Net, Params, DEFAULT_FEE, MAIN_V2_DEFAULT_FEE};
 use newsatoshi::peers::{self, AddrBook};
 use newsatoshi::pow;
 use newsatoshi::pruned_store::{load_pruned_checkpoint, prune_chain_to_disk, DiskKvStore};
@@ -17,12 +18,10 @@ use newsatoshi::recursion::{
     prove_fri_folding, prove_header_chain_segment, verify_folded_header_segments,
     verify_fri_folding, FriFoldStep, HEADERS_PER_SEGMENT,
 };
-use newsatoshi::rollup::{verify_batch_proof, RollupBatchInputs};
 use newsatoshi::spend::{self, InputNote, OutputNote, SpendPublic, SpendWitness};
 use newsatoshi::tx::{Block, Header, PlainOut, Tx};
 use newsatoshi::utreexo::{CompactNoteTree, TrackedNoteProof};
 use newsatoshi::wallet::Wallet;
-use newsatoshi::zkvm::{verify_zkvm_execution, ZkVmPublicInputs, ZkVmShard};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use winterfell::math::fields::f64::BaseElement as Felt;
@@ -52,7 +51,6 @@ fn run_independent_verifier(json_payload: &str) -> (bool, String) {
 
 #[test]
 fn differential_rust_vs_independent_js_openssl_verifier() {
-    // 1. Mine a real Mainnet v2 chain (with Genesis-#0 FlyClient MMR commitment & SHA-384 spends)
     let mut p = Params::main_v2_with(1_762_473_600, u32::MAX, 0x207fffff);
     p.pow_limit = 0x207fffff;
     p.coinbase_maturity = 1;
@@ -69,12 +67,12 @@ fn differential_rust_vs_independent_js_openssl_verifier() {
     let (spend_tx, _) = alice
         .spend(&chain, Some((bob.a_pk(), 100_000_000)), MAIN_V2_DEFAULT_FEE, None, vec![])
         .unwrap();
-    let out6 = PlainOut { a_pk: bob.a_pk(), v: subsidy(6) + MAIN_V2_DEFAULT_FEE, rho: [66; 5] };
+    let (burned_fee, producer_fee) = split_spend_fee(MAIN_V2_DEFAULT_FEE, true);
+    let out6 = PlainOut { a_pk: bob.a_pk(), v: subsidy(6) + producer_fee, rho: [66; 5] };
     let mut b6 = chain.template(vec![out6], vec![spend_tx], vec![]).unwrap();
     assert!(mine(&mut b6.header, u64::MAX));
     chain.add_block(b6.clone()).unwrap();
 
-    // Build headers list [0..=6], note leaves, DigestParts, ASERT check, PayWord, and Bond slash
     let headers_hex: Vec<String> = chain
         .active
         .iter()
@@ -87,7 +85,6 @@ fn differential_rust_vs_independent_js_openssl_verifier() {
     }
     let (mmr_root, _) = rust_mmr.root_and_work();
 
-    // Independent ASERT cross-check on non-trivial timestamp & height delta
     let asert_expected = pow::asert_bits(
         0x1d00_ffff,
         1_762_473_000,
@@ -110,7 +107,6 @@ fn differential_rust_vs_independent_js_openssl_verifier() {
     let rust_state_digest = hex::encode(parts.digest());
     let tx_hashes: Vec<String> = b6.txs.iter().map(|t| hex::encode(t.id())).collect();
 
-    // PayWord 10-tick hash chain
     let tok = [0x42u8; 32];
     let mut tip = tok;
     for _ in 0..10 {
@@ -152,9 +148,7 @@ fn differential_rust_vs_independent_js_openssl_verifier() {
             "conds": {},
             "nf_root": {},
             "channels": {},
-            "bonds": {},
-            "rollups": {},
-            "missions": {},
+            "priors": {},
             "header_mmr": {}
           }},
           "expected_state_digest": "{}",
@@ -170,12 +164,16 @@ fn differential_rust_vs_independent_js_openssl_verifier() {
             "buyerRefund": "5000",
             "minerFee": "100"
           }},
-          "bond_slash": {{
-            "stake": "50000000",
-            "slash": "20000000",
-            "victim": "17000000",
-            "burn": "2500000",
-            "fee": "500000"
+          "prior_disconfirm": {{
+            "stake": "10000000",
+            "bounty": "4950000",
+            "burn": "4950000",
+            "fee": "100000"
+          }},
+          "homeostatic_burn": {{
+            "fee": "{}",
+            "burned": "{}",
+            "producer": "{}"
           }}
         }}"#,
         headers_hex.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(","),
@@ -199,37 +197,36 @@ fn differential_rust_vs_independent_js_openssl_verifier() {
         opt_hex(parts.conds),
         opt_hex(parts.nf_root),
         opt_hex(parts.channels),
-        opt_hex(parts.bonds),
-        opt_hex(parts.rollups),
-        opt_hex(parts.missions),
+        opt_hex(parts.priors),
         opt_hex(parts.header_mmr),
         rust_state_digest,
         tx_hashes.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(","),
         hex::encode(b6.header.bytes()),
         hex::encode(tip),
         hex::encode(tok),
+        MAIN_V2_DEFAULT_FEE,
+        burned_fee,
+        producer_fee,
     );
 
     let (ok, stdout) = run_independent_verifier(&json_vec);
     assert!(ok, "Independent JS/OpenSSL verifier disagreed with Rust L1! Output: {stdout}");
     assert!(stdout.contains("\"header_commit_verified\":true"), "missing commit check: {stdout}");
+    assert!(stdout.contains("\"prior_disconfirm_verified\":true"));
+    assert!(stdout.contains("\"homeostatic_burn_verified\":true"));
 
-    // Adversarial Differential Check: 1-bit forgery in state digest or ASERT MUST fail BOTH clients!
     let bad_asert = json_vec.replace(
         &format!("\"expected_bits\": {asert_expected}"),
         &format!("\"expected_bits\": {}", asert_expected ^ 1),
     );
-    let (bad_ok, _) = run_independent_verifier(&bad_asert);
-    assert!(!bad_ok, "Independent verifier MUST reject 1-bit mutated ASERT target");
+    assert!(!run_independent_verifier(&bad_asert).0);
 
-    let bad_slash = json_vec.replace("\"victim\": \"17000000\"", "\"victim\": \"17000001\"");
-    let (bad_slash_ok, _) = run_independent_verifier(&bad_slash);
-    assert!(!bad_slash_ok, "Independent verifier MUST reject 1-unit bond slash inflation");
+    let bad_prior = json_vec.replace("\"bounty\": \"4950000\"", "\"bounty\": \"4950001\"");
+    assert!(!run_independent_verifier(&bad_prior).0);
 }
 
 #[test]
-fn mutation_fuzz_10000_hostile_wire_stark_p2p_and_flyclient_payloads() {
-    // Deterministic xorshift64* PRNG for reproducible CI fuzzing
+fn mutation_fuzz_10000_hostile_wire_stark_batch_p2p_payloads() {
     let mut rng = 0x9e37_79b9_7f4a_7c15u64;
     let mut next_u64 = || {
         rng ^= rng >> 12;
@@ -246,28 +243,9 @@ fn mutation_fuzz_10000_hostile_wire_stark_p2p_and_flyclient_payloads() {
         dummy: [false, true],
         bind: [5; 8],
     };
-    let rpi = RollupBatchInputs {
-        vk_hash: [0x22; 32],
-        prev_state_root: [0x33; 32],
-        new_state_root: [0x44; 32],
-        deposit_acc: [0x11; 32],
-        withdraw_root: [0x55; 32],
-        batch_seq: 1,
-        batch_tx_count: 1,
-        prev_tvl: 1_000_000,
-        new_tvl: 900_000,
-        batch_withdrawals: 99_000,
-        batch_fee: 1_000,
-    };
-    let zpi = ZkVmPublicInputs {
-        program_hash: [0x22; 32],
-        program_bytecode: vec![],
-        initial_slots: [1_000_000, 0, 0, 0],
-        final_slots: [900_000, 0, 0, 0],
-        prev_state_root: [0x33; 32],
-        new_state_root: [0x44; 32],
-        total_withdrawals: 99_000,
-        steps_executed: 1,
+    let bpi = BatchSpendPublic {
+        spends: vec![pi.clone(), pi.clone()],
+        prover_a_pk: [9; 8],
     };
 
     let mut book = AddrBook::default();
@@ -277,7 +255,6 @@ fn mutation_fuzz_10000_hostile_wire_stark_p2p_and_flyclient_payloads() {
         for b in &mut buf {
             *b = (next_u64() & 0xff) as u8;
         }
-        // None of these may EVER panic or allocate unbounded memory!
         let _ = Tx::from_bytes(&buf);
         let _ = Block::decode(&buf);
         let _ = AuxPow::parse(&buf);
@@ -291,8 +268,6 @@ fn mutation_fuzz_10000_hostile_wire_stark_p2p_and_flyclient_payloads() {
         let _ = CompactNoteTree::decode(&mut r3);
         let mut r4 = Reader::new(&buf);
         let _ = CompactBlock::decode(&mut r4);
-        let mut r5 = Reader::new(&buf);
-        let _ = ZkVmShard::decode(&mut r5);
         if buf.len() >= 80 {
             let mut hb = [0u8; 80];
             hb.copy_from_slice(&buf[..80]);
@@ -300,8 +275,7 @@ fn mutation_fuzz_10000_hostile_wire_stark_p2p_and_flyclient_payloads() {
         }
         if iter % 10 == 0 {
             assert!(spend::verify_bytes_for(&spend::MAIN_V2, &pi, &buf).is_err());
-            assert!(verify_batch_proof(&rpi, &buf).is_err());
-            assert!(verify_zkvm_execution(&zpi, &buf).is_err());
+            assert!(verify_batch_bytes_for(&spend::MAIN_V2, &bpi, &buf).is_err());
         }
         if let Ok(s) = std::str::from_utf8(&buf) {
             let _ = peers::valid(s);
@@ -313,8 +287,6 @@ fn mutation_fuzz_10000_hostile_wire_stark_p2p_and_flyclient_payloads() {
 
 #[test]
 fn frontier_utreexo_tracked_proof_spends_in_stark_plus_pruned_kv_and_sha384_recursion_e2e() {
-    // 1. Prove that a 1 KB Utreexo CompactNoteTree + TrackedNoteProof feeds DIRECTLY into a real
-    //    Newsatoshi shielded spend STARK (`spend::prove` / `spend::verify`) with ZERO NoteTree!
     let mut compact = CompactNoteTree::new();
     let alice = Wallet::generate();
     let bob = Wallet::generate();
@@ -341,7 +313,6 @@ fn frontier_utreexo_tracked_proof_spends_in_stark_plus_pruned_kv_and_sha384_recu
     assert_eq!(tp.root(), compact.root());
     assert!(compact.frontier_bytes() <= 1024);
 
-    // Generate a REAL shielded STARK spend proof using ONLY the 1 KB Utreexo tracked path!
     let wit = SpendWitness {
         inputs: [
             InputNote {
@@ -367,8 +338,6 @@ fn frontier_utreexo_tracked_proof_spends_in_stark_plus_pruned_kv_and_sha384_recu
     assert_eq!(pi.root, compact.root());
     spend::verify_bytes_for(&spend::TEST, &pi, &proof.to_bytes()).unwrap();
 
-    // 2. Mine a live chain, prune historical bodies to disk KV + 1 KB frontier, AND prove
-    //    contiguous 4-header segments inside our bit-exact SHA-256d HeaderChainAir STARK!
     let params = Params::get(Net::Reg).unwrap();
     let mut chain = Chain::open(params, None).unwrap();
     for i in 1..=8u32 {
@@ -393,7 +362,6 @@ fn frontier_utreexo_tracked_proof_spends_in_stark_plus_pruned_kv_and_sha384_recu
     let _ = DiskKvStore::open(&pdir.join("nullifiers"), 64).unwrap();
     let _ = std::fs::remove_dir_all(&pdir);
 
-    // Bit-exact SHA-256d HeaderChainAir STARK over 8 live mined chain headers (2 folded segments!)
     let hdrs: Vec<Header> = chain
         .active[1..=8]
         .iter()
@@ -409,7 +377,6 @@ fn frontier_utreexo_tracked_proof_spends_in_stark_plus_pruned_kv_and_sha384_recu
     assert_eq!(count, 8);
     assert!(sec >= 140);
 
-    // Algebraic FRI-Folding Verifier STARK
     let mut steps = Vec::new();
     let (mut x, mut fp, mut fn_) = (Felt::new(11), Felt::new(333), Felt::new(777));
     let inv2 = Felt::new(2).inv();

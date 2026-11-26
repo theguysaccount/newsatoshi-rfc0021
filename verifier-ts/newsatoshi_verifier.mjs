@@ -8,11 +8,11 @@
  *   2. Exact `aserti3-launch` & steady-state ASERT difficulty math (`pow::asert_bits_staged`)
  *   3. Namecoin AuxPoW (`CHAIN_ID = 0x4e53 = 20051`, `0xfabe6d6d`, `expected_index`, coinbase branch)
  *   4. CVE-2012-2459-safe zero-padded Merkle root, `header_commit("nsBLOCK")`, & `DigestParts`
- *      (`nsSTATE` + optional `locks`, `C`, `N`, `P`, `B`, `R`, `M`, and Genesis-#0 `F` `header_mmr`)
+ *      (`nsSTATE` + optional `locks`, `C`, `N`, `P`, `K` `priors`, and Genesis-#0 `F` `header_mmr`)
  *   5. Raw FIPS 180-4 `SHA256Compress` NoteTree (`nsAD`, `nsCM`, `nsNF`, depth-32 Utreexo frontier)
- *   6. Logarithmic O(log N) FlyClient `HeaderMmr` peak bagging & cumulative work verification
- *   7. RFC-0022 PayWord hash-chain conservation, RFC-0024 Bond slash conservation,
- *      and RFC-0027 Mission Launchpad `isqrt` bonding curve conservation.
+ *   6. Work-proportional O(log N) FlyClient `HeaderMmr` peak bagging & cumulative work verification
+ *   7. PayWord hash-chain conservation, Priorism-FEP `PriorLock` 50/50 surprise-bounty & burn
+ *      conservation, and Homeostatic Base-Fee Burn conservation (`50%` burned / `50%` producer).
  *
  * Used for multi-client differential cross-verification against the Rust L1 node in CI.
  */
@@ -270,9 +270,7 @@ export function computeStateDigest(parts) {
   if (parts.conds) chunks.push(Buffer.from("C"), Buffer.from(parts.conds, "hex"));
   if (parts.nf_root) chunks.push(Buffer.from("N"), Buffer.from(parts.nf_root, "hex"));
   if (parts.channels) chunks.push(Buffer.from("P"), Buffer.from(parts.channels, "hex"));
-  if (parts.bonds) chunks.push(Buffer.from("B"), Buffer.from(parts.bonds, "hex"));
-  if (parts.rollups) chunks.push(Buffer.from("R"), Buffer.from(parts.rollups, "hex"));
-  if (parts.missions) chunks.push(Buffer.from("M"), Buffer.from(parts.missions, "hex"));
+  if (parts.priors) chunks.push(Buffer.from("K"), Buffer.from(parts.priors, "hex"));
   if (parts.header_mmr) chunks.push(Buffer.from("F"), Buffer.from(parts.header_mmr, "hex"));
   return sha256(Buffer.concat(chunks)).toString("hex");
 }
@@ -350,7 +348,7 @@ export function computeHeaderMmrRoot(headersHexList) {
   return { root: accHash.toString("hex"), totalWork: accWork.toString() };
 }
 
-// ---- Independent RFC-0022 / RFC-0024 / RFC-0027 Conservation Checks ------------------
+// ---- Independent PayWord / PriorLock / Homeostatic-Burn Conservation Checks ----------
 
 export function verifyPayWordClaim({ tipHex, tokenHex, ticks, deposit, unitPrice, sellerPaid, buyerRefund, minerFee }) {
   let cur = Buffer.from(tokenHex, "hex");
@@ -364,20 +362,23 @@ export function verifyPayWordClaim({ tipHex, tokenHex, ticks, deposit, unitPrice
   return { ok: true };
 }
 
-export function verifyBondSlash({ stake, slash, victim, burn, fee }) {
-  const st = BigInt(stake), sl = BigInt(slash);
-  const v = BigInt(victim), b = BigInt(burn), f = BigInt(fee);
-  if (sl > st) return { ok: false, reason: "slash exceeds stake" };
-  if (v + b + f !== sl) return { ok: false, reason: "slash conservation violation" };
+export function verifyPriorDisconfirm({ stake, bounty, burn, fee }) {
+  const st = BigInt(stake), bo = BigInt(bounty), bu = BigInt(burn), f = BigInt(fee);
+  if (f * 10n > st) return { ok: false, reason: "miner fee exceeds 10% cap" };
+  if (bo + bu + f !== st) return { ok: false, reason: "prior disconfirm conservation violation" };
+  const slashable = st - f;
+  if (bo !== slashable / 2n || bu !== slashable - bo) {
+    return { ok: false, reason: "prior disconfirm 50/50 split mismatch" };
+  }
   return { ok: true };
 }
 
-export function isqrtBigInt(n) {
-  if (n < 0n) throw new Error("negative isqrt");
-  if (n < 2n) return n;
-  let x = n, y = (x + 1n) >> 1n;
-  while (y < x) { x = y; y = (x + n / x) >> 1n; }
-  return x;
+export function verifyHomeostaticBurn({ fee, burned, producer }) {
+  const f = BigInt(fee), bu = BigInt(burned), pr = BigInt(producer);
+  if (bu !== f / 2n || pr !== f - bu || bu + pr !== f) {
+    return { ok: false, reason: "homeostatic 50/50 fee burn mismatch" };
+  }
+  return { ok: true };
 }
 
 // ---- CLI Differential Vector Runner --------------------------------------------------
@@ -442,10 +443,15 @@ export function verifyVectorBundle(vec) {
     if (!r.ok) return r;
     out.payword_verified = true;
   }
-  if (vec.bond_slash) {
-    const r = verifyBondSlash(vec.bond_slash);
+  if (vec.prior_disconfirm) {
+    const r = verifyPriorDisconfirm(vec.prior_disconfirm);
     if (!r.ok) return r;
-    out.bond_slash_verified = true;
+    out.prior_disconfirm_verified = true;
+  }
+  if (vec.homeostatic_burn) {
+    const r = verifyHomeostaticBurn(vec.homeostatic_burn);
+    if (!r.ok) return r;
+    out.homeostatic_burn_verified = true;
   }
   return out;
 }

@@ -19,8 +19,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_stark_and_zkvm"
-path = "fuzz_targets/fuzz_stark_and_zkvm.rs"
+name = "fuzz_stark_and_batch"
+path = "fuzz_targets/fuzz_stark_and_batch.rs"
 test = false
 doc = false
 bench = false

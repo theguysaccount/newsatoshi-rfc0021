@@ -13,16 +13,13 @@
 //! Authorisations (commit, accept, challenge) are SLH-DSA-SHA2-128s signatures, FIPS 205,
 //! which rest on SHA-256 alone.
 
-use crate::bond::{BondPost, MAX_ARBITERS};
 use crate::channel::{ChannelPost, MAX_BATCH_CHANNELS};
 use crate::codec::{Reader, Res, Writer};
-use crate::hash::{sha256, Word8};
 use crate::cond::CondPost;
+use crate::hash::{sha256, Word8};
 use crate::lock::LockPost;
-use crate::merkmap::MerkleProof;
-use crate::mission::{MissionPost, MAX_VERIFIERS};
 use crate::note::Rho;
-use crate::rollup::{RollupPost, MAX_ROLLUP_PROOF_BYTES};
+use crate::prior::{PriorPost, MAX_PRIOR_ARBITERS};
 use rand::Rng;
 use slh_dsa::{Sha2_128s, Signature, SigningKey, VerifyingKey};
 use winterfell::math::{fields::f64::BaseElement as Felt, FieldElement, StarkField};
@@ -233,18 +230,8 @@ pub enum Deposit {
     Channel(ChannelPost),
     /// RFC-0022: Batched open of up to 64 distinct PayWord payment channels in one spend.
     ChannelBatch(Vec<ChannelPost>),
-    /// RFC-0024: Create a persistent Universal Trust Bond (`crate::bond`).
-    Bond(BondPost),
-    /// RFC-0024: Top up an existing Universal Trust Bond's active collateral.
-    BondTopUp { bond: [u8; 32], amount: u64 },
-    /// RFC-0023: Permissionlessly deploy a Sovereign L2 Rollup Vault (`crate::rollup`).
-    RollupRegister(RollupPost),
-    /// RFC-0023: Shielded L1 → L2 bridge deposit into an active Rollup Vault.
-    RollupDeposit { rollup: [u8; 32], l2_recipient: [u8; 32], amount: u64 },
-    /// RFC-0027: Launch a decentralized agent-coordination Mission Pool & Launchpad.
-    MissionLaunch(MissionPost),
-    /// RFC-0027: Fund a Mission Pool (either direct patron bounty or bonding-curve share buy).
-    MissionFund { mission: [u8; 32], holder_vk: [u8; 32], amount: u64, direct_to_bounty: bool },
+    /// Priorism-FEP: Open a falsifiable `PriorLock` with surprise bounty + burn (`crate::prior`).
+    Prior(PriorPost),
 }
 
 impl Deposit {
@@ -268,12 +255,7 @@ impl Deposit {
                 }
                 Ok(sum)
             }
-            Deposit::Bond(b) => Ok(b.stake),
-            Deposit::BondTopUp { amount, .. } => Ok(*amount),
-            Deposit::RollupRegister(r) => Ok(r.initial_tvl),
-            Deposit::RollupDeposit { amount, .. } => Ok(*amount),
-            Deposit::MissionLaunch(m) => Ok(m.initial_funding),
-            Deposit::MissionFund { amount, .. } => Ok(*amount),
+            Deposit::Prior(p) => Ok(p.stake),
         }
     }
 }
@@ -308,97 +290,35 @@ pub enum Action {
     ChannelClaim { channel: [u8; 32], ticks: u32, token: [u8; 32], sig: Vec<u8> },
     /// RFC-0022: Expire an unclaimed PayWord channel after timeout, refunding buyer and paying miner fee.
     ChannelExpire { channel: [u8; 32] },
-    /// RFC-0024: Dual-signed honest settlement attestation compounding portable reputation.
-    BondAttest {
-        bond: [u8; 32],
-        receipt_hash: [u8; 32],
-        settled_amount: u64,
-        fee: u64,
-        owner_sig: Vec<u8>,
-        counterparty_vk: [u8; 32],
-        counterparty_sig: Vec<u8>,
-    },
-    /// RFC-0024: Permissionless Tier-1/Tier-2 equivocation slash paying victim + burning penalty.
-    BondSlashEquivocation {
-        bond: [u8; 32],
+    /// Priorism-FEP: Owner commits an outcome hash to an open `PriorLock` before `deadline`.
+    PriorCommit { prior: [u8; 32], outcome_hash: [u8; 32], sig: Vec<u8> },
+    /// Priorism-FEP: Permissionless objective cryptographic disconfirmation (SHA-256 falsifier
+    /// preimage OR owner signed equivocation) — pays 50% surprise bounty + burns 50% permanently.
+    PriorDisconfirmObjective {
+        prior: [u8; 32],
+        evidence_kind: u8,
         context_nonce: u64,
         payload_a: [u8; 32],
         sig_a: Vec<u8>,
         payload_b: [u8; 32],
         sig_b: Vec<u8>,
-        victim_addr: Word8,
-        slash_amount: u64,
+        disconfirmer_addr: Word8,
         miner_fee: u64,
     },
-    /// RFC-0024: Tier-3 M-of-N arbiter quorum adjudication slash paying victim + burning penalty.
-    BondSlashQuorum {
-        bond: [u8; 32],
-        dispute_hash: [u8; 32],
-        victim_addr: Word8,
-        slash_amount: u64,
+    /// Priorism-FEP: Independent `M-of-N` SLH-DSA arbiter quorum disconfirmation (SCGS I-3:
+    /// `arbiter != owner`) — pays 50% surprise bounty + burns 50% permanently.
+    PriorDisconfirmQuorum {
+        prior: [u8; 32],
+        evidence_hash: [u8; 32],
+        disconfirmer_addr: Word8,
         miner_fee: u64,
         sigs: Vec<(u8, Vec<u8>)>,
     },
-    /// RFC-0024: Initiate timelocked bond withdrawal (collateral remains slashable during delay).
-    BondUnbondRequest { bond: [u8; 32], amount: u64, sig: Vec<u8> },
-    /// RFC-0024: Complete timelocked bond withdrawal once cooldown has elapsed.
-    BondUnbondComplete { bond: [u8; 32], miner_fee: u64 },
-    /// RFC-0023: Settle a hyperscale L2 batch via a 128-bit pure-SHA-2 Winterfell STARK proof.
-    RollupBatch {
-        rollup: [u8; 32],
-        new_state_root: [u8; 32],
-        withdraw_root: [u8; 32],
-        batch_tx_count: u64,
-        batch_withdrawals: u64,
-        batch_fee: u64,
-        sequencer_sig: Vec<u8>,
-        proof: Vec<u8>,
-    },
-    /// RFC-0023: Trustless L2 → L1 shielded exit via canonical Merkle proof against `withdraw_root`.
-    RollupWithdraw {
-        rollup: [u8; 32],
-        batch_seq: u64,
-        withdrawal_id: [u8; 32],
-        recipient_addr: Word8,
-        amount: u64,
+    /// Priorism-FEP: Zero-surprise collateral unlock after `deadline + challenge_window`.
+    PriorRelease {
+        prior: [u8; 32],
         miner_fee: u64,
-        proof: MerkleProof,
-    },
-    /// RFC-0027: Post a verifiable lemma/subtask backed by the Mission Pool's bounty_pool.
-    MissionPostTask {
-        mission: [u8; 32],
-        task_id: u32,
-        spec_hash: [u8; 32],
-        reward: u64,
-        sig: Vec<u8>,
-    },
-    /// RFC-0027: Claim a verified Mission task with atomic contributor/public-goods split.
-    MissionClaimTask {
-        mission: [u8; 32],
-        task_id: u32,
-        proof_hash: [u8; 32],
-        contributor_addr: Word8,
-        contributor_bond_id: Option<[u8; 32]>,
-        miner_fee: u64,
-        verifier_sigs: Vec<(u8, Vec<u8>)>,
-    },
-    /// RFC-0027: Redeem bonding-curve shares back to shielded LOVE (routing fee to bounty_pool).
-    MissionCurveRedeem {
-        mission: [u8; 32],
-        holder_vk: [u8; 32],
-        shares: u64,
-        recipient_addr: Word8,
-        miner_fee: u64,
-        sig: Vec<u8>,
-    },
-    /// RFC-0023: Permissionless on-chain L1 settlement directly verifying 1..=4 contiguous
-    /// 128-bit pure-SHA-2 L2 `ZkVmExecutionAir` STARK shards pinned to `vault.post.vk_hash`.
-    RollupZkVmBatch {
-        rollup: [u8; 32],
-        withdraw_root: [u8; 32],
-        batch_fee: u64,
-        sequencer_sig: Vec<u8>,
-        shards: Vec<crate::zkvm::ZkVmShard>,
+        owner_sig: Vec<u8>,
     },
 }
 
@@ -493,26 +413,9 @@ impl Deposit {
                     ch.encode(w);
                 }
             }
-            Deposit::Bond(b) => {
+            Deposit::Prior(p) => {
                 w.u8(7);
-                b.encode(w);
-            }
-            Deposit::BondTopUp { bond, amount } => {
-                w.u8(8).raw(bond).u64(*amount);
-            }
-            Deposit::RollupRegister(r) => {
-                w.u8(9);
-                r.encode(w);
-            }
-            Deposit::RollupDeposit { rollup, l2_recipient, amount } => {
-                w.u8(10).raw(rollup).raw(l2_recipient).u64(*amount);
-            }
-            Deposit::MissionLaunch(m) => {
-                w.u8(11);
-                m.encode(w);
-            }
-            Deposit::MissionFund { mission, holder_vk, amount, direct_to_bounty } => {
-                w.u8(12).raw(mission).raw(holder_vk).u64(*amount).bool(*direct_to_bounty);
+                p.encode(w);
             }
         }
     }
@@ -535,17 +438,7 @@ impl Deposit {
                 let list = (0..n).map(|_| ChannelPost::decode(r)).collect::<Res<Vec<_>>>()?;
                 Ok(Deposit::ChannelBatch(list))
             }
-            7 => Ok(Deposit::Bond(BondPost::decode(r)?)),
-            8 => Ok(Deposit::BondTopUp { bond: r.arr()?, amount: r.u64()? }),
-            9 => Ok(Deposit::RollupRegister(RollupPost::decode(r)?)),
-            10 => Ok(Deposit::RollupDeposit { rollup: r.arr()?, l2_recipient: r.arr()?, amount: r.u64()? }),
-            11 => Ok(Deposit::MissionLaunch(MissionPost::decode(r)?)),
-            12 => Ok(Deposit::MissionFund {
-                mission: r.arr()?,
-                holder_vk: r.arr()?,
-                amount: r.u64()?,
-                direct_to_bounty: r.bool()?,
-            }),
+            7 => Ok(Deposit::Prior(PriorPost::decode(r)?)),
             _ => Err("bad deposit tag".into()),
         }
     }
@@ -587,17 +480,10 @@ impl Action {
             Action::Unlock { lock, .. } | Action::Expire { lock } => lock,
             Action::Fulfil { cond, .. } => cond,
             Action::ChannelClaim { channel, .. } | Action::ChannelExpire { channel } => channel,
-            Action::BondAttest { bond, .. }
-            | Action::BondSlashEquivocation { bond, .. }
-            | Action::BondSlashQuorum { bond, .. }
-            | Action::BondUnbondRequest { bond, .. }
-            | Action::BondUnbondComplete { bond, .. } => bond,
-            Action::RollupBatch { rollup, .. }
-            | Action::RollupWithdraw { rollup, .. }
-            | Action::RollupZkVmBatch { rollup, .. } => rollup,
-            Action::MissionPostTask { mission, .. }
-            | Action::MissionClaimTask { mission, .. }
-            | Action::MissionCurveRedeem { mission, .. } => mission,
+            Action::PriorCommit { prior, .. }
+            | Action::PriorDisconfirmObjective { prior, .. }
+            | Action::PriorDisconfirmQuorum { prior, .. }
+            | Action::PriorRelease { prior, .. } => prior,
         }
     }
     pub fn encode(&self, w: &mut Writer) {
@@ -650,152 +536,50 @@ impl Action {
             Action::ChannelExpire { channel } => {
                 w.u8(12).raw(channel);
             }
-            Action::BondAttest {
-                bond,
-                receipt_hash,
-                settled_amount,
-                fee,
-                owner_sig,
-                counterparty_vk,
-                counterparty_sig,
-            } => {
-                w.u8(13)
-                    .raw(bond)
-                    .raw(receipt_hash)
-                    .u64(*settled_amount)
-                    .u64(*fee)
-                    .bytes(owner_sig)
-                    .raw(counterparty_vk)
-                    .bytes(counterparty_sig);
+            Action::PriorCommit { prior, outcome_hash, sig } => {
+                w.u8(13).raw(prior).raw(outcome_hash).bytes(sig);
             }
-            Action::BondSlashEquivocation {
-                bond,
+            Action::PriorDisconfirmObjective {
+                prior,
+                evidence_kind,
                 context_nonce,
                 payload_a,
                 sig_a,
                 payload_b,
                 sig_b,
-                victim_addr,
-                slash_amount,
+                disconfirmer_addr,
                 miner_fee,
             } => {
                 w.u8(14)
-                    .raw(bond)
+                    .raw(prior)
+                    .u8(*evidence_kind)
                     .u64(*context_nonce)
                     .raw(payload_a)
                     .bytes(sig_a)
                     .raw(payload_b)
                     .bytes(sig_b)
-                    .word8(victim_addr)
-                    .u64(*slash_amount)
+                    .word8(disconfirmer_addr)
                     .u64(*miner_fee);
             }
-            Action::BondSlashQuorum { bond, dispute_hash, victim_addr, slash_amount, miner_fee, sigs } => {
+            Action::PriorDisconfirmQuorum {
+                prior,
+                evidence_hash,
+                disconfirmer_addr,
+                miner_fee,
+                sigs,
+            } => {
                 w.u8(15)
-                    .raw(bond)
-                    .raw(dispute_hash)
-                    .word8(victim_addr)
-                    .u64(*slash_amount)
+                    .raw(prior)
+                    .raw(evidence_hash)
+                    .word8(disconfirmer_addr)
                     .u64(*miner_fee)
                     .u8(sigs.len() as u8);
                 for (idx, sig) in sigs {
                     w.u8(*idx).bytes(sig);
                 }
             }
-            Action::BondUnbondRequest { bond, amount, sig } => {
-                w.u8(16).raw(bond).u64(*amount).bytes(sig);
-            }
-            Action::BondUnbondComplete { bond, miner_fee } => {
-                w.u8(17).raw(bond).u64(*miner_fee);
-            }
-            Action::RollupBatch {
-                rollup,
-                new_state_root,
-                withdraw_root,
-                batch_tx_count,
-                batch_withdrawals,
-                batch_fee,
-                sequencer_sig,
-                proof,
-            } => {
-                w.u8(18)
-                    .raw(rollup)
-                    .raw(new_state_root)
-                    .raw(withdraw_root)
-                    .u64(*batch_tx_count)
-                    .u64(*batch_withdrawals)
-                    .u64(*batch_fee)
-                    .bytes(sequencer_sig)
-                    .bytes(proof);
-            }
-            Action::RollupWithdraw {
-                rollup,
-                batch_seq,
-                withdrawal_id,
-                recipient_addr,
-                amount,
-                miner_fee,
-                proof,
-            } => {
-                w.u8(19)
-                    .raw(rollup)
-                    .u64(*batch_seq)
-                    .raw(withdrawal_id)
-                    .word8(recipient_addr)
-                    .u64(*amount)
-                    .u64(*miner_fee)
-                    .raw(&proof.key)
-                    .raw(&proof.value_hash)
-                    .u16(proof.siblings.len() as u16);
-                for s in &proof.siblings {
-                    w.raw(s);
-                }
-            }
-            Action::MissionPostTask { mission, task_id, spec_hash, reward, sig } => {
-                w.u8(20).raw(mission).u32(*task_id).raw(spec_hash).u64(*reward).bytes(sig);
-            }
-            Action::MissionClaimTask {
-                mission,
-                task_id,
-                proof_hash,
-                contributor_addr,
-                contributor_bond_id,
-                miner_fee,
-                verifier_sigs,
-            } => {
-                w.u8(21).raw(mission).u32(*task_id).raw(proof_hash).word8(contributor_addr);
-                match contributor_bond_id {
-                    Some(bid) => {
-                        w.bool(true).raw(bid);
-                    }
-                    None => {
-                        w.bool(false);
-                    }
-                }
-                w.u64(*miner_fee).u8(verifier_sigs.len() as u8);
-                for (idx, sig) in verifier_sigs {
-                    w.u8(*idx).bytes(sig);
-                }
-            }
-            Action::MissionCurveRedeem { mission, holder_vk, shares, recipient_addr, miner_fee, sig } => {
-                w.u8(22)
-                    .raw(mission)
-                    .raw(holder_vk)
-                    .u64(*shares)
-                    .word8(recipient_addr)
-                    .u64(*miner_fee)
-                    .bytes(sig);
-            }
-            Action::RollupZkVmBatch { rollup, withdraw_root, batch_fee, sequencer_sig, shards } => {
-                w.u8(23)
-                    .raw(rollup)
-                    .raw(withdraw_root)
-                    .u64(*batch_fee)
-                    .bytes(sequencer_sig)
-                    .u8(shards.len() as u8);
-                for s in shards {
-                    s.encode(w);
-                }
+            Action::PriorRelease { prior, miner_fee, owner_sig } => {
+                w.u8(16).raw(prior).u64(*miner_fee).bytes(owner_sig);
             }
         }
     }
@@ -851,137 +635,48 @@ impl Action {
                 sig: r.bytes(MAX_SIG)?,
             },
             12 => Action::ChannelExpire { channel: r.arr()? },
-            13 => Action::BondAttest {
-                bond: r.arr()?,
-                receipt_hash: r.arr()?,
-                settled_amount: r.u64()?,
-                fee: r.u64()?,
-                owner_sig: r.bytes(MAX_SIG)?,
-                counterparty_vk: r.arr()?,
-                counterparty_sig: r.bytes(MAX_SIG)?,
+            13 => Action::PriorCommit {
+                prior: r.arr()?,
+                outcome_hash: r.arr()?,
+                sig: r.bytes(MAX_SIG)?,
             },
-            14 => Action::BondSlashEquivocation {
-                bond: r.arr()?,
+            14 => Action::PriorDisconfirmObjective {
+                prior: r.arr()?,
+                evidence_kind: r.u8()?,
                 context_nonce: r.u64()?,
                 payload_a: r.arr()?,
                 sig_a: r.bytes(MAX_SIG)?,
                 payload_b: r.arr()?,
                 sig_b: r.bytes(MAX_SIG)?,
-                victim_addr: r.word8()?,
-                slash_amount: r.u64()?,
+                disconfirmer_addr: r.word8()?,
                 miner_fee: r.u64()?,
             },
             15 => {
-                let bond = r.arr()?;
-                let dispute_hash = r.arr()?;
-                let victim_addr = r.word8()?;
-                let slash_amount = r.u64()?;
+                let prior = r.arr()?;
+                let evidence_hash = r.arr()?;
+                let disconfirmer_addr = r.word8()?;
                 let miner_fee = r.u64()?;
                 let n = r.u8()? as usize;
-                if n == 0 || n > MAX_ARBITERS {
-                    return Err("quorum sig count out of range".into());
+                if n == 0 || n > MAX_PRIOR_ARBITERS {
+                    return Err("prior quorum sig count out of range".into());
                 }
                 let mut sigs = Vec::with_capacity(n);
                 for _ in 0..n {
                     sigs.push((r.u8()?, r.bytes(MAX_SIG)?));
                 }
-                Action::BondSlashQuorum { bond, dispute_hash, victim_addr, slash_amount, miner_fee, sigs }
-            }
-            16 => Action::BondUnbondRequest {
-                bond: r.arr()?,
-                amount: r.u64()?,
-                sig: r.bytes(MAX_SIG)?,
-            },
-            17 => Action::BondUnbondComplete { bond: r.arr()?, miner_fee: r.u64()? },
-            18 => Action::RollupBatch {
-                rollup: r.arr()?,
-                new_state_root: r.arr()?,
-                withdraw_root: r.arr()?,
-                batch_tx_count: r.u64()?,
-                batch_withdrawals: r.u64()?,
-                batch_fee: r.u64()?,
-                sequencer_sig: r.bytes(MAX_SIG)?,
-                proof: r.bytes(MAX_ROLLUP_PROOF_BYTES)?,
-            },
-            19 => {
-                let rollup = r.arr()?;
-                let batch_seq = r.u64()?;
-                let withdrawal_id = r.arr()?;
-                let recipient_addr = r.word8()?;
-                let amount = r.u64()?;
-                let miner_fee = r.u64()?;
-                let key = r.arr()?;
-                let value_hash = r.arr()?;
-                let ns = r.u16()? as usize;
-                if ns > 256 {
-                    return Err("rollup withdrawal Merkle proof too deep".into());
-                }
-                let siblings = (0..ns).map(|_| r.arr()).collect::<Res<Vec<_>>>()?;
-                Action::RollupWithdraw {
-                    rollup,
-                    batch_seq,
-                    withdrawal_id,
-                    recipient_addr,
-                    amount,
+                Action::PriorDisconfirmQuorum {
+                    prior,
+                    evidence_hash,
+                    disconfirmer_addr,
                     miner_fee,
-                    proof: MerkleProof { key, value_hash, siblings },
+                    sigs,
                 }
             }
-            20 => Action::MissionPostTask {
-                mission: r.arr()?,
-                task_id: r.u32()?,
-                spec_hash: r.arr()?,
-                reward: r.u64()?,
-                sig: r.bytes(MAX_SIG)?,
-            },
-            21 => {
-                let mission = r.arr()?;
-                let task_id = r.u32()?;
-                let proof_hash = r.arr()?;
-                let contributor_addr = r.word8()?;
-                let contributor_bond_id = if r.bool()? { Some(r.arr()?) } else { None };
-                let miner_fee = r.u64()?;
-                let n = r.u8()? as usize;
-                if n == 0 || n > MAX_VERIFIERS {
-                    return Err("mission verifier sig count out of range".into());
-                }
-                let mut verifier_sigs = Vec::with_capacity(n);
-                for _ in 0..n {
-                    verifier_sigs.push((r.u8()?, r.bytes(MAX_SIG)?));
-                }
-                Action::MissionClaimTask {
-                    mission,
-                    task_id,
-                    proof_hash,
-                    contributor_addr,
-                    contributor_bond_id,
-                    miner_fee,
-                    verifier_sigs,
-                }
-            }
-            22 => Action::MissionCurveRedeem {
-                mission: r.arr()?,
-                holder_vk: r.arr()?,
-                shares: r.u64()?,
-                recipient_addr: r.word8()?,
+            16 => Action::PriorRelease {
+                prior: r.arr()?,
                 miner_fee: r.u64()?,
-                sig: r.bytes(MAX_SIG)?,
+                owner_sig: r.bytes(MAX_SIG)?,
             },
-            23 => {
-                let rollup = r.arr()?;
-                let withdraw_root = r.arr()?;
-                let batch_fee = r.u64()?;
-                let sequencer_sig = r.bytes(MAX_SIG)?;
-                let n = r.u8()? as usize;
-                if n == 0 || n > crate::zkvm::MAX_ONCHAIN_ZKVM_SHARDS {
-                    return Err("zkVM shard count out of range".into());
-                }
-                let mut shards = Vec::with_capacity(n);
-                for _ in 0..n {
-                    shards.push(crate::zkvm::ZkVmShard::decode(r)?);
-                }
-                Action::RollupZkVmBatch { rollup, withdraw_root, batch_fee, sequencer_sig, shards }
-            }
             _ => return Err("bad action tag".into()),
         })
     }
