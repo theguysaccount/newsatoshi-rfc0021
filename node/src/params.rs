@@ -110,6 +110,9 @@ pub struct Params {
     /// Height from which RFC-0024 (Universal Trust Bonds & 3-tier slashing reputation) is
     /// active (`None` preserves v0.1.0 rejection).
     pub rfc0024_from: Option<u32>,
+    /// Height from which RFC-0027 (Mission Launchpads & Agent Swarm Pools) is active
+    /// (`None` preserves v0.1.0 rejection).
+    pub rfc0027_from: Option<u32>,
     /// Nodes to reach when none is named with `--peer`. Any node can be one; these are
     /// only where a new node first looks.
     pub seeds: &'static [&'static str],
@@ -158,6 +161,7 @@ impl Params {
                 rfc0022_from: None,
                 rfc0023_from: None,
                 rfc0024_from: None,
+                rfc0027_from: None,
                 seeds: &["newsatoshi-seed.fly.dev:18444"],
             }),
             Net::Reg => Ok(Params {
@@ -186,6 +190,7 @@ impl Params {
                 rfc0022_from: Some(0),
                 rfc0023_from: Some(0),
                 rfc0024_from: Some(0),
+                rfc0027_from: Some(0),
                 seeds: &[],
             }),
             // The main network's rules, with what makes it a rehearsal: its own name (in
@@ -205,6 +210,7 @@ impl Params {
                 rfc0022_from: Some(0),
                 rfc0023_from: Some(0),
                 rfc0024_from: Some(0),
+                rfc0027_from: Some(0),
                 seeds: &[],
                 ..Self::main_with(0, 0)
             }),
@@ -241,6 +247,7 @@ impl Params {
             rfc0022_from: None,
             rfc0023_from: None,
             rfc0024_from: None,
+            rfc0027_from: None,
             seeds: &["newsatoshi-seed.fly.dev:8444"],
         }
     }
@@ -248,7 +255,7 @@ impl Params {
     /// Audited Mainnet v2 launch rules: anti-instamine Day-1 ASERT ramp (1-hour half-life for
     /// the first 2,016 blocks → 48-hour steady state), RFC-0021 (128-bit proven covenants),
     /// RFC-0022 (seller-signed 64× batched PayWord channels), RFC-0023 (sovereign L2 rollup
-    /// vaults), and RFC-0024 (universal trust bonds) active from genesis.
+    /// vaults), RFC-0024 (universal trust bonds), and RFC-0027 (mission launchpads) active from genesis.
     pub fn main_v2_with(genesis_time: u32, genesis_nonce: u32, genesis_bits: u32) -> Params {
         Params {
             genesis_bits,
@@ -258,6 +265,7 @@ impl Params {
             rfc0022_from: Some(0),
             rfc0023_from: Some(0),
             rfc0024_from: Some(0),
+            rfc0027_from: Some(0),
             ..Self::main_with(genesis_time, genesis_nonce)
         }
     }

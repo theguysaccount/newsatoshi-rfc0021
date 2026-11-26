@@ -1033,6 +1033,70 @@ pub fn rollup_info(shared: &Shared, id: &[u8; 32]) -> J {
     J::Obj(kv)
 }
 
+/// One RFC-0027 Mission Launchpad & Agent Swarm Pool, by mission id, with canonical Merkle proof.
+pub fn mission_info(shared: &Shared, id: &[u8; 32]) -> J {
+    let n = lock(shared);
+    let tip = n.chain.height();
+    let st = &n.chain.state;
+    let pool = n.pool_state();
+    let (m, confirmed, mp) = if let Some(m) = st.missions.get(id) {
+        let proof = st.missions_merkle.prove(id).map(|p| (p, st.missions_merkle.root()));
+        (Some(m), true, proof)
+    } else if let Some(m) = pool.missions.get(id) {
+        (Some(m), false, None)
+    } else {
+        (None, false, None)
+    };
+    let Some(m) = m else {
+        return J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))]);
+    };
+    let tasks: Vec<J> = m
+        .tasks
+        .values()
+        .map(|t| {
+            let mut tkv = vec![
+                ("task_id".into(), J::num(t.task_id as u64)),
+                ("spec_hash".into(), J::str(hex::encode(t.spec_hash))),
+                ("reward".into(), J::num(t.reward)),
+            ];
+            match &t.status {
+                crate::mission::TaskStatus::Open => {
+                    tkv.push(("status".into(), J::str("open")));
+                }
+                crate::mission::TaskStatus::Completed { contributor_addr, proof_hash, height } => {
+                    tkv.push(("status".into(), J::str("completed")));
+                    tkv.push(("contributor_address".into(), J::str(encode_address(contributor_addr))));
+                    tkv.push(("proof_hash".into(), J::str(hex::encode(proof_hash))));
+                    tkv.push(("completed_height".into(), J::num(*height as u64)));
+                }
+            }
+            J::Obj(tkv)
+        })
+        .collect();
+    let mut kv = vec![
+        ("found".into(), J::Bool(true)),
+        ("height".into(), J::num(tip)),
+        ("confirmed".into(), J::Bool(confirmed)),
+        ("id".into(), J::str(hex::encode(m.id))),
+        ("mission_hash".into(), J::str(hex::encode(m.post.mission_hash))),
+        ("public_goods_address".into(), J::str(encode_address(&m.post.public_goods_addr))),
+        ("public_goods_bps".into(), J::num(m.post.public_goods_bps as u64)),
+        ("contributor_bps".into(), J::num((10_000 - m.post.public_goods_bps) as u64)),
+        ("curve_fee_bps".into(), J::num(m.post.curve_fee_bps as u64)),
+        ("min_worker_bond".into(), J::num(m.post.min_worker_bond)),
+        ("bounty_pool".into(), J::num(m.bounty_pool)),
+        ("curve_reserve".into(), J::num(m.curve_reserve)),
+        ("total_shares".into(), J::num(m.total_shares)),
+        ("completed_tasks".into(), J::num(m.completed_tasks)),
+        ("total_bounties_paid".into(), J::str(m.total_bounties_paid.to_string())),
+        ("tasks".into(), J::Arr(tasks)),
+    ];
+    if let Some((p, root)) = mp {
+        kv.push(("merkle_proof".into(), merkle_proof_json(&p, root)));
+    }
+    J::Obj(kv)
+}
+
 /// RFC-0026: Live BIP-9 collective protocol steering & ossification signaling telemetry.
 pub fn signaling_info(shared: &Shared) -> J {
     let n = lock(shared);
@@ -1213,6 +1277,9 @@ pub fn state_commitment(shared: &Shared) -> J {
     }
     if let Some(rv) = &p.rollups {
         parts.push(("rollups".into(), h32(rv)));
+    }
+    if let Some(m) = &p.missions {
+        parts.push(("missions".into(), h32(m)));
     }
     J::Obj(vec![
         ("ok".into(), J::Bool(true)),
@@ -1423,6 +1490,10 @@ pub fn serve_public_with(shared: Shared, bind: &str, port: u16, faucet: Option<A
                             },
                             ("GET", "/api/rollup") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
                                 Some(Some(id)) => (200, rollup_info(&sh, &id)),
+                                _ => (400, err_json("id= takes 64 hex characters")),
+                            },
+                            ("GET", "/api/mission") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
+                                Some(Some(id)) => (200, mission_info(&sh, &id)),
                                 _ => (400, err_json("id= takes 64 hex characters")),
                             },
                             ("GET", "/api/signaling") => (200, signaling_info(&sh)),

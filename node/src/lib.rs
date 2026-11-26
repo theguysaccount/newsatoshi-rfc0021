@@ -19,6 +19,7 @@ pub mod job;
 pub mod light;
 pub mod lock;
 pub mod merkmap;
+pub mod mission;
 pub mod nftree;
 pub mod node;
 pub mod note;

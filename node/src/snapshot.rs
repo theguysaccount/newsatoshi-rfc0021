@@ -21,6 +21,7 @@ use crate::hash::{sha256, Word8};
 use crate::job::Job;
 use crate::lock::{Lock, LockEnd};
 use crate::merkmap::MerkleMap;
+use crate::mission::MissionPool;
 use crate::nftree::NfTree;
 use crate::note::NoteTree;
 use crate::rollup::RollupVault;
@@ -34,7 +35,7 @@ use std::path::Path;
 
 pub const SNAPSHOT_FILE: &str = "state.snap";
 pub const SNAPSHOT_INTERVAL: u32 = 50;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP02";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP03";
 const MAX_SNAPSHOT_ITEMS: usize = 10_000_000;
 
 /// Metadata for one active block (heights `1..=tip`) stored inside `blocks.dat`.
@@ -216,6 +217,12 @@ fn encode_state(st: &State, w: &mut Writer) {
     w.u32(st.rollups.len() as u32);
     for rv in st.rollups.values() {
         rv.encode(w);
+    }
+
+    // RFC-0027 Mission Launchpads & Swarm Pools (missions_merkle is canonical & rebuilt on load)
+    w.u32(st.missions.len() as u32);
+    for m in st.missions.values() {
+        m.encode(w);
     }
 }
 
@@ -406,6 +413,16 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         rollups.insert(rv.id, rv);
     }
 
+    // RFC-0027 Mission Launchpads + canonical MerkleMap
+    let n_missions = read_count(r)?;
+    let mut missions = imbl::OrdMap::new();
+    let mut missions_merkle = MerkleMap::new();
+    for _ in 0..n_missions {
+        let m = MissionPool::decode(r)?;
+        missions_merkle.insert(m.id, m.value_hash());
+        missions.insert(m.id, m);
+    }
+
     Ok(State {
         height,
         tree,
@@ -434,6 +451,8 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         bonds_merkle,
         rollups,
         rollups_merkle,
+        missions,
+        missions_merkle,
     })
 }
 

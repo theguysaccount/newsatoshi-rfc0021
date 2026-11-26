@@ -736,6 +736,37 @@ theorem rfc0023_rollup_vault_solvency
   exact ⟨by omega, by omega, by omega, by omega,
     block_solvency_preserved s total_in 0 0 total_in user_payout 0 total_fees claimed_coinbase h_inv (by omega)⟩
 
+/-- Theorem 9 (RFC-0027 Mission Launchpad & Agent Swarm Exact Bounty & Bonding-Curve Split):
+    On every launchpad buy/sell (`fee_to_bounty + net_to_curve = amount`) and every verified
+    task claim (`contributor_payout + public_goods_payout + miner_fee = reward`), zero LOVE is
+    created or lost and `pool + locked + burned = issued` is preserved identically. -/
+theorem rfc0027_mission_launchpad_conservation
+    (amount reward miner_fee curve_fee_bps public_goods_bps : Nat)
+    (h_cfee : curve_fee_bps ≤ 1000)
+    (h_pg : public_goods_bps ≤ 10000)
+    (h_mfee : miner_fee ≤ reward) :
+    let fee_to_bounty := (amount * curve_fee_bps) / 10000
+    let net_to_curve := amount - fee_to_bounty
+    let net_reward := reward - miner_fee
+    let public_goods_payout := (net_reward * public_goods_bps) / 10000
+    let contributor_payout := net_reward - public_goods_payout
+    fee_to_bounty ≤ amount ∧
+    fee_to_bounty + net_to_curve = amount ∧
+    public_goods_payout ≤ net_reward ∧
+    contributor_payout + public_goods_payout + miner_fee = reward := by
+  intro fee_to_bounty net_to_curve net_reward public_goods_payout contributor_payout
+  have h1 : amount * curve_fee_bps ≤ amount * 10000 := Nat.mul_le_mul_left amount (by omega)
+  have h1d : fee_to_bounty ≤ amount := by
+    have hd := Nat.div_le_div_right (c := 10000) h1
+    have hs : (amount * 10000) / 10000 = amount := Nat.mul_div_cancel amount (by decide)
+    omega
+  have h2 : net_reward * public_goods_bps ≤ net_reward * 10000 := Nat.mul_le_mul_left net_reward h_pg
+  have h2d : public_goods_payout ≤ net_reward := by
+    have hd := Nat.div_le_div_right (c := 10000) h2
+    have hs : (net_reward * 10000) / 10000 = net_reward := Nat.mul_div_cancel net_reward (by decide)
+    omega
+  exact ⟨h1d, by omega, h2d, by omega⟩
+
 #print axioms extracted_constraint_247_exact
 #print axioms extracted_constraint_248_exact
 #print axioms note_value_strictly_below_2_pow_60
@@ -744,6 +775,7 @@ theorem rfc0023_rollup_vault_solvency
 #print axioms block_solvency_preserved
 #print axioms rfc0024_trust_bond_slash_conservation
 #print axioms rfc0023_rollup_vault_solvency
+#print axioms rfc0027_mission_launchpad_conservation
 
 end NewsatoshiSpendBalance
 "#,

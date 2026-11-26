@@ -579,7 +579,9 @@ impl Node {
             Tx::Act(crate::job::Action::BondSlashEquivocation { miner_fee, .. })
             | Tx::Act(crate::job::Action::BondSlashQuorum { miner_fee, .. })
             | Tx::Act(crate::job::Action::BondUnbondComplete { miner_fee, .. })
-            | Tx::Act(crate::job::Action::RollupWithdraw { miner_fee, .. }) => *miner_fee,
+            | Tx::Act(crate::job::Action::RollupWithdraw { miner_fee, .. })
+            | Tx::Act(crate::job::Action::MissionClaimTask { miner_fee, .. })
+            | Tx::Act(crate::job::Action::MissionCurveRedeem { miner_fee, .. }) => *miner_fee,
             Tx::Act(crate::job::Action::RollupBatch { batch_fee, .. }) => *batch_fee,
             _ => 0,
         };

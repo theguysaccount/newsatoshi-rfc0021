@@ -112,6 +112,15 @@ pub fn standard_deployments(window: u32, threshold: u32) -> Vec<Deployment> {
             ossifies_monetary_base: false,
         },
         Deployment {
+            name: "rfc0027_mission_launchpads",
+            bit: 5,
+            window,
+            threshold,
+            start_height: 0,
+            timeout_height: window.saturating_mul(52),
+            ossifies_monetary_base: false,
+        },
+        Deployment {
             name: "rfc0026_ossify_monetary_base",
             bit: 7,
             window,

@@ -20,6 +20,7 @@ use crate::hash::{sha256, Word8};
 use crate::cond::CondPost;
 use crate::lock::LockPost;
 use crate::merkmap::MerkleProof;
+use crate::mission::{MissionPost, MAX_VERIFIERS};
 use crate::note::Rho;
 use crate::rollup::{RollupPost, MAX_ROLLUP_PROOF_BYTES};
 use rand::Rng;
@@ -240,6 +241,10 @@ pub enum Deposit {
     RollupRegister(RollupPost),
     /// RFC-0023: Shielded L1 → L2 bridge deposit into an active Rollup Vault.
     RollupDeposit { rollup: [u8; 32], l2_recipient: [u8; 32], amount: u64 },
+    /// RFC-0027: Launch a decentralized agent-coordination Mission Pool & Launchpad.
+    MissionLaunch(MissionPost),
+    /// RFC-0027: Fund a Mission Pool (either direct patron bounty or bonding-curve share buy).
+    MissionFund { mission: [u8; 32], holder_vk: [u8; 32], amount: u64, direct_to_bounty: bool },
 }
 
 impl Deposit {
@@ -267,6 +272,8 @@ impl Deposit {
             Deposit::BondTopUp { amount, .. } => Ok(*amount),
             Deposit::RollupRegister(r) => Ok(r.initial_tvl),
             Deposit::RollupDeposit { amount, .. } => Ok(*amount),
+            Deposit::MissionLaunch(m) => Ok(m.initial_funding),
+            Deposit::MissionFund { amount, .. } => Ok(*amount),
         }
     }
 }
@@ -356,6 +363,33 @@ pub enum Action {
         amount: u64,
         miner_fee: u64,
         proof: MerkleProof,
+    },
+    /// RFC-0027: Post a verifiable lemma/subtask backed by the Mission Pool's bounty_pool.
+    MissionPostTask {
+        mission: [u8; 32],
+        task_id: u32,
+        spec_hash: [u8; 32],
+        reward: u64,
+        sig: Vec<u8>,
+    },
+    /// RFC-0027: Claim a verified Mission task with atomic contributor/public-goods split.
+    MissionClaimTask {
+        mission: [u8; 32],
+        task_id: u32,
+        proof_hash: [u8; 32],
+        contributor_addr: Word8,
+        contributor_bond_id: Option<[u8; 32]>,
+        miner_fee: u64,
+        verifier_sigs: Vec<(u8, Vec<u8>)>,
+    },
+    /// RFC-0027: Redeem bonding-curve shares back to shielded LOVE (routing fee to bounty_pool).
+    MissionCurveRedeem {
+        mission: [u8; 32],
+        holder_vk: [u8; 32],
+        shares: u64,
+        recipient_addr: Word8,
+        miner_fee: u64,
+        sig: Vec<u8>,
     },
 }
 
@@ -464,6 +498,13 @@ impl Deposit {
             Deposit::RollupDeposit { rollup, l2_recipient, amount } => {
                 w.u8(10).raw(rollup).raw(l2_recipient).u64(*amount);
             }
+            Deposit::MissionLaunch(m) => {
+                w.u8(11);
+                m.encode(w);
+            }
+            Deposit::MissionFund { mission, holder_vk, amount, direct_to_bounty } => {
+                w.u8(12).raw(mission).raw(holder_vk).u64(*amount).bool(*direct_to_bounty);
+            }
         }
     }
     pub fn decode(r: &mut Reader) -> Res<Self> {
@@ -489,6 +530,13 @@ impl Deposit {
             8 => Ok(Deposit::BondTopUp { bond: r.arr()?, amount: r.u64()? }),
             9 => Ok(Deposit::RollupRegister(RollupPost::decode(r)?)),
             10 => Ok(Deposit::RollupDeposit { rollup: r.arr()?, l2_recipient: r.arr()?, amount: r.u64()? }),
+            11 => Ok(Deposit::MissionLaunch(MissionPost::decode(r)?)),
+            12 => Ok(Deposit::MissionFund {
+                mission: r.arr()?,
+                holder_vk: r.arr()?,
+                amount: r.u64()?,
+                direct_to_bounty: r.bool()?,
+            }),
             _ => Err("bad deposit tag".into()),
         }
     }
@@ -536,6 +584,9 @@ impl Action {
             | Action::BondUnbondRequest { bond, .. }
             | Action::BondUnbondComplete { bond, .. } => bond,
             Action::RollupBatch { rollup, .. } | Action::RollupWithdraw { rollup, .. } => rollup,
+            Action::MissionPostTask { mission, .. }
+            | Action::MissionClaimTask { mission, .. }
+            | Action::MissionCurveRedeem { mission, .. } => mission,
         }
     }
     pub fn encode(&self, w: &mut Writer) {
@@ -689,6 +740,41 @@ impl Action {
                     w.raw(s);
                 }
             }
+            Action::MissionPostTask { mission, task_id, spec_hash, reward, sig } => {
+                w.u8(20).raw(mission).u32(*task_id).raw(spec_hash).u64(*reward).bytes(sig);
+            }
+            Action::MissionClaimTask {
+                mission,
+                task_id,
+                proof_hash,
+                contributor_addr,
+                contributor_bond_id,
+                miner_fee,
+                verifier_sigs,
+            } => {
+                w.u8(21).raw(mission).u32(*task_id).raw(proof_hash).word8(contributor_addr);
+                match contributor_bond_id {
+                    Some(bid) => {
+                        w.bool(true).raw(bid);
+                    }
+                    None => {
+                        w.bool(false);
+                    }
+                }
+                w.u64(*miner_fee).u8(verifier_sigs.len() as u8);
+                for (idx, sig) in verifier_sigs {
+                    w.u8(*idx).bytes(sig);
+                }
+            }
+            Action::MissionCurveRedeem { mission, holder_vk, shares, recipient_addr, miner_fee, sig } => {
+                w.u8(22)
+                    .raw(mission)
+                    .raw(holder_vk)
+                    .u64(*shares)
+                    .word8(recipient_addr)
+                    .u64(*miner_fee)
+                    .bytes(sig);
+            }
         }
     }
     pub fn decode(r: &mut Reader) -> Res<Self> {
@@ -819,6 +905,46 @@ impl Action {
                     proof: MerkleProof { key, value_hash, siblings },
                 }
             }
+            20 => Action::MissionPostTask {
+                mission: r.arr()?,
+                task_id: r.u32()?,
+                spec_hash: r.arr()?,
+                reward: r.u64()?,
+                sig: r.bytes(MAX_SIG)?,
+            },
+            21 => {
+                let mission = r.arr()?;
+                let task_id = r.u32()?;
+                let proof_hash = r.arr()?;
+                let contributor_addr = r.word8()?;
+                let contributor_bond_id = if r.bool()? { Some(r.arr()?) } else { None };
+                let miner_fee = r.u64()?;
+                let n = r.u8()? as usize;
+                if n == 0 || n > MAX_VERIFIERS {
+                    return Err("mission verifier sig count out of range".into());
+                }
+                let mut verifier_sigs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    verifier_sigs.push((r.u8()?, r.bytes(MAX_SIG)?));
+                }
+                Action::MissionClaimTask {
+                    mission,
+                    task_id,
+                    proof_hash,
+                    contributor_addr,
+                    contributor_bond_id,
+                    miner_fee,
+                    verifier_sigs,
+                }
+            }
+            22 => Action::MissionCurveRedeem {
+                mission: r.arr()?,
+                holder_vk: r.arr()?,
+                shares: r.u64()?,
+                recipient_addr: r.word8()?,
+                miner_fee: r.u64()?,
+                sig: r.bytes(MAX_SIG)?,
+            },
             _ => return Err("bad action tag".into()),
         })
     }

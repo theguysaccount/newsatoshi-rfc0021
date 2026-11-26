@@ -390,9 +390,163 @@ fn universal_trust_bond_sovereign_l2_rollup_signaling_and_viewing_key_e2e() {
         assert_eq!(reopened.state.rollups[&rid].total_l2_txs, 100_000);
     }
 
-    // Verify v0.1.0 Mainnet height gate rejects RFC-0023 / RFC-0024 when inactive (`None`)
+    // Verify v0.1.0 Mainnet height gate rejects RFC-0023 / RFC-0024 / RFC-0027 when inactive (`None`)
     let v1_main = Params::main_with(1_794_268_800, 0);
     assert_eq!(v1_main.rfc0023_from, None);
     assert_eq!(v1_main.rfc0024_from, None);
+    assert_eq!(v1_main.rfc0027_from, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pequalnp_style_mission_launchpad_bonding_curve_and_bonded_agent_swarm_e2e() {
+    use newsatoshi::mission::{self, MissionPost};
+
+    let dir = temp_dir("launchpad");
+    let params = Params::get(Net::Reg).unwrap();
+    let mut chain = Chain::open(params.clone(), Some(&dir)).unwrap();
+
+    let founder_sk: Word8 = [10u32; 8];
+    let founder_apk = note::address(&founder_sk);
+    let agent_sk: Word8 = [20u32; 8];
+    let agent_apk = note::address(&agent_sk);
+    let lean_fro_apk = note::address(&[30u32; 8]);
+
+    let cb_rho: Rho = rand::random();
+    let out1 = PlainOut { a_pk: founder_apk, v: 50 * COIN, rho: cb_rho };
+    let mut b1 = chain.template(vec![out1], vec![], vec![]).unwrap();
+    assert!(mine(&mut b1.header, u64::MAX));
+    chain.add_block(b1).unwrap();
+    mine_txs(&mut chain, founder_apk, vec![], 0);
+    let cm0 = note::commit(&founder_apk, 50 * COIN, &cb_rho);
+    let pos0 = chain.state.cm_pos[&cm0][0];
+
+    let orch = JobKey::derive(&[51u8; 32]);
+    let checker0 = JobKey::derive(&[52u8; 32]);
+    let checker1 = JobKey::derive(&[53u8; 32]);
+    let trader = JobKey::derive(&[54u8; 32]);
+    let trader_vk: [u8; 32] = trader.vk().try_into().unwrap();
+    let agent_key = JobKey::derive(&words_to_bytes(&agent_sk));
+    let agent_vk: [u8; 32] = agent_key.vk().try_into().unwrap();
+
+    // 1. Agent posts an RFC-0024 Trust Bond (1 LOVE) so anti-Sybil min_worker_bond passes
+    let bond_post = BondPost {
+        owner_vk: agent_vk,
+        owner_addr: agent_apk,
+        arbiter_vks: vec![],
+        quorum_m: 0,
+        unbond_delay: 5,
+        slash_burn_bps: 2_000,
+        stake: 1 * COIN,
+        service_tag: sha256(b"lean4-prover-agent"),
+    };
+    let (tx_bond, ch1) = spend_deposit(&chain, founder_sk, 50 * COIN, cb_rho, pos0, 300_000, Deposit::Bond(bond_post.clone()));
+    let b_nf = match &tx_bond { Tx::Spend(s) => s.nf[0], _ => unreachable!() };
+    let bid = bond::bond_id(&bond_post, &b_nf);
+    mine_txs(&mut chain, founder_apk, vec![tx_bond], 300_000);
+
+    // 2. Launch a pequalnp.money-style Mission Launchpad in 1 tx (80% contributor / 20% Lean FRO, 5% trade fee -> bounty pool!)
+    let mpost = MissionPost {
+        orchestrator_vk: orch.vk().try_into().unwrap(),
+        verifier_vks: vec![checker0.vk().try_into().unwrap(), checker1.vk().try_into().unwrap()],
+        verifier_quorum_m: 2,
+        public_goods_addr: lean_fro_apk,
+        public_goods_bps: 2_000, // 20% Lean FRO, 80% outside verified contributor
+        curve_fee_bps: 500,      // 5% on every bonding-curve buy/sell feeds verified-work bounties!
+        initial_funding: 2 * COIN,
+        min_worker_bond: 1 * COIN,
+        mission_hash: sha256(b"pequalnp-open-lean4-swarm"),
+    };
+    let ch1_cm = note::commit(&founder_apk, ch1.v, &ch1.rho);
+    let ch1_pos = chain.state.cm_pos[&ch1_cm][0];
+    let (tx_launch, ch2) = spend_deposit(&chain, founder_sk, ch1.v, ch1.rho, ch1_pos, 300_000, Deposit::MissionLaunch(mpost.clone()));
+    let m_nf = match &tx_launch { Tx::Spend(s) => s.nf[0], _ => unreachable!() };
+    let mid = mission::mission_id(&mpost, &m_nf);
+    mine_txs(&mut chain, founder_apk, vec![tx_launch], 300_000);
+
+    // 3. Launchpad buyer puts 20 LOVE into bonding curve -> 1 LOVE (5%) automatically feeds bounty_pool!
+    let ch2_cm = note::commit(&founder_apk, ch2.v, &ch2.rho);
+    let ch2_pos = chain.state.cm_pos[&ch2_cm][0];
+    let (tx_buy, _ch3) = spend_deposit(
+        &chain,
+        founder_sk,
+        ch2.v,
+        ch2.rho,
+        ch2_pos,
+        300_000,
+        Deposit::MissionFund { mission: mid, holder_vk: trader_vk, amount: 20 * COIN, direct_to_bounty: false },
+    );
+    mine_txs(&mut chain, founder_apk, vec![tx_buy], 300_000);
+    assert_eq!(chain.state.missions[&mid].bounty_pool, 3 * COIN);
+    assert_eq!(chain.state.missions[&mid].curve_reserve, 19 * COIN);
+
+    // 4. Live HTTP RPC: GET /api/mission + post lemma + verified 80/20 claim + bonding-curve redeem!
+    let shared: Shared = Node::new(chain);
+    let port = serve_public(shared.clone(), "127.0.0.1", 0, None).unwrap();
+    let (code, jm) = http_req(port, "GET", &format!("/api/mission?id={}", hex::encode(mid)), &[]);
+    assert_eq!(code, 200);
+    assert_eq!(jm.get("found"), Some(&J::Bool(true)));
+    assert_eq!(jm.get("bounty_pool"), Some(&J::num(3 * COIN)));
+
+    let spec = sha256(b"lemma-circuit-lower-bound.lean");
+    let reward = 2 * COIN + 10_000;
+    let tx_task = Tx::Act(Action::MissionPostTask {
+        mission: mid,
+        task_id: 1,
+        spec_hash: spec,
+        reward,
+        sig: orch.sign(&mission::post_task_message(&mid, 1, &spec, reward)),
+    });
+    assert_eq!(http_req(port, "POST", "/api/tx", &tx_task.to_bytes()).0, 200);
+
+    // Unbonded Sybil claim MUST be rejected!
+    let proof_hash = sha256(b"lean4-verified-0-sorry-commit");
+    let cmsg = mission::claim_task_message(&mid, 1, &spec, &proof_hash, &agent_apk, 10_000);
+    let vsigs = vec![(0, checker0.sign(&cmsg)), (1, checker1.sign(&cmsg))];
+    let sybil_claim = Tx::Act(Action::MissionClaimTask {
+        mission: mid,
+        task_id: 1,
+        proof_hash,
+        contributor_addr: agent_apk,
+        contributor_bond_id: None,
+        miner_fee: 10_000,
+        verifier_sigs: vsigs.clone(),
+    });
+    assert_eq!(http_req(port, "POST", "/api/tx", &sybil_claim.to_bytes()).0, 400);
+
+    // Bonded agent claim succeeds -> 1.6 LOVE to agent, 0.4 LOVE to Lean FRO!
+    let bonded_claim = Tx::Act(Action::MissionClaimTask {
+        mission: mid,
+        task_id: 1,
+        proof_hash,
+        contributor_addr: agent_apk,
+        contributor_bond_id: Some(bid),
+        miner_fee: 10_000,
+        verifier_sigs: vsigs,
+    });
+    assert_eq!(http_req(port, "POST", "/api/tx", &bonded_claim.to_bytes()).0, 200);
+
+    // Mine block & check exact 80/20 shielded payouts + snapshot persistence!
+    {
+        let mut n = shared.lock().unwrap();
+        let (selected, fees) = n.select_with_fees();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(fees, 10_000);
+        let h = n.chain.height() + 1;
+        let out = PlainOut { a_pk: founder_apk, v: newsatoshi::params::subsidy(h) + fees, rho: rand::random() };
+        let mut b = n.chain.template(vec![out], selected, vec![]).unwrap();
+        assert!(mine(&mut b.header, u64::MAX));
+        n.accept_block(b, None).unwrap();
+
+        assert_eq!(n.chain.state.public_notes[&agent_apk][0].0, 160_000_000); // 80% outside contributor
+        assert_eq!(n.chain.state.public_notes[&lean_fro_apk][0].0, 40_000_000); // 20% Lean FRO
+        assert_eq!(n.chain.state.missions[&mid].completed_tasks, 1);
+
+        let expected = n.chain.state.digest();
+        n.chain.save_snapshot().unwrap();
+        let reopened = Chain::open(params, Some(&dir)).unwrap();
+        assert_eq!(reopened.state.digest(), expected);
+        assert_eq!(reopened.state.missions[&mid].completed_tasks, 1);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -8,6 +8,7 @@ use crate::job::{self, Action, Deposit, Job, Payout, Phase};
 use crate::cond::{self, Cond, CondEnd};
 use crate::lock::{self, Lock, LockEnd};
 use crate::merkmap::MerkleMap;
+use crate::mission::{self, MissionPool};
 use crate::nftree::NfTree;
 use crate::note::{self, NoteTree, MAX_NOTE_VALUE};
 use crate::params::{subsidy, Params, MAX_COINBASE_EXTRA, MAX_MEMO};
@@ -69,6 +70,9 @@ pub struct State {
     /// RFC-0023: Sovereign L2 Rollup Vaults (`crate::rollup`) + canonical Merkle map.
     pub rollups: imbl::OrdMap<[u8; 32], RollupVault>,
     pub rollups_merkle: MerkleMap,
+    /// RFC-0027: Mission Launchpads & Decentralized Agent Swarm Pools + canonical Merkle map.
+    pub missions: imbl::OrdMap<[u8; 32], MissionPool>,
+    pub missions_merkle: MerkleMap,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +124,8 @@ impl State {
             bonds_merkle: MerkleMap::new(),
             rollups: imbl::OrdMap::new(),
             rollups_merkle: MerkleMap::new(),
+            missions: imbl::OrdMap::new(),
+            missions_merkle: MerkleMap::new(),
         }
     }
 
@@ -172,6 +178,8 @@ impl State {
         let bonds = (!self.bonds.is_empty()).then(|| self.bonds_merkle.root());
         // RFC-0023 Sovereign L2 Rollup Vaults: O(1) incremental Merkle root while any exist
         let rollups = (!self.rollups.is_empty()).then(|| self.rollups_merkle.root());
+        // RFC-0027 Mission Launchpads: O(1) incremental Merkle root while any exist
+        let missions = (!self.missions.is_empty()).then(|| self.missions_merkle.root());
         DigestParts {
             height: self.height,
             tree_root: self.tree.root(),
@@ -187,6 +195,7 @@ impl State {
             channels,
             bonds,
             rollups,
+            missions,
         }
     }
 
@@ -298,6 +307,8 @@ impl State {
                     | Some(Deposit::BondTopUp { .. })
                     | Some(Deposit::RollupRegister(_))
                     | Some(Deposit::RollupDeposit { .. })
+                    | Some(Deposit::MissionLaunch(_))
+                    | Some(Deposit::MissionFund { .. })
                     | None => None,
                 };
                 let cond_after = match &sp.deposit {
@@ -426,6 +437,41 @@ impl State {
                     }
                     _ => None,
                 };
+                let mission_after = match &sp.deposit {
+                    Some(Deposit::MissionLaunch(p)) => {
+                        if !params.rfc0027_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0027 Mission Launchpads are not active at this height".into());
+                        }
+                        mission::check_post(p)?;
+                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
+                        let id = mission::mission_id(p, &first_nf);
+                        if self.missions.contains_key(&id) {
+                            return Err("duplicate mission launchpad".into());
+                        }
+                        Some(MissionPool {
+                            id,
+                            post: p.clone(),
+                            created_at: h,
+                            bounty_pool: p.initial_funding,
+                            curve_reserve: 0,
+                            total_shares: 0,
+                            shares_by_holder: BTreeMap::new(),
+                            tasks: BTreeMap::new(),
+                            completed_tasks: 0,
+                            total_bounties_paid: 0,
+                            action_nonce: 0,
+                        })
+                    }
+                    Some(Deposit::MissionFund { mission: id, holder_vk, amount, direct_to_bounty }) => {
+                        if !params.rfc0027_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0027 Mission Launchpads are not active at this height".into());
+                        }
+                        let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
+                        mission::apply_fund(&mut m, *holder_vk, *amount, *direct_to_bounty)?;
+                        Some(m)
+                    }
+                    _ => None,
+                };
                 if checks.verify_proofs {
                     spend::verify_bytes_cached(&params.proof, &pi, &sp.proof).map_err(|e| format!("proof rejected: {e}"))?;
                 }
@@ -461,6 +507,10 @@ impl State {
                 if let Some(rv) = rollup_after {
                     self.rollups_merkle.insert(rv.id, rv.value_hash());
                     self.rollups.insert(rv.id, rv);
+                }
+                if let Some(m) = mission_after {
+                    self.missions_merkle.insert(m.id, m.value_hash());
+                    self.missions.insert(m.id, m);
                 }
                 let dep_amt = match &sp.deposit {
                     Some(d) => d.checked_amount()? as u128,
@@ -707,6 +757,70 @@ impl State {
                 self.rollups.insert(rv.id, rv);
                 Ok(fee)
             }
+            Tx::Act(Action::MissionPostTask { mission: id, task_id, spec_hash, reward, sig }) => {
+                if !params.rfc0027_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0027 Mission Launchpads are not active at this height".into());
+                }
+                let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
+                mission::apply_post_task(&mut m, *task_id, *spec_hash, *reward, sig)?;
+                self.missions_merkle.insert(m.id, m.value_hash());
+                self.missions.insert(m.id, m);
+                Ok(0)
+            }
+            Tx::Act(Action::MissionClaimTask {
+                mission: id,
+                task_id,
+                proof_hash,
+                contributor_addr,
+                contributor_bond_id,
+                miner_fee,
+                verifier_sigs,
+            }) => {
+                if !params.rfc0027_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0027 Mission Launchpads are not active at this height".into());
+                }
+                let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
+                let worker_bond = contributor_bond_id.and_then(|bid| self.bonds.get(&bid));
+                let eff = mission::apply_claim_task(
+                    &mut m,
+                    *task_id,
+                    *proof_hash,
+                    *contributor_addr,
+                    worker_bond,
+                    *miner_fee,
+                    verifier_sigs,
+                    h,
+                )?;
+                self.pay_out_with_fee(&eff.payouts, 0, eff.miner_fee)?;
+                self.missions_merkle.insert(m.id, m.value_hash());
+                self.missions.insert(m.id, m);
+                Ok(eff.miner_fee)
+            }
+            Tx::Act(Action::MissionCurveRedeem {
+                mission: id,
+                holder_vk,
+                shares,
+                recipient_addr,
+                miner_fee,
+                sig,
+            }) => {
+                if !params.rfc0027_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0027 Mission Launchpads are not active at this height".into());
+                }
+                let mut m = self.missions.get(id).ok_or("unknown mission launchpad")?.clone();
+                let eff = mission::apply_curve_redeem(
+                    &mut m,
+                    *holder_vk,
+                    *shares,
+                    *recipient_addr,
+                    *miner_fee,
+                    sig,
+                )?;
+                self.pay_out_with_fee(&eff.payouts, 0, eff.miner_fee)?;
+                self.missions_merkle.insert(m.id, m.value_hash());
+                self.missions.insert(m.id, m);
+                Ok(eff.miner_fee)
+            }
             Tx::Act(a) => {
                 let mut j = self.jobs.get(a.job()).ok_or("unknown job")?.clone();
                 let fx = job::apply_action(&mut j, a, h)?;
@@ -820,6 +934,8 @@ pub struct DigestParts {
     pub bonds: Option<[u8; 32]>,
     /// RFC-0023: Sovereign L2 Rollup Vaults Merkle root (present only while any rollups exist).
     pub rollups: Option<[u8; 32]>,
+    /// RFC-0027: Mission Launchpads & Swarm Pools Merkle root (present only while any exist).
+    pub missions: Option<[u8; 32]>,
 }
 
 impl DigestParts {
@@ -846,6 +962,9 @@ impl DigestParts {
         }
         if let Some(r) = &self.rollups {
             w.raw(b"R").raw(r);
+        }
+        if let Some(m) = &self.missions {
+            w.raw(b"M").raw(m);
         }
         sha256(&w.0)
     }

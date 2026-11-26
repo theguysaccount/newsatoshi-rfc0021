@@ -237,6 +237,10 @@ pub extern "C" fn light_root(p: *const u8, n: usize) -> i32 {
                 Some(J::Str(s)) => Some(hex32(s)?),
                 _ => None,
             },
+            missions: match p.get("missions") {
+                Some(J::Str(s)) => Some(hex32(s)?),
+                _ => None,
+            },
         };
         let root = lc.committed_root(&newsatoshi::tx::Header::from_bytes(&hb), &tx_root, &parts)?;
         let mut out = vec![("root".into(), J::str(hex::encode(words_to_bytes(&root)))), ("height".into(), J::num(parts.height))];
@@ -251,6 +255,9 @@ pub extern "C" fn light_root(p: *const u8, n: usize) -> i32 {
         }
         if let Some(r) = parts.rollups {
             out.push(("rollups".into(), J::str(hex::encode(r))));
+        }
+        if let Some(r) = parts.missions {
+            out.push(("missions".into(), J::str(hex::encode(r))));
         }
         Ok(J::Obj(out).to_json())
     })())
