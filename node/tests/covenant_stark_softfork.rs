@@ -11,8 +11,8 @@
 use newsatoshi::chain::{mine, Chain};
 use newsatoshi::cond::{self, CondPost};
 use newsatoshi::covenant_stark::{
-    prove_covenant_stark, verify_covenant_stark_bytes, CovenantPublicInputs, CovenantTxKind,
-    PUBLIC_INPUTS_BYTES,
+    prove_covenant_stark, proven_security_bits, verify_covenant_stark_bytes, CovenantPublicInputs,
+    CovenantTxKind, MIN_PROVEN_SECURITY_BITS, PUBLIC_INPUTS_BYTES,
 };
 use newsatoshi::hash::sha256;
 use newsatoshi::job::{Action, Deposit};
@@ -102,6 +102,16 @@ fn op_verify_covenant_stark_0xb4_executes_on_l1_chain_and_blocks_tampering_and_c
     let pub_bytes = inputs.to_bytes();
     assert_eq!(pub_bytes.len(), PUBLIC_INPUTS_BYTES);
     let proof_bytes = prove_covenant_stark(&inputs).expect("valid STARK must prove");
+    let proven_bits = proven_security_bits(&proof_bytes).unwrap();
+    eprintln!(
+        "[RFC-0021 BENCH] Covenant STARK proof = {} bytes, {} proven bits (list decoding)",
+        proof_bytes.len(),
+        proven_bits
+    );
+    assert!(
+        proven_bits >= MIN_PROVEN_SECURITY_BITS,
+        "covenant STARK must meet >= 128 proven bits, got {proven_bits}"
+    );
     assert!(
         proof_bytes.len() > 1_000 && proof_bytes.len() <= script::MAX_ITEM,
         "proof size {} must fit within MAX_ITEM",
@@ -236,5 +246,18 @@ fn op_verify_covenant_stark_streaming_settlement_and_dos_limit() {
     assert!(
         err.contains("too many covenant STARK checks") || err.contains("witness bytes exceed limit"),
         "unexpected error: {err}"
+    );
+
+    // Height-gated hard-fork activation check: before rfc0021_from, opcode 0xb4 MUST be rejected!
+    let inactive_err = script::run_with_rfc0021(
+        &prog,
+        &[witness[0].clone(), witness[1].clone()],
+        &ctx,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        inactive_err.contains("not active"),
+        "expected inactive RFC-0021 rejection, got: {inactive_err}"
     );
 }

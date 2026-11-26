@@ -16,11 +16,11 @@
 use crate::hash::sha256;
 
 pub const MAX_PROGRAM: usize = 10_000;
-/// Largest stack/witness item: accommodates both SLH-DSA-SHA2-128s signatures (7,856 bytes)
-/// and RFC-0021 `OP_VERIFY_COVENANT_STARK` (0xb4) Winterfell proofs (up to 32 KiB).
-pub const MAX_ITEM: usize = 32_768;
+/// Largest stack/witness item: accommodates SLH-DSA-SHA2-128s signatures (7,856 bytes)
+/// and 128-bit proven RFC-0021 `OP_VERIFY_COVENANT_STARK` (0xb4) Winterfell proofs (up to 128 KiB).
+pub const MAX_ITEM: usize = 131_072;
 /// Total witness byte budget across all witness items (anti-DoS bound well below `MAX_TX_BYTES`).
-pub const MAX_WITNESS_BYTES: usize = 65_536;
+pub const MAX_WITNESS_BYTES: usize = 196_608;
 pub const MAX_STACK: usize = 64;
 pub const MAX_STEPS: usize = 1_000;
 pub const MAX_SIGCHECKS: usize = 16;
@@ -166,8 +166,18 @@ impl Machine<'_> {
     }
 }
 
-/// Run `program` with `witness` on the stack. `Ok` means the condition is met.
+/// Run `program` with `witness` on the stack (`rfc0021_active = true`). `Ok` means the condition is met.
 pub fn run(program: &[u8], witness: &[Vec<u8>], ctx: &Ctx) -> Result<(), String> {
+    run_with_rfc0021(program, witness, ctx, true)
+}
+
+/// Run `program` with explicit height-gated RFC-0021 hard-fork activation control.
+pub fn run_with_rfc0021(
+    program: &[u8],
+    witness: &[Vec<u8>],
+    ctx: &Ctx,
+    rfc0021_active: bool,
+) -> Result<(), String> {
     if program.len() > MAX_PROGRAM {
         return Err("program too long".into());
     }
@@ -243,6 +253,9 @@ pub fn run(program: &[u8], witness: &[Vec<u8>], ctx: &Ctx) -> Result<(), String>
         }
         if !running {
             // check the opcode exists even in a branch that does not run
+            if o == op::VERIFY_COVENANT_STARK && !rfc0021_active {
+                return Err("RFC-0021 OP_VERIFY_COVENANT_STARK is not active at this height".into());
+            }
             if !known(o) {
                 return Err(format!("unknown opcode {o:#04x}"));
             }
@@ -339,6 +352,9 @@ pub fn run(program: &[u8], witness: &[Vec<u8>], ctx: &Ctx) -> Result<(), String>
             }
             op::PAYOUT => m.push(num_bytes(ctx.payout as u64))?,
             op::VERIFY_COVENANT_STARK => {
+                if !rfc0021_active {
+                    return Err("RFC-0021 OP_VERIFY_COVENANT_STARK is not active at this height".into());
+                }
                 m.starkchecks += 1;
                 if m.starkchecks > MAX_STARK_CHECKS {
                     return Err("too many covenant STARK checks".into());

@@ -280,9 +280,10 @@ pub enum Action {
     /// Release coins under a condition to one of its payouts by running its program
     /// (`crate::cond`): the salt and program its commitment names, and a witness.
     Fulfil { cond: [u8; 32], payout: u8, salt: [u8; 32], program: Vec<u8>, witness: Vec<Vec<u8>> },
-    /// RFC-0022: Unilateral seller claim of `ticks` vouchers from a PayWord channel,
-    /// atomically splitting `ticks * unit_price` to seller, remainder to buyer, and fee to miner.
-    ChannelClaim { channel: [u8; 32], ticks: u32, token: [u8; 32] },
+    /// RFC-0022: Seller-authorized unilateral claim of `ticks` vouchers from a PayWord channel,
+    /// signed with the seller's `SLH-DSA-SHA2-128s` key (`seller_vk`), atomically splitting
+    /// `ticks * unit_price` to seller, remainder to buyer, and fee to miner.
+    ChannelClaim { channel: [u8; 32], ticks: u32, token: [u8; 32], sig: Vec<u8> },
     /// RFC-0022: Expire an unclaimed PayWord channel after timeout, refunding buyer and paying miner fee.
     ChannelExpire { channel: [u8; 32] },
 }
@@ -486,8 +487,8 @@ impl Action {
                     w.bytes(x);
                 }
             }
-            Action::ChannelClaim { channel, ticks, token } => {
-                w.u8(11).raw(channel).u32(*ticks).raw(token);
+            Action::ChannelClaim { channel, ticks, token, sig } => {
+                w.u8(11).raw(channel).u32(*ticks).raw(token).bytes(sig);
             }
             Action::ChannelExpire { channel } => {
                 w.u8(12).raw(channel);
@@ -539,7 +540,12 @@ impl Action {
                 }
                 Action::Fulfil { cond, payout, salt, program, witness }
             }
-            11 => Action::ChannelClaim { channel: r.arr()?, ticks: r.u32()?, token: r.arr()? },
+            11 => Action::ChannelClaim {
+                channel: r.arr()?,
+                ticks: r.u32()?,
+                token: r.arr()?,
+                sig: r.bytes(MAX_SIG)?,
+            },
             12 => Action::ChannelExpire { channel: r.arr()? },
             _ => return Err("bad action tag".into()),
         })

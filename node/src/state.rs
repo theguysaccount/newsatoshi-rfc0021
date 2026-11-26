@@ -305,6 +305,9 @@ impl State {
                 };
                 let channels_after = match &sp.deposit {
                     Some(Deposit::Channel(p)) => {
+                        if !params.rfc0022_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0022 PayWord channels are not active at this height".into());
+                        }
                         channel::check_post(p, h)?;
                         let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
                         let id = channel::channel_id(p, &first_nf, 0);
@@ -314,6 +317,9 @@ impl State {
                         vec![Channel { id, post: p.clone(), at: h }]
                     }
                     Some(Deposit::ChannelBatch(list)) => {
+                        if !params.rfc0022_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0022 PayWord channels are not active at this height".into());
+                        }
                         channel::check_batch(list, h)?;
                         let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
                         let mut out = Vec::with_capacity(list.len());
@@ -380,7 +386,8 @@ impl State {
             }
             Tx::Act(Action::Fulfil { cond: id, payout, salt, program, witness }) => {
                 let c = self.conds.get(id).ok_or("unknown condition")?;
-                let p = cond::fulfil(c, *payout, salt, program, witness, h)?;
+                let rfc0021_active = params.rfc0021_from.is_some_and(|f| h >= f);
+                let p = cond::fulfil_at(c, *payout, salt, program, witness, h, rfc0021_active)?;
                 self.pay_out(&[p], 0)?;
                 let c = self.conds.remove(id).expect("checked above");
                 self.cond_ends.insert(*id, CondEnd { cond: c, height: h, fulfilled: Some((*payout, program.clone())) });
@@ -394,9 +401,12 @@ impl State {
                 self.lock_ends.insert(*id, LockEnd { lock: l, height: h, preimage: None });
                 Ok(0)
             }
-            Tx::Act(Action::ChannelClaim { channel: id, ticks, token }) => {
+            Tx::Act(Action::ChannelClaim { channel: id, ticks, token, sig }) => {
+                if !params.rfc0022_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0022 PayWord channels are not active at this height".into());
+                }
                 let ch = self.channels.get(id).ok_or("unknown channel")?;
-                let res = channel::claim(ch, *ticks, token, h)?;
+                let res = channel::claim(ch, *ticks, token, sig, h)?;
                 self.pay_out_with_fee(&res.payouts, 0, res.miner_fee)?;
                 let ch = self.channels.remove(id).expect("checked above");
                 self.channels_merkle.remove(id);
@@ -414,6 +424,9 @@ impl State {
                 Ok(res.miner_fee)
             }
             Tx::Act(Action::ChannelExpire { channel: id }) => {
+                if !params.rfc0022_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0022 PayWord channels are not active at this height".into());
+                }
                 let ch = self.channels.get(id).ok_or("unknown channel")?;
                 let res = channel::expire(ch, h)?;
                 self.pay_out_with_fee(&res.payouts, 0, res.miner_fee)?;

@@ -7,7 +7,7 @@
 //! byte-for-byte against live wallet derivation and wire formats.
 
 use newsatoshi::chain::{mine, Chain};
-use newsatoshi::channel::{build_payword_chain, channel_id, ChannelPost};
+use newsatoshi::channel::{build_payword_chain, channel_id, claim_message, ChannelPost};
 use newsatoshi::deliver;
 use newsatoshi::hash::{bytes_to_words, sha256};
 use newsatoshi::job::{self, Action, Deposit, JobKey};
@@ -143,6 +143,8 @@ fn fast_boot_snapshot_restores_exact_state_catches_up_tail_and_rejects_tampering
         mine_one(&mut c, &buyer, vec![]);
     }
     let chain_pw = build_payword_chain(sha256(b"snap-channel-seed"), 100);
+    let seller_key = seller.job_key().unwrap();
+    let seller_vk: [u8; 32] = seller_key.vk().try_into().unwrap();
     let post = ChannelPost {
         tip: *chain_pw.last().unwrap(),
         max_ticks: 100,
@@ -150,6 +152,7 @@ fn fast_boot_snapshot_restores_exact_state_catches_up_tail_and_rejects_tampering
         claim_fee: 1_000,
         timeout: c.height() + 50,
         seller_addr: seller.a_pk(),
+        seller_vk,
         refund_addr: buyer.a_pk(),
     };
     let (open_tx, _) = buyer
@@ -161,11 +164,14 @@ fn fast_boot_snapshot_restores_exact_state_catches_up_tail_and_rejects_tampering
     c.save_snapshot().unwrap();
     assert!(dir.join(SNAPSHOT_FILE).exists());
 
-    // Now mine 2 MORE blocks AFTER the snapshot (including a partial channel claim in block 5!)
+    // Now mine 2 MORE blocks AFTER the snapshot (including a seller-signed partial claim in block 5!)
+    let tok_42 = chain_pw[100 - 42];
+    let sig_42 = seller_key.sign(&claim_message(&cid, 42, &tok_42));
     let claim_tx = Tx::Act(Action::ChannelClaim {
         channel: cid,
         ticks: 42,
-        token: chain_pw[100 - 42],
+        token: tok_42,
+        sig: sig_42,
     });
     mine_one(&mut c, &miner, vec![claim_tx]);
     mine_one(&mut c, &miner, vec![]);

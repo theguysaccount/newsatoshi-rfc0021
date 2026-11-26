@@ -1,8 +1,8 @@
 # RFC-0022: Unilateral Partial-Claim PayWord Channels & 64× Batched Funding
 
-> **Status:** Executable Testnet / Regtest L1 Consensus Prototype (`node/src/channel.rs`, `node/tests/payword_channel.rs`) built alongside `RFC-0021` (`OP_VERIFY_COVENANT_STARK`, `0xb4`) on top of `newsatoshi` v0.1.0.
+> **Status:** Executable Testnet / Regtest L1 Consensus Prototype (`node/src/channel.rs`, `node/tests/payword_channel.rs`) built alongside `RFC-0021` (`OP_VERIFY_COVENANT_STARK`, `0xb4`, 128 proven bits) on top of `newsatoshi` v0.1.0.
 >
-> **Upgrade Path:** Activatable on existing Mainnet via a height-gated consensus upgrade (`v0.2.0`, zero genesis reset required; state digest tag `b"P"` is omitted whenever `state.channels.is_empty()`, preserving 100% of historical block hashes) — or included from genesis in a clean audited Mainnet v2.
+> **Upgrade Path:** Height-gated consensus upgrade (**hard fork**, controlled by `Params::rfc0021_from` and `Params::rfc0022_from`, defaulting to `None` on v0.1.0 Mainnet/Testnet and `Some(0)` on Regtest/Rehearsal; `DigestParts::channels` is omitted whenever `state.channels.is_empty()` so historical hashes are untouched) — or active from genesis in an audited Mainnet v2 relaunch.
 
 ---
 
@@ -24,13 +24,14 @@ On Newsatoshi L1 v0.1.0:
   - `unit_price: u64` (`>= 1`)
   - `claim_fee: u64` (pre-funded miner fee paid to the block producer on claim or expire)
   - `timeout: u32` (`height < timeout <= height + MAX_LOCK_BLOCKS`)
-  - `seller_addr: Word8`, `refund_addr: Word8`
-- **`Deposit::ChannelBatch(Vec<ChannelPost>)` (tag `6`)**: Opens **`1..=64` distinct buyer–seller channels atomically inside ONE single shielded `Spend` proof** (~120 bytes per channel ≈ +7.7 KB for 64 channels = **64× channel-opening throughput lift**, ~1,088 channel opens per 8 MB Mainnet block ≈ ~156,672/day even before recursive proof compression).
+  - `seller_addr: Word8`, `seller_vk: [u8; 32]` (seller's NIST FIPS 205 `SLH-DSA-SHA2-128s` verifying key), `refund_addr: Word8`
+- **`Deposit::ChannelBatch(Vec<ChannelPost>)` (tag `6`)**: Opens **`1..=64` distinct buyer–seller channels atomically inside ONE single shielded `Spend` proof** (~152 bytes per channel ≈ +9.7 KB for 64 channels = **64× channel-opening throughput lift**, ~1,088 channel opens per 8 MB Mainnet block ≈ ~156,672/day even before recursive proof compression).
 
 ### New `Action` Variants
-- **`Action::ChannelClaim { channel, ticks, token }` (tag `11`, 70 bytes encoded)**:
-  - Anyone (typically the seller) submits the highest received voucher `(ticks, token)` to **any independent L1 node** at `height <= ch.post.timeout`.
-  - Consensus checks `1 <= ticks <= ch.post.max_ticks`, enforces the per-block anti-DoS hash budget (`MAX_BLOCK_CHANNEL_HASHES = 2_000_000` SHA-256 iterations across all claims in a block, `< 80 ms` total CPU), and verifies `SHA256^{ticks}(token) == ch.post.tip`.
+- **`Action::ChannelClaim { channel, ticks, token, sig }` (tag `11`, `7,930` bytes with FIPS 205 `SLH-DSA-SHA2-128s` signature)**:
+  - Requires a valid `SLH-DSA-SHA2-128s` signature by `ch.post.seller_vk` over `SHA256("nsCHANCLAIM" || channel_id || ticks_u32_le || token)` — **blocking adversarial buyers** who hold every earlier voucher (`token_1..token_{k-1}`) from front-running or closing early at `ticks = 1` to steal unpaid calls, and preventing unauthenticated hash-loop DoS (signature is checked before hashing).
+  - Seller unilaterally submits `(ticks, token, sig)` to **any independent L1 node** at `height <= ch.post.timeout` with zero buyer cooperation.
+  - Consensus checks `1 <= ticks <= ch.post.max_ticks`, enforces the per-block anti-DoS hash budget (`MAX_BLOCK_CHANNEL_HASHES = 2_000_000` SHA-256 iterations across all claims in a block, `< 80 ms` total CPU), and verifies `SHA256^{ticks}(token) == ch.post.tip` (so even a malicious seller with their own valid signature can never over-claim `ticks + 1`).
   - Atomically creates:
     - `seller_paid = ticks * unit_price` → new note for `seller_addr`
     - `buyer_refunded = (max_ticks - ticks) * unit_price` → new note for `refund_addr` (omitted if `0`)

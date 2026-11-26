@@ -30,12 +30,13 @@ use winterfell::{
 pub const TRACE_LENGTH: usize = 64;
 /// Number of algebraic columns in `CovenantTransitionAir`.
 pub const TRACE_WIDTH: usize = 15;
-/// Minimum conjectured post-quantum security bits required by L1 script verification.
-pub const MIN_SECURITY_BITS: u32 = 95;
+/// Minimum **proven** (list-decoding, non-conjectured) post-quantum security bits required
+/// by L1 script verification — matching Mainnet spend STARKs (`spend::PROVEN_BITS = 128`).
+pub const MIN_PROVEN_SECURITY_BITS: u32 = 128;
 /// Exact canonical byte length of encoded `CovenantPublicInputs`.
 pub const PUBLIC_INPUTS_BYTES: usize = 1 + 8 + 32 * 4 + 8 * 4 + 2 * 3; // 175 bytes
 /// Hard DoS cap on a serialized Covenant STARK proof inside an L1 script witness.
-pub const MAX_COVENANT_STARK_BYTES: usize = 32_768;
+pub const MAX_COVENANT_STARK_BYTES: usize = 131_072;
 
 type StarkHashFn = Sha2_256<BaseElement>;
 type StarkVC = MerkleTree<StarkHashFn>;
@@ -369,12 +370,15 @@ struct CovenantProver {
 }
 
 impl CovenantProver {
+    /// 128 queries, blowup 16, 16-bit grinding, quadratic extension over f128 (256-bit
+    /// challenge field), FRI folding by 4 → 128 **proven** bits under list decoding
+    /// (zero reliance on conjectured proximity gaps).
     fn default_options() -> ProofOptions {
         ProofOptions::new(
-            32,
-            8,
-            4,
-            FieldExtension::None,
+            128,
+            16,
+            16,
+            FieldExtension::Quadratic,
             4,
             31,
             BatchingMethod::Linear,
@@ -566,13 +570,41 @@ pub fn verify_covenant_stark_bytes(
     if inputs.min_soil_health_score > 100 || inputs.soil_health_score > 100 {
         return Err("covenant soil_health_score exceeds 100".into());
     }
+    let run = || -> Result<(), String> {
+        let proof = Proof::from_bytes(proof_bytes)
+            .map_err(|e| format!("bad covenant STARK proof: {e}"))?;
+        if proof.to_bytes() != proof_bytes {
+            return Err("covenant STARK proof is not canonically encoded".into());
+        }
+        let proven_bits = proof.proven_security::<StarkHashFn>().ldr_bits();
+        if proven_bits < MIN_PROVEN_SECURITY_BITS {
+            return Err(format!(
+                "covenant STARK proven security ({proven_bits} bits) below {MIN_PROVEN_SECURITY_BITS}"
+            ));
+        }
+        let acceptable = AcceptableOptions::OptionSet(vec![CovenantProver::default_options()]);
+        winterfell::verify::<CovenantTransitionAir, StarkHashFn, StarkCoin, StarkVC>(
+            proof,
+            inputs,
+            &acceptable,
+        )
+        .map_err(|e| format!("covenant STARK verify failed: {e}"))
+    };
+    #[cfg(panic = "unwind")]
+    {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+            .unwrap_or_else(|_| Err("malformed covenant STARK proof".into()))
+    }
+    #[cfg(not(panic = "unwind"))]
+    {
+        run()
+    }
+}
+
+/// Returns the non-conjectured proven security level (in bits, list-decoding regime)
+/// of a serialized Covenant STARK proof.
+pub fn proven_security_bits(proof_bytes: &[u8]) -> Result<u32, String> {
     let proof =
         Proof::from_bytes(proof_bytes).map_err(|e| format!("bad covenant STARK proof: {e}"))?;
-    let acceptable = AcceptableOptions::MinConjecturedSecurity(MIN_SECURITY_BITS);
-    winterfell::verify::<CovenantTransitionAir, StarkHashFn, StarkCoin, StarkVC>(
-        proof,
-        inputs,
-        &acceptable,
-    )
-    .map_err(|e| format!("covenant STARK verify failed: {e}"))
+    Ok(proof.proven_security::<StarkHashFn>().ldr_bits())
 }

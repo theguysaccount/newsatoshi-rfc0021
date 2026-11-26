@@ -130,8 +130,21 @@ pub fn refund_payout(c: &Cond) -> Payout {
 }
 
 /// Release the coins to payout `index` by running the committed program with `witness`, in
-/// a block at `height` no later than the timeout.
+/// a block at `height` no later than the timeout (`rfc0021_active = true`).
 pub fn fulfil(c: &Cond, index: u8, salt: &[u8; 32], program: &[u8], witness: &[Vec<u8>], height: u32) -> Res<Payout> {
+    fulfil_at(c, index, salt, program, witness, height, true)
+}
+
+/// Height-gated release enforcing `rfc0021_active` for `OP_VERIFY_COVENANT_STARK` (0xb4).
+pub fn fulfil_at(
+    c: &Cond,
+    index: u8,
+    salt: &[u8; 32],
+    program: &[u8],
+    witness: &[Vec<u8>],
+    height: u32,
+    rfc0021_active: bool,
+) -> Res<Payout> {
     if height > c.post.timeout {
         return Err("condition has expired".into());
     }
@@ -142,7 +155,13 @@ pub fn fulfil(c: &Cond, index: u8, salt: &[u8; 32], program: &[u8], witness: &[V
         return Err("that is not the committed program".into());
     }
     let msg = sign_message(&c.id, index);
-    script::run(program, witness, &script::Ctx { height, payout: index, msg: &msg }).map_err(|e| format!("condition not met: {e}"))?;
+    script::run_with_rfc0021(
+        program,
+        witness,
+        &script::Ctx { height, payout: index, msg: &msg },
+        rfc0021_active,
+    )
+    .map_err(|e| format!("condition not met: {e}"))?;
     Ok(payout(c, index))
 }
 

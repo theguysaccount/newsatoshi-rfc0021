@@ -93,6 +93,12 @@ pub struct Params {
     pub checkpoint_sunset: u32,
     /// Height from which blocks commit to the nullifier tree's root (`crate::nftree`).
     pub nf_tree_from: Option<u32>,
+    /// Height from which RFC-0021 (`OP_VERIFY_COVENANT_STARK`, opcode 0xb4) is active
+    /// (height-gated hard-fork consensus upgrade; `None` preserves v0.1.0 rejection).
+    pub rfc0021_from: Option<u32>,
+    /// Height from which RFC-0022 (seller-authorized PayWord channels & batched channel opens)
+    /// is active (height-gated hard-fork consensus upgrade; `None` preserves v0.1.0 rejection).
+    pub rfc0022_from: Option<u32>,
     /// Nodes to reach when none is named with `--peer`. Any node can be one; these are
     /// only where a new node first looks.
     pub seeds: &'static [&'static str],
@@ -135,6 +141,8 @@ impl Params {
                 checkpoints: vec![],
                 checkpoint_sunset: 0,
                 nf_tree_from: Some(TESTNET_NF_TREE_FROM),
+                rfc0021_from: None,
+                rfc0022_from: None,
                 seeds: &["newsatoshi-seed.fly.dev:18444"],
             }),
             Net::Reg => Ok(Params {
@@ -157,6 +165,8 @@ impl Params {
                 checkpoints: vec![],
                 checkpoint_sunset: 0,
                 nf_tree_from: Some(0),
+                rfc0021_from: Some(0),
+                rfc0022_from: Some(0),
                 seeds: &[],
             }),
             // The main network's rules, with what makes it a rehearsal: its own name (in
@@ -172,6 +182,8 @@ impl Params {
                 genesis_bits: 0x207fffff,
                 genesis_nonce: u32::MAX, // mined deterministically at start-up
                 genesis_message: "rehearsal: the main network's rules on a chain that is thrown away",
+                rfc0021_from: Some(0),
+                rfc0022_from: Some(0),
                 seeds: &[],
                 ..Self::main_with(0, 0)
             }),
@@ -202,6 +214,8 @@ impl Params {
             checkpoints: vec![],
             checkpoint_sunset: 0,
             nf_tree_from: Some(0),
+            rfc0021_from: None,
+            rfc0022_from: None,
             seeds: &["newsatoshi-seed.fly.dev:8444"],
         }
     }

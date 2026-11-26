@@ -843,6 +843,7 @@ fn channel_json(
         ("total_deposit".into(), J::num(total_deposit)),
         ("timeout".into(), J::num(p.timeout)),
         ("seller".into(), J::str(encode_address(&p.seller_addr))),
+        ("seller_vk".into(), J::str(hex::encode(p.seller_vk))),
         ("refund".into(), J::str(encode_address(&p.refund_addr))),
         ("at".into(), J::num(ch.at)),
         ("confirmations".into(), J::num(if confirmed { (tip_height + 1).saturating_sub(ch.at) } else { 0 })),
