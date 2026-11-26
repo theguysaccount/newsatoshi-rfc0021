@@ -550,3 +550,161 @@ fn pequalnp_style_mission_launchpad_bonding_curve_and_bonded_agent_swarm_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn permissionless_zero_sequencer_l2_zkvm_onchain_stark_settlement_e2e() {
+    use newsatoshi::zkvm::{compile_l2_program, prove_zkvm_execution, state_slots_root, ZkVmShard};
+
+    let dir = temp_dir("perm-zkvm");
+    let params = Params::get(Net::Reg).unwrap();
+    let mut chain = Chain::open(params.clone(), Some(&dir)).unwrap();
+
+    let funder_sk: Word8 = [41u32; 8];
+    let funder_apk = note::address(&funder_sk);
+    let alice_apk = note::address(&[42u32; 8]);
+    let bob_apk = note::address(&[43u32; 8]);
+
+    let cb_rho: Rho = rand::random();
+    let out1 = PlainOut { a_pk: funder_apk, v: 50 * COIN, rho: cb_rho };
+    let mut b1 = chain.template(vec![out1], vec![], vec![]).unwrap();
+    assert!(mine(&mut b1.header, u64::MAX));
+    chain.add_block(b1).unwrap();
+    mine_txs(&mut chain, funder_apk, vec![], 0);
+    let cm0 = note::commit(&funder_apk, 50 * COIN, &cb_rho);
+    let pos0 = chain.state.cm_pos[&cm0][0];
+
+    // Compile a deterministic L2 withdrawal + transfer program; pin its exact `program_hash`
+    // as `vk_hash` on a 100% PERMISSIONLESS (`sequencer_vk: None`) L1 RollupVault!
+    let prog = compile_l2_program(
+        r#"
+        LOAD_STATE r0, s0
+        LOAD_CONST r1, 10000000
+        SUB r0, r0, r1
+        STORE_STATE s0, r0
+        EMIT_WITHDRAW r1
+        HALT
+        "#,
+    )
+    .unwrap();
+
+    let init_slots = [100_000_000, 50_000_000, 0, 0];
+    let genesis_root = state_slots_root(&init_slots);
+    let rpost = RollupPost {
+        vk_hash: prog.program_hash,
+        genesis_root,
+        sequencer_vk: None, // ZERO SEQUENCER — 100% permissionless & L1 STARK-enforced!
+        initial_tvl: 150_000_000,
+        name_tag: sha256(b"permissionless-l2-zkvm"),
+    };
+    let (tx_reg, _ch1) = spend_deposit(
+        &chain,
+        funder_sk,
+        50 * COIN,
+        cb_rho,
+        pos0,
+        300_000,
+        Deposit::RollupRegister(rpost.clone()),
+    );
+    let r_nf = match &tx_reg { Tx::Spend(s) => s.nf[0], _ => unreachable!() };
+    let rid = rollup::rollup_id(&rpost, &r_nf);
+    mine_txs(&mut chain, funder_apk, vec![tx_reg], 300_000);
+
+    // Prove TWO contiguous L2 zkVM shards (128-bit pure-SHA-2 Winterfell STARKs!)
+    let s1 = prove_zkvm_execution(&prog, init_slots).unwrap();
+    let s2 = prove_zkvm_execution(&prog, s1.pub_inputs.final_slots).unwrap();
+    assert_eq!(s2.pub_inputs.final_slots, [80_000_000, 50_000_000, 0, 0]);
+
+    let w1_id = sha256(b"perm-zkvm-exit-1");
+    let w2_id = sha256(b"perm-zkvm-exit-2");
+    let mut wmap = MerkleMap::new();
+    wmap.insert(w1_id, rollup::withdrawal_leaf_hash(&rid, 1, &w1_id, &alice_apk, 10_000_000));
+    wmap.insert(w2_id, rollup::withdrawal_leaf_hash(&rid, 1, &w2_id, &bob_apk, 10_000_000));
+    let wroot = wmap.root();
+
+    let shared: Shared = Node::new(chain);
+    let port = serve_public(shared.clone(), "127.0.0.1", 0, None).unwrap();
+
+    // 1. ATTACK: Submitting a DIFFERENT compiled program's valid STARK proof MUST be rejected HTTP 400!
+    let evil_prog = compile_l2_program(
+        "LOAD_STATE r0, s0\nLOAD_CONST r1, 90000000\nSUB r0, r0, r1\nSTORE_STATE s0, r0\nEMIT_WITHDRAW r1\nHALT",
+    )
+    .unwrap();
+    let evil_shard = prove_zkvm_execution(&evil_prog, init_slots).unwrap();
+    let evil_tx = Tx::Act(Action::RollupZkVmBatch {
+        rollup: rid,
+        withdraw_root: wroot,
+        batch_fee: 10_000,
+        sequencer_sig: vec![],
+        shards: vec![ZkVmShard { pub_inputs: evil_shard.pub_inputs, proof: evil_shard.proof_bytes }],
+    });
+    assert_eq!(
+        http_req(port, "POST", "/api/tx", &evil_tx.to_bytes()).0,
+        400,
+        "wrong L2 program_hash MUST be rejected on L1"
+    );
+
+    // 2. ATTACK: Bit-flipping 1 byte inside an honest shard's STARK proof MUST be rejected HTTP 400!
+    let mut tampered_proof = s1.proof_bytes.clone();
+    tampered_proof[200] ^= 0x80;
+    let tampered_tx = Tx::Act(Action::RollupZkVmBatch {
+        rollup: rid,
+        withdraw_root: wroot,
+        batch_fee: 10_000,
+        sequencer_sig: vec![],
+        shards: vec![ZkVmShard { pub_inputs: s1.pub_inputs.clone(), proof: tampered_proof }],
+    });
+    assert_eq!(
+        http_req(port, "POST", "/api/tx", &tampered_tx.to_bytes()).0,
+        400,
+        "tampered zkVM STARK MUST be rejected on L1"
+    );
+
+    // 3. HONEST: Submit BOTH contiguous 128-bit zkVM STARK shards directly over HTTP POST /api/tx (ZERO sequencer sig!)
+    let honest_tx = Tx::Act(Action::RollupZkVmBatch {
+        rollup: rid,
+        withdraw_root: wroot,
+        batch_fee: 25_000,
+        sequencer_sig: vec![],
+        shards: vec![
+            ZkVmShard { pub_inputs: s1.pub_inputs, proof: s1.proof_bytes },
+            ZkVmShard { pub_inputs: s2.pub_inputs.clone(), proof: s2.proof_bytes },
+        ],
+    });
+    let (code, resp) = http_req(port, "POST", "/api/tx", &honest_tx.to_bytes());
+    assert_eq!(code, 200, "honest permissionless 2-shard zkVM batch failed: {}", resp.to_json());
+
+    // Submit both Alice & Bob trustless Merkle withdrawals in the same block!
+    for (wid, addr) in [(w1_id, alice_apk), (w2_id, bob_apk)] {
+        let tx_w = Tx::Act(Action::RollupWithdraw {
+            rollup: rid,
+            batch_seq: 1,
+            withdrawal_id: wid,
+            recipient_addr: addr,
+            amount: 10_000_000,
+            miner_fee: 1_000,
+            proof: wmap.prove(&wid).unwrap(),
+        });
+        assert_eq!(http_req(port, "POST", "/api/tx", &tx_w.to_bytes()).0, 200);
+    }
+
+    // Mine block and verify L1 consensus state, TVL conservation, and shielded exits!
+    {
+        let mut n = shared.lock().unwrap();
+        let (selected, fees) = n.select_with_fees();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(fees, 25_000 + 1_000 + 1_000);
+        let h = n.chain.height() + 1;
+        let out = PlainOut { a_pk: funder_apk, v: newsatoshi::params::subsidy(h) + fees, rho: rand::random() };
+        let mut b = n.chain.template(vec![out], selected, vec![]).unwrap();
+        assert!(mine(&mut b.header, u64::MAX));
+        n.accept_block(b, None).unwrap();
+
+        let rv = &n.chain.state.rollups[&rid];
+        assert_eq!(rv.state_root, s2.pub_inputs.new_state_root);
+        assert_eq!(rv.tvl, 150_000_000 - 20_000_000 - 25_000);
+        assert_eq!(rv.pending_withdrawals, 0);
+        assert_eq!(n.chain.state.public_notes[&alice_apk][0].0, 9_999_000);
+        assert_eq!(n.chain.state.public_notes[&bob_apk][0].0, 9_999_000);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

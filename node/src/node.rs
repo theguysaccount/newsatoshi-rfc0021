@@ -582,7 +582,8 @@ impl Node {
             | Tx::Act(crate::job::Action::RollupWithdraw { miner_fee, .. })
             | Tx::Act(crate::job::Action::MissionClaimTask { miner_fee, .. })
             | Tx::Act(crate::job::Action::MissionCurveRedeem { miner_fee, .. }) => *miner_fee,
-            Tx::Act(crate::job::Action::RollupBatch { batch_fee, .. }) => *batch_fee,
+            Tx::Act(crate::job::Action::RollupBatch { batch_fee, .. })
+            | Tx::Act(crate::job::Action::RollupZkVmBatch { batch_fee, .. }) => *batch_fee,
             _ => 0,
         };
         let mut new = PoolEntry { tx, id, size, fee, seq: self.seq };
@@ -606,7 +607,13 @@ impl Node {
         }
         let h = self.next_height();
         let admit_checks = crate::state::Checks {
-            verify_proofs: matches!(&new.tx, Tx::Act(crate::job::Action::RollupBatch { .. })),
+            verify_proofs: matches!(
+                &new.tx,
+                Tx::Act(
+                    crate::job::Action::RollupBatch { .. }
+                        | crate::job::Action::RollupZkVmBatch { .. }
+                )
+            ),
             check_commit: false,
         };
         let applied_fee = self.pool_state.apply_tx(&new.tx, h, &self.chain.params, admit_checks)?;

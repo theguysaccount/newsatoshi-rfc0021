@@ -729,6 +729,30 @@ impl State {
                 self.rollups.insert(rv.id, rv);
                 Ok(fee)
             }
+            Tx::Act(Action::RollupZkVmBatch {
+                rollup: id,
+                withdraw_root,
+                batch_fee,
+                sequencer_sig,
+                shards,
+            }) => {
+                if !params.rfc0023_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
+                }
+                let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
+                let fee = rollup::apply_zkvm_batch(
+                    &mut rv,
+                    *withdraw_root,
+                    *batch_fee,
+                    sequencer_sig,
+                    shards,
+                    checks.verify_proofs,
+                )?;
+                self.pay_out_with_fee(&[], 0, fee)?;
+                self.rollups_merkle.insert(rv.id, rv.value_hash());
+                self.rollups.insert(rv.id, rv);
+                Ok(fee)
+            }
             Tx::Act(Action::RollupWithdraw {
                 rollup: id,
                 batch_seq,

@@ -743,6 +743,129 @@ pub fn apply_batch(
     Ok(batch_fee)
 }
 
+/// Domain-separated sequencer signature message for `Action::RollupZkVmBatch`
+/// (checked only when `vault.post.sequencer_vk` is `Some`; `None` is fully permissionless!).
+pub fn zkvm_batch_sig_message(
+    rollup: &[u8; 32],
+    next_seq: u64,
+    new_state_root: &[u8; 32],
+    withdraw_root: &[u8; 32],
+    batch_withdrawals: u64,
+    batch_fee: u64,
+    total_steps: u64,
+) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(8 + 32 * 3 + 8 * 4);
+    buf.extend_from_slice(b"nsZKVMBA");
+    buf.extend_from_slice(rollup);
+    buf.extend_from_slice(&next_seq.to_le_bytes());
+    buf.extend_from_slice(new_state_root);
+    buf.extend_from_slice(withdraw_root);
+    buf.extend_from_slice(&batch_withdrawals.to_le_bytes());
+    buf.extend_from_slice(&batch_fee.to_le_bytes());
+    buf.extend_from_slice(&total_steps.to_le_bytes());
+    sha256(&buf)
+}
+
+/// Trustless L1 Consensus Settlement of Permissionless L2 zkVM Execution (`Action::RollupZkVmBatch`).
+///
+/// Closes the L1 <-> L2 execution soundness gap completely: L1 consensus nodes directly verify
+/// every shard's 128-bit pure-SHA-2 Winterfell `ZkVmExecutionAir` STARK proof, enforce that
+/// every shard executed the exact pinned `vault.post.vk_hash` (`program_hash`), verify contiguous
+/// state-root chaining (`vault.state_root -> shard[0] -> ... -> shard[K-1]`), and mathematically
+/// bind `batch_withdrawals == sum(shard.total_withdrawals)` (the exact `EMIT_WITHDRAW` ops!).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_zkvm_batch(
+    vault: &mut RollupVault,
+    withdraw_root: [u8; 32],
+    batch_fee: u64,
+    sequencer_sig: &[u8],
+    shards: &[crate::zkvm::ZkVmShard],
+    verify_proof: bool,
+) -> Result<u64, String> {
+    if shards.is_empty() || shards.len() > crate::zkvm::MAX_ONCHAIN_ZKVM_SHARDS {
+        return Err("zkVM shard count out of range".into());
+    }
+    let next_seq = vault.batch_seq.checked_add(1).ok_or("batch_seq overflow")?;
+
+    let mut total_withdrawals: u64 = 0;
+    let mut total_steps: u64 = 0;
+    let mut expected_prev = vault.state_root;
+
+    for (idx, shard) in shards.iter().enumerate() {
+        // 1. Pin every shard's executed L2 program to the vault's immutable `vk_hash`!
+        if shard.pub_inputs.program_hash != vault.post.vk_hash {
+            return Err(format!(
+                "zkVM shard {idx} program_hash does not match rollup vault vk_hash"
+            ));
+        }
+        // 2. Enforce exact contiguous state-root chaining from `vault.state_root`!
+        if shard.pub_inputs.prev_state_root != expected_prev {
+            return Err(format!(
+                "zkVM shard {idx} prev_state_root breaks state chain continuity"
+            ));
+        }
+        shard.pub_inputs.verify_roots_consistent()?;
+        if shard.pub_inputs.steps_executed == 0 {
+            return Err(format!("zkVM shard {idx} executed zero instructions"));
+        }
+        // 3. Cryptographically verify the 128-bit pure-SHA-2 Winterfell zkVM STARK directly on L1!
+        if verify_proof {
+            crate::zkvm::verify_zkvm_execution(&shard.pub_inputs, &shard.proof)?;
+        }
+        total_withdrawals = total_withdrawals
+            .checked_add(shard.pub_inputs.total_withdrawals)
+            .ok_or("zkVM batch withdrawal overflow")?;
+        total_steps = total_steps
+            .checked_add(shard.pub_inputs.steps_executed)
+            .ok_or("zkVM batch steps overflow")?;
+        expected_prev = shard.pub_inputs.new_state_root;
+    }
+
+    let max_63 = (1u64 << 63) - 1;
+    let total_out = total_withdrawals
+        .checked_add(batch_fee)
+        .ok_or("zkVM batch total_out overflow")?;
+    let new_tvl = vault
+        .tvl
+        .checked_sub(total_out)
+        .ok_or("zkVM batch withdrawals + fee exceed vault tvl")?;
+    if vault.tvl > max_63 || new_tvl > max_63 || total_withdrawals > max_63 || batch_fee > max_63 {
+        return Err("zkVM batch amounts exceed 63-bit bound".into());
+    }
+    let next_pending = vault
+        .pending_withdrawals
+        .checked_add(total_withdrawals)
+        .ok_or("pending withdrawals overflow")?;
+    if total_withdrawals > 0 && vault.withdraw_roots.len() >= MAX_WITHDRAW_ROOTS {
+        return Err("rollup withdraw root table full".into());
+    }
+
+    if let Some(vk) = &vault.post.sequencer_vk {
+        let msg = zkvm_batch_sig_message(
+            &vault.id,
+            next_seq,
+            &expected_prev,
+            &withdraw_root,
+            total_withdrawals,
+            batch_fee,
+            total_steps,
+        );
+        if !verify_sig(vk, &msg, sequencer_sig) {
+            return Err("invalid rollup sequencer signature".into());
+        }
+    }
+
+    vault.state_root = expected_prev;
+    vault.batch_seq = next_seq;
+    vault.total_l2_txs = vault.total_l2_txs.saturating_add(total_steps);
+    vault.tvl = new_tvl;
+    vault.pending_withdrawals = next_pending;
+    if total_withdrawals > 0 {
+        vault.withdraw_roots.push((next_seq, withdraw_root));
+    }
+    Ok(batch_fee)
+}
+
 /// Apply a trustless L2 → L1 shielded exit (`Action::RollupWithdraw`).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_withdraw(

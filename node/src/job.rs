@@ -391,6 +391,15 @@ pub enum Action {
         miner_fee: u64,
         sig: Vec<u8>,
     },
+    /// RFC-0023: Permissionless on-chain L1 settlement directly verifying 1..=4 contiguous
+    /// 128-bit pure-SHA-2 L2 `ZkVmExecutionAir` STARK shards pinned to `vault.post.vk_hash`.
+    RollupZkVmBatch {
+        rollup: [u8; 32],
+        withdraw_root: [u8; 32],
+        batch_fee: u64,
+        sequencer_sig: Vec<u8>,
+        shards: Vec<crate::zkvm::ZkVmShard>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -583,7 +592,9 @@ impl Action {
             | Action::BondSlashQuorum { bond, .. }
             | Action::BondUnbondRequest { bond, .. }
             | Action::BondUnbondComplete { bond, .. } => bond,
-            Action::RollupBatch { rollup, .. } | Action::RollupWithdraw { rollup, .. } => rollup,
+            Action::RollupBatch { rollup, .. }
+            | Action::RollupWithdraw { rollup, .. }
+            | Action::RollupZkVmBatch { rollup, .. } => rollup,
             Action::MissionPostTask { mission, .. }
             | Action::MissionClaimTask { mission, .. }
             | Action::MissionCurveRedeem { mission, .. } => mission,
@@ -775,6 +786,17 @@ impl Action {
                     .u64(*miner_fee)
                     .bytes(sig);
             }
+            Action::RollupZkVmBatch { rollup, withdraw_root, batch_fee, sequencer_sig, shards } => {
+                w.u8(23)
+                    .raw(rollup)
+                    .raw(withdraw_root)
+                    .u64(*batch_fee)
+                    .bytes(sequencer_sig)
+                    .u8(shards.len() as u8);
+                for s in shards {
+                    s.encode(w);
+                }
+            }
         }
     }
     pub fn decode(r: &mut Reader) -> Res<Self> {
@@ -945,6 +967,21 @@ impl Action {
                 miner_fee: r.u64()?,
                 sig: r.bytes(MAX_SIG)?,
             },
+            23 => {
+                let rollup = r.arr()?;
+                let withdraw_root = r.arr()?;
+                let batch_fee = r.u64()?;
+                let sequencer_sig = r.bytes(MAX_SIG)?;
+                let n = r.u8()? as usize;
+                if n == 0 || n > crate::zkvm::MAX_ONCHAIN_ZKVM_SHARDS {
+                    return Err("zkVM shard count out of range".into());
+                }
+                let mut shards = Vec::with_capacity(n);
+                for _ in 0..n {
+                    shards.push(crate::zkvm::ZkVmShard::decode(r)?);
+                }
+                Action::RollupZkVmBatch { rollup, withdraw_root, batch_fee, sequencer_sig, shards }
+            }
             _ => return Err("bad action tag".into()),
         })
     }

@@ -87,7 +87,15 @@ fn opts() -> Result<Opts, String> {
     // network's genesis block
     let name = match Params::get(net) {
         Ok(p) => p.name,
-        Err(_) if net == Net::Main && args.first().map(|a| a == "genesis").unwrap_or(false) => "mainnet",
+        Err(_)
+            if net == Net::Main
+                && args
+                    .first()
+                    .map(|a| a == "genesis" || a == "genesis-v2")
+                    .unwrap_or(false) =>
+        {
+            "mainnet"
+        }
         Err(e) => return Err(e),
     };
     let dir = dir.unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or(".".into())).join(".newsatoshi").join(name));
@@ -580,6 +588,60 @@ fn run() -> Result<(), String> {
             g.header.nonce = 0;
             mine(&mut g.header, u64::MAX);
             println!("time {} nonce {} hash {} ({} ms)", g.header.time, g.header.nonce, hash_hex(&g.hash()), t.elapsed().as_millis());
+        }
+        ["genesis-v2", ..] => {
+            let btc_hash = flag(&o.rest, "--btc-block-hash")
+                .ok_or("usage: newsatoshi genesis-v2 --btc-block-hash <64HEX> --btc-height <HEIGHT> [--time <UNIX>] [--bits <HEX>] [--mine]")?;
+            let btc_height: u64 = flag(&o.rest, "--btc-height")
+                .ok_or("missing --btc-height <HEIGHT>")?
+                .parse()
+                .map_err(|_| "invalid --btc-height")?;
+            let msg_owned = Params::format_v2_fair_launch_message(btc_height, &btc_hash)?;
+            let msg_static: &'static str = Box::leak(msg_owned.clone().into_boxed_str());
+            let time: u32 = match flag(&o.rest, "--time") {
+                Some(s) => s.parse().map_err(|_| "invalid --time")?,
+                None => newsatoshi::chain::now() as u32,
+            };
+            let bits: u32 = match flag(&o.rest, "--bits") {
+                Some(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                    .map_err(|_| "invalid hex --bits")?,
+                None => 0x1d00_ffff,
+            };
+            let do_mine = o.rest.iter().any(|a| a == "--mine");
+            let mut p = Params::main_v2_with(time, u32::MAX, bits);
+            p.genesis_message = msg_static;
+            let mut g = genesis_block(&p);
+            let fp = hex::encode(newsatoshi::hash::sha256(
+                format!(
+                    "nsV2GEN|{msg_owned}|{time}|{bits:#010x}|{}|{}|{}",
+                    p.launch_blocks, p.launch_half_life, p.half_life
+                )
+                .as_bytes(),
+            ));
+            let mined_ms = if do_mine {
+                let t = Instant::now();
+                g.header.nonce = 0;
+                mine(&mut g.header, u64::MAX);
+                Some(t.elapsed().as_millis())
+            } else {
+                None
+            };
+            println!(
+                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_security_profile\": \"MAIN_V2_384_BIT_PURE_SHA2\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"rfc_activation_height\": 0,\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
+                p.launch_blocks,
+                p.launch_half_life,
+                p.half_life,
+                btc_height,
+                btc_hash.trim().to_ascii_lowercase(),
+                msg_owned,
+                g.header.time,
+                g.header.bits,
+                do_mine,
+                g.header.nonce,
+                hash_hex(&g.hash()),
+                mined_ms.map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
+                fp
+            );
         }
         ["demo"] => demo()?,
         _ => {

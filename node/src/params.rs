@@ -253,14 +253,16 @@ impl Params {
     }
 
     /// Audited Mainnet v2 launch rules: anti-instamine Day-1 ASERT ramp (1-hour half-life for
-    /// the first 2,016 blocks → 48-hour steady state), RFC-0021 (128-bit proven covenants),
-    /// RFC-0022 (seller-signed 64× batched PayWord channels), RFC-0023 (sovereign L2 rollup
-    /// vaults), RFC-0024 (universal trust bonds), and RFC-0027 (mission launchpads) active from genesis.
+    /// the first 2,016 blocks → 48-hour steady state), 384-bit pure-SHA-2 FRI (`spend::MAIN_V2`),
+    /// RFC-0021 (128-bit proven covenants), RFC-0022 (seller-signed 64× batched PayWord channels),
+    /// RFC-0023 (sovereign L2 rollup vaults + permissionless on-chain L2 zkVM STARKs),
+    /// RFC-0024 (universal trust bonds), and RFC-0027 (mission launchpads) active from genesis.
     pub fn main_v2_with(genesis_time: u32, genesis_nonce: u32, genesis_bits: u32) -> Params {
         Params {
             genesis_bits,
             launch_blocks: 2_016,
             launch_half_life: 3_600,
+            proof: crate::spend::MAIN_V2,
             rfc0021_from: Some(0),
             rfc0022_from: Some(0),
             rfc0023_from: Some(0),
@@ -268,6 +270,21 @@ impl Params {
             rfc0027_from: Some(0),
             ..Self::main_with(genesis_time, genesis_nonce)
         }
+    }
+
+    /// Format the canonical Bitcoin-block-anchored Mainnet v2 fair-launch genesis message
+    /// (<= 120 bytes to fit `MAX_COINBASE_EXTRA`), proving zero secret pre-mining before
+    /// Bitcoin reached `btc_height`.
+    pub fn format_v2_fair_launch_message(btc_height: u64, btc_block_hash_hex: &str) -> Result<String, String> {
+        let h = btc_block_hash_hex.trim().to_ascii_lowercase();
+        if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("btc_block_hash must be 64 hex characters".into());
+        }
+        let msg = format!("NEWSATOSHI-V2 BTC#{btc_height} {h}");
+        if msg.len() > MAX_COINBASE_EXTRA {
+            return Err(format!("genesis message exceeds MAX_COINBASE_EXTRA ({MAX_COINBASE_EXTRA})"));
+        }
+        Ok(msg)
     }
 
     pub fn parse(s: &str) -> Result<Net, String> {

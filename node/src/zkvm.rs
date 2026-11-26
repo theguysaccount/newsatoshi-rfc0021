@@ -14,6 +14,7 @@
 //!   verifies program `vk_hash` continuity, folds their withdrawal totals, and emits a single
 //!   128-bit pure-SHA-2 `RFC-0023` `RollupBatch` STARK proof for L1 consensus settlement.
 
+use crate::codec::{Reader, Res, Writer};
 use crate::hash::{sha256, Sha2_256};
 use crate::rollup::{prove_batch, verify_batch_proof, RollupBatchInputs};
 use winterfell::crypto::{DefaultRandomCoin, MerkleTree};
@@ -32,6 +33,7 @@ pub const ZKVM_TRACE_LEN: usize = 64;
 pub const ZKVM_MAX_STEPS: usize = ZKVM_TRACE_LEN - 1;
 pub const ZKVM_MIN_PROVEN_BITS: u32 = 128;
 pub const MAX_ZKVM_PROOF_BYTES: usize = 196_608;
+pub const MAX_ONCHAIN_ZKVM_SHARDS: usize = 4;
 
 type ZkVmHashFn = Sha2_256<BaseElement>;
 type ZkVmVC = MerkleTree<ZkVmHashFn>;
@@ -337,6 +339,65 @@ impl ZkVmPublicInputs {
             return Err("zkVM final_slots do not match new_state_root".into());
         }
         Ok(())
+    }
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.raw(&self.program_hash);
+        for s in &self.initial_slots {
+            w.u64(*s);
+        }
+        for s in &self.final_slots {
+            w.u64(*s);
+        }
+        w.raw(&self.prev_state_root)
+            .raw(&self.new_state_root)
+            .u64(self.total_withdrawals)
+            .u64(self.steps_executed)
+            .u64(self.final_transcript_lo)
+            .u64(self.final_transcript_hi);
+    }
+
+    pub fn decode(r: &mut Reader) -> Res<Self> {
+        let program_hash = r.arr()?;
+        let initial_slots = [r.u64()?, r.u64()?, r.u64()?, r.u64()?];
+        let final_slots = [r.u64()?, r.u64()?, r.u64()?, r.u64()?];
+        let prev_state_root = r.arr()?;
+        let new_state_root = r.arr()?;
+        let total_withdrawals = r.u64()?;
+        let steps_executed = r.u64()?;
+        let final_transcript_lo = r.u64()?;
+        let final_transcript_hi = r.u64()?;
+        Ok(ZkVmPublicInputs {
+            program_hash,
+            initial_slots,
+            final_slots,
+            prev_state_root,
+            new_state_root,
+            total_withdrawals,
+            steps_executed,
+            final_transcript_lo,
+            final_transcript_hi,
+        })
+    }
+}
+
+/// One self-contained on-chain L2 zkVM execution shard (`ZkVmPublicInputs` + 128-bit STARK proof).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZkVmShard {
+    pub pub_inputs: ZkVmPublicInputs,
+    pub proof: Vec<u8>,
+}
+
+impl ZkVmShard {
+    pub fn encode(&self, w: &mut Writer) {
+        self.pub_inputs.encode(w);
+        w.bytes(&self.proof);
+    }
+
+    pub fn decode(r: &mut Reader) -> Res<Self> {
+        let pub_inputs = ZkVmPublicInputs::decode(r)?;
+        let proof = r.bytes(MAX_ZKVM_PROOF_BYTES)?;
+        Ok(ZkVmShard { pub_inputs, proof })
     }
 }
 
