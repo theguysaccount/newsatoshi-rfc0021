@@ -1391,6 +1391,52 @@ impl Faucet {
     }
 }
 
+fn flyclient_proof_json(shared: &Shared, tail: usize, samples: usize) -> J {
+    let n = lock(shared);
+    let height = n.chain.height();
+    let mut headers = Vec::with_capacity((height + 1) as usize);
+    for h in 0..=height {
+        if let Some(b) = n.chain.block_at(h) {
+            headers.push(b);
+        } else {
+            return err_json("chain header unavailable");
+        }
+    }
+    drop(n);
+    match crate::light::FlyClientProof::prove(&headers, tail.clamp(1, 32), samples.clamp(1, 64)) {
+        Ok(p) => J::Obj(vec![
+            ("ok".into(), J::Bool(true)),
+            ("genesis_hash".into(), J::str(hash_hex(&p.genesis_hash))),
+            ("tip_height".into(), J::num(p.tip_height)),
+            ("mmr_root".into(), J::str(hash_hex(&p.mmr_root))),
+            ("total_work".into(), J::str(p.total_work.to_string())),
+            ("peak_count".into(), J::num(p.peaks.len())),
+            ("tail_count".into(), J::num(p.tail_headers.len())),
+            ("sample_count".into(), J::num(p.samples.len())),
+            (
+                "peaks".into(),
+                J::Arr(
+                    p.peaks
+                        .iter()
+                        .map(|pk| {
+                            J::Obj(vec![
+                                ("hash".into(), J::str(hash_hex(&pk.hash))),
+                                ("work".into(), J::str(pk.work.to_string())),
+                                ("height".into(), J::num(pk.height)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "sample_heights".into(),
+                J::Arr(p.samples.iter().map(|s| J::num(s.height)).collect()),
+            ),
+        ]),
+        Err(e) => err_json(&e),
+    }
+}
+
 fn respond(s: &mut TcpStream, code: u16, body: &str, head_only: bool) {
     let reason = match code {
         200 => "OK",
@@ -1506,6 +1552,11 @@ pub fn serve_public_with(shared: Shared, bind: &str, port: u16, faucet: Option<A
                                 Err(_) => (400, err_json("from= takes a height")),
                             },
                             ("GET", "/api/state") => (200, state_commitment(&sh)),
+                            ("GET", "/api/flyclient") => {
+                                let tail = req.param("tail").and_then(|x| x.parse::<usize>().ok()).unwrap_or(6);
+                                let samples = req.param("samples").and_then(|x| x.parse::<usize>().ok()).unwrap_or(16);
+                                (200, flyclient_proof_json(&sh, tail, samples))
+                            }
                             ("GET", "/api/envelopes") => match req.param("from").unwrap_or("0").parse::<u32>() {
                                 Ok(from) => (200, envelopes(&sh, from)),
                                 Err(_) => (400, err_json("from= takes a height")),

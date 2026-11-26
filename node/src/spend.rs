@@ -778,16 +778,18 @@ pub struct Profile {
     pub unmasked: bool,
     /// Largest proof taken.
     pub max_proof_bytes: usize,
+    /// Use 384-bit SHA-384 FRI/Merkle commitments (192-bit classical / 128-bit QROM soundness).
+    pub sha384: bool,
 }
 
 /// The test network's proofs (and regtest's): 64 queries, about 249 KB.
-pub const TEST: Profile = Profile { queries: 64, tag: b"", unmasked: true, max_proof_bytes: MAX_PROOF_BYTES };
+pub const TEST: Profile = Profile { queries: 64, tag: b"", unmasked: true, max_proof_bytes: MAX_PROOF_BYTES, sha384: false };
 
 /// The main network's proofs: `MAIN_QUERIES` queries, about 460 KB, masked only.
-pub const MAIN: Profile = Profile { queries: MAIN_QUERIES, tag: b"/main", unmasked: false, max_proof_bytes: MAIN_MAX_PROOF_BYTES };
+pub const MAIN: Profile = Profile { queries: MAIN_QUERIES, tag: b"/main", unmasked: false, max_proof_bytes: MAIN_MAX_PROOF_BYTES, sha384: false };
 
 /// The rehearsal network's proofs: the main network's in everything but the name.
-pub const DRY: Profile = Profile { queries: MAIN_QUERIES, tag: b"/dry", unmasked: false, max_proof_bytes: MAIN_MAX_PROOF_BYTES };
+pub const DRY: Profile = Profile { queries: MAIN_QUERIES, tag: b"/dry", unmasked: false, max_proof_bytes: MAIN_MAX_PROOF_BYTES, sha384: false };
 
 impl Profile {
     /// Blowup 16, 16 bits of grinding, the cubic extension, FRI folding by 8 (`options`),
@@ -1077,11 +1079,19 @@ fn prefix_of(pi: &SpendPublic, meta: &[u8], options: &ProofOptions) -> Vec<u8> {
     b
 }
 
-/// Make a payment proof for a network.
+/// Make a payment proof for a network (automatically dispatches 384-bit SHA-384 FRI for `MAIN_V2`).
 pub fn prove_for(profile: &Profile, wit: &SpendWitness, bind: Word8) -> Result<(SpendPublic, Proof), String> {
     let pi = wit.public(bind)?;
     let trace = build_trace_with(wit, &profile.meta());
-    let proof = SpendProver { options: profile.options(), pi: pi.clone() }.prove(trace).map_err(|e| format!("prover: {e}"))?;
+    let proof = if profile.sha384 {
+        SpendProver384 { options: profile.options(), pi: pi.clone() }
+            .prove(trace)
+            .map_err(|e| format!("prover: {e}"))?
+    } else {
+        SpendProver { options: profile.options(), pi: pi.clone() }
+            .prove(trace)
+            .map_err(|e| format!("prover: {e}"))?
+    };
     Ok((pi, proof))
 }
 
@@ -1094,6 +1104,7 @@ pub fn verify_bytes(pi: &SpendPublic, proof: &[u8]) -> Result<(), String> {
 /// network's limit or not starting with the exact bytes its proofs start with (the
 /// network's name and parameters among them); refuses any encoding but the canonical one,
 /// so a valid proof cannot be padded or re-encoded into a second valid transaction.
+/// Automatically dispatches 384-bit SHA-384 FRI verification when `profile.sha384` is true.
 /// Natively a panic anywhere inside the library becomes an error rather than a dead node.
 pub fn verify_bytes_for(profile: &Profile, pi: &SpendPublic, proof: &[u8]) -> Result<(), String> {
     if proof.len() > profile.max_proof_bytes {
@@ -1106,13 +1117,18 @@ pub fn verify_bytes_for(profile: &Profile, pi: &SpendPublic, proof: &[u8]) -> Re
     if !proof.starts_with(&context_prefix_for(profile, pi)) && !(profile.unmasked && proof.starts_with(&prefix_of(pi, &[], &options))) {
         return Err("proof is not for this circuit".into());
     }
+    let sha384 = profile.sha384;
     let run = || -> Result<(), String> {
         let p = Proof::from_bytes(proof).map_err(|e| format!("malformed proof: {e}"))?;
         if p.to_bytes() != proof {
             return Err("proof is not canonically encoded".into());
         }
         let acceptable = winterfell::AcceptableOptions::OptionSet(vec![options.clone()]);
-        winterfell::verify::<SpendAir, Hash, Coin, Vc>(p, pi.clone(), &acceptable).map_err(|e| format!("{e}"))
+        if sha384 {
+            winterfell::verify::<SpendAir, Hash384, Coin384, Vc384>(p, pi.clone(), &acceptable).map_err(|e| format!("{e}"))
+        } else {
+            winterfell::verify::<SpendAir, Hash, Coin, Vc>(p, pi.clone(), &acceptable).map_err(|e| format!("{e}"))
+        }
     };
     #[cfg(panic = "unwind")]
     {
@@ -1133,7 +1149,7 @@ fn verified_cache() -> &'static std::sync::Mutex<std::collections::HashSet<[u8; 
 }
 
 fn cache_key(profile: &Profile, pi: &SpendPublic, proof: &[u8]) -> [u8; 32] {
-    let rules = [profile.queries as u8, profile.unmasked as u8, profile.tag.len() as u8];
+    let rules = [profile.queries as u8, profile.unmasked as u8, profile.sha384 as u8, profile.tag.len() as u8];
     hash::sha256(&[rules.as_slice(), profile.tag, &(profile.max_proof_bytes as u64).to_le_bytes(), pi.to_bytes().as_slice(), proof].concat())
 }
 
@@ -1184,6 +1200,7 @@ pub const MAIN_V2: Profile = Profile {
     tag: b"/main-v2-sha384",
     unmasked: false,
     max_proof_bytes: MAIN_V2_MAX_PROOF_BYTES,
+    sha384: true,
 };
 
 pub struct SpendProver384 {

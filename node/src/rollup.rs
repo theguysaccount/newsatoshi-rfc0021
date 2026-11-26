@@ -17,7 +17,7 @@
 //!   a settled batch's `withdraw_root`, protected against replay by `claimed_withdrawals`.
 
 use crate::codec::{Reader, Res, Writer};
-use crate::hash::{sha256, words_to_bytes, Sha2_256, Word8};
+use crate::hash::{sha256, words_to_bytes, Sha2_384, Word8};
 use crate::job::{verify_sig, Payout};
 use crate::merkmap::{verify_proof, MerkleProof};
 use crate::note::{Rho, MAX_NOTE_VALUE};
@@ -39,14 +39,15 @@ pub const ROLLUP_TRACE_LEN: usize = 64;
 pub const ROLLUP_TRACE_WIDTH: usize = 15;
 /// Minimum proven (list-decoding, non-conjectured) security bits enforced on L1.
 pub const ROLLUP_MIN_PROVEN_BITS: u32 = 128;
-/// Hard DoS cap on serialized Rollup STARK batch proof bytes.
-pub const MAX_ROLLUP_PROOF_BYTES: usize = 131_072;
+/// Hard DoS cap on serialized 384-bit SHA-384 Rollup STARK batch proof bytes.
+pub const MAX_ROLLUP_PROOF_BYTES: usize = 262_144;
 /// Maximum number of retained batch withdrawal roots per rollup vault.
 pub const MAX_WITHDRAW_ROOTS: usize = 1024;
 /// Maximum number of recorded withdrawal nullifiers per rollup vault in snapshot/state.
 pub const MAX_CLAIMED_WITHDRAWALS: usize = 1_000_000;
 
-type RollupHashFn = Sha2_256<BaseElement>;
+/// 384-bit pure SHA-384 FRI/Merkle commitment stack (192-bit classical / 128-bit QROM soundness).
+type RollupHashFn = Sha2_384<BaseElement>;
 type RollupVC = MerkleTree<RollupHashFn>;
 type RollupCoin = DefaultRandomCoin<RollupHashFn>;
 

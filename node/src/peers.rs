@@ -13,10 +13,67 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Most addresses kept, sent in one answer, and taken from one message.
 pub const MAX_BOOK: usize = 2_000;
+/// Eclipse defense: maximum entries stored from any single /16 IPv4 (or /32 IPv6) netgroup.
+pub const MAX_PER_NETGROUP_BOOK: usize = 32;
+/// Persistent outbound anchor connections reconnected first on restart (reboot-eclipse defense).
+pub const MAX_ANCHORS: usize = 2;
 pub const MAX_ADDR_SEND: usize = 100;
 pub const MAX_ADDR_TAKE: usize = 100;
 /// Longest address string accepted ("host:port", a bracketed IPv6 host included).
 pub const MAX_ADDR_LEN: usize = 72;
+
+/// Canonical netgroup bucket key (`/16` prefix for IPv4, `/32` prefix for IPv6) used for
+/// Bitcoin-Core-style eclipse attack resistance.
+pub fn netgroup_of_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("v4:{}.{}", o[0], o[1])
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                let o = v4.octets();
+                format!("v4:{}.{}", o[0], o[1])
+            } else {
+                let s = v6.segments();
+                format!("v6:{:x}:{:x}", s[0], s[1])
+            }
+        }
+    }
+}
+
+/// True when `addr` targets the local loopback interface (`127.0.0.0/8` or `::1`).
+/// Localhost regtest clusters run multiple peers on loopback; routable peers strictly enforce
+/// one outbound connection per `/16` IPv4 or `/32` IPv6 netgroup.
+fn is_loopback_addr(addr: &str) -> bool {
+    let Some((host, _)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    let clean = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    clean
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Extract the eclipse-defense netgroup for a `"host:port"` peer address string.
+pub fn netgroup(addr: &str) -> String {
+    let Some((host, _)) = addr.rsplit_once(':') else {
+        return format!("raw:{addr}");
+    };
+    let clean = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+        netgroup_of_ip(ip)
+    } else {
+        format!("dns:{}", clean.to_ascii_lowercase())
+    }
+}
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -63,12 +120,14 @@ pub struct AddrBook {
     pub map: HashMap<String, Entry>,
     /// Addresses that turned out to be this node itself.
     pub selves: HashSet<String>,
+    /// Last known-good outbound anchors persisted across restarts (defeats reboot-eclipse attacks).
+    pub anchors: Vec<String>,
     path: Option<PathBuf>,
     dirty: bool,
 }
 
 impl AddrBook {
-    /// Open the book at `path`, if it exists.
+    /// Open the book at `path`, if it exists (and any companion `anchors.txt`).
     pub fn open(path: Option<PathBuf>) -> AddrBook {
         let mut b = AddrBook { path, ..Default::default() };
         if let Some(p) = &b.path {
@@ -82,13 +141,47 @@ impl AddrBook {
                     }
                 }
             }
+            let ap = p.with_file_name("anchors.txt");
+            if let Ok(text) = std::fs::read_to_string(ap) {
+                for line in text.lines() {
+                    let a = line.trim();
+                    if valid(a) && b.anchors.len() < MAX_ANCHORS && !b.anchors.iter().any(|x| x == a) {
+                        b.anchors.push(a.to_string());
+                    }
+                }
+            }
         }
         b
     }
 
+    /// Record up to `MAX_ANCHORS` distinct-netgroup outbound peers to prioritize on restart.
+    pub fn set_anchors(&mut self, peers: &[String]) {
+        let mut next = Vec::new();
+        let mut seen_ng = HashSet::new();
+        for a in peers {
+            if valid(a) && !self.selves.contains(a) && seen_ng.insert(netgroup(a)) {
+                next.push(a.clone());
+                if next.len() >= MAX_ANCHORS {
+                    break;
+                }
+            }
+        }
+        if next != self.anchors {
+            self.anchors = next;
+            self.dirty = true;
+        }
+    }
+
     /// Note an address heard from someone. Known addresses keep what is known of them.
+    /// Enforces a per-netgroup (`/16` IPv4 / `/32` IPv6) ceiling so a single subnet cannot
+    /// flood the book and evict honest peers.
     pub fn heard(&mut self, addr: &str) -> bool {
         if !valid(addr) || self.selves.contains(addr) || self.map.contains_key(addr) {
+            return false;
+        }
+        let ng = netgroup(addr);
+        let in_ng = self.map.keys().filter(|k| netgroup(k) == ng).count();
+        if in_ng >= MAX_PER_NETGROUP_BOOK {
             return false;
         }
         if self.map.len() >= MAX_BOOK && !self.evict() {
@@ -162,19 +255,59 @@ impl AddrBook {
     /// Addresses worth dialling now, best first: not connected, not this node, and not
     /// tried recently (the wait doubles with each failure, up to a day).
     pub fn candidates(&self, connected: &HashSet<String>) -> Vec<String> {
+        let connected_ng: HashSet<String> = connected.iter().map(|a| netgroup(a)).collect();
+        self.candidates_diverse(connected, &connected_ng)
+    }
+
+    /// Eclipse-resistant candidate selection: prioritizes persistent anchors first, then picks
+    /// at most ONE outbound candidate per `/16` IPv4 (or `/32` IPv6) netgroup not already
+    /// present in `connected_netgroups`.
+    pub fn candidates_diverse(
+        &self,
+        connected: &HashSet<String>,
+        connected_netgroups: &HashSet<String>,
+    ) -> Vec<String> {
         use rand::seq::SliceRandom;
         let t = now();
+        let mut used_ng = connected_netgroups.clone();
+        let mut out = Vec::new();
+
+        // 1. Prioritize persistent anchors (reboot-eclipse defense)
+        for a in &self.anchors {
+            if !connected.contains(a) && !self.selves.contains(a) {
+                let ng = netgroup(a);
+                let ok_cooldown = self
+                    .map
+                    .get(a)
+                    .map(|e| t.saturating_sub(e.tried) >= (30u64 << e.fails.min(12)).min(86_400))
+                    .unwrap_or(true);
+                if ok_cooldown && (is_loopback_addr(a) || used_ng.insert(ng)) {
+                    out.push(a.clone());
+                }
+            }
+        }
+
+        // 2. Remaining candidates ordered by reliability, capped at 1 per non-loopback netgroup
         let mut v: Vec<(&String, &Entry)> = self
             .map
             .iter()
-            .filter(|(a, e)| !connected.contains(*a) && t.saturating_sub(e.tried) >= (30u64 << e.fails.min(12)).min(86_400))
+            .filter(|(a, e)| {
+                !connected.contains(*a)
+                    && t.saturating_sub(e.tried) >= (30u64 << e.fails.min(12)).min(86_400)
+            })
             .collect();
         v.shuffle(&mut rand::thread_rng());
         v.sort_by_key(|(_, e)| (e.fails, e.seen == 0));
-        v.into_iter().map(|(a, _)| a.clone()).collect()
+        for (a, _) in v {
+            let ng = netgroup(a);
+            if is_loopback_addr(a) || used_ng.insert(ng) {
+                out.push(a.clone());
+            }
+        }
+        out
     }
 
-    /// Write the book out if it changed.
+    /// Write the book and persistent anchors out if changed.
     pub fn save(&mut self) {
         if !self.dirty {
             return;
@@ -186,6 +319,10 @@ impl AddrBook {
             }
             let tmp = p.with_extension("tmp");
             if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, p).is_ok() {
+                let ap = p.with_file_name("anchors.txt");
+                let atmp = p.with_file_name("anchors.tmp");
+                let atext = self.anchors.join("\n");
+                let _ = std::fs::write(&atmp, atext).and_then(|_| std::fs::rename(&atmp, &ap));
                 self.dirty = false;
             }
         }

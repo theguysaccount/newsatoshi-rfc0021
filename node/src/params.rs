@@ -15,9 +15,12 @@ pub const MAX_TX_BYTES: usize = 400_000;
 /// Largest encoded transaction on the main network: its larger proofs, and the same room
 /// for the rest of a payment.
 pub const MAIN_MAX_TX_BYTES: usize = MAX_TX_BYTES - crate::spend::MAX_PROOF_BYTES + crate::spend::MAIN_MAX_PROOF_BYTES;
+/// Largest encoded transaction on Mainnet v2 / Regtest (fits 384-bit SHA-384 spend proofs and
+/// up to 4× 192-bit SHA-384 Haböck LogUp RAP zkVM execution shards in one `RollupZkVmBatch`).
+pub const MAIN_V2_MAX_TX_BYTES: usize = 1_400_000;
 /// Largest encoded transaction any network takes: what a decoder will read, so a block one
 /// node accepts is a block every node can decode.
-pub const TX_BYTES_CAP: usize = MAIN_MAX_TX_BYTES;
+pub const TX_BYTES_CAP: usize = MAIN_V2_MAX_TX_BYTES;
 pub const MAX_BLOCK_TXS: usize = 100_000;
 pub const MAX_FUTURE_SECS: i64 = 2 * 60 * 60;
 
@@ -175,7 +178,7 @@ impl Params {
                 target_spacing: 600,
                 coinbase_maturity: 1,
                 max_block_bytes: 8_000_000,
-                max_tx_bytes: MAX_TX_BYTES,
+                max_tx_bytes: MAIN_MAX_TX_BYTES,
                 proof: crate::spend::TEST,
                 default_fee: DEFAULT_FEE,
                 default_port: 18_544,
@@ -262,6 +265,7 @@ impl Params {
             genesis_bits,
             launch_blocks: 2_016,
             launch_half_life: 3_600,
+            max_tx_bytes: MAIN_V2_MAX_TX_BYTES,
             proof: crate::spend::MAIN_V2,
             rfc0021_from: Some(0),
             rfc0022_from: Some(0),

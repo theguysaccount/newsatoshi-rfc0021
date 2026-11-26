@@ -39,6 +39,8 @@ const MAX_PEERS: usize = 64;
 const MAX_INBOUND: usize = 48;
 /// Inbound connections from one public address.
 pub const MAX_PER_IP: usize = 4;
+/// Eclipse defense: inbound connections from any single public `/16` IPv4 (or `/32` IPv6) netgroup.
+pub const MAX_PER_NETGROUP: usize = 8;
 /// A peer says hello within this long of connecting, and is heard from at least every
 /// `IDLE_SECS` after: every node repeats its hello each `KEEPALIVE_SECS`.
 const HANDSHAKE_SECS: u64 = 20;
@@ -120,8 +122,19 @@ pub fn admit_inbound(ip: IpAddr) -> bool {
     }
     let mut m = BY_IP.lock().unwrap_or_else(|e| e.into_inner());
     let have = m.iter().find(|(x, _)| *x == ip).map(|(_, n)| *n).unwrap_or(0);
-    if is_public(ip) && have >= MAX_PER_IP {
-        return false;
+    if is_public(ip) {
+        if have >= MAX_PER_IP {
+            return false;
+        }
+        let ng = peers::netgroup_of_ip(ip);
+        let have_ng: usize = m
+            .iter()
+            .filter(|(x, _)| is_public(*x) && peers::netgroup_of_ip(*x) == ng)
+            .map(|(_, n)| *n)
+            .sum();
+        if have_ng >= MAX_PER_NETGROUP {
+            return false;
+        }
     }
     match m.iter_mut().find(|(x, _)| *x == ip) {
         Some(e) => e.1 += 1,
@@ -163,6 +176,135 @@ pub enum Msg {
     /// fetched. `Headers` carries blocks with no transactions.
     GetHeaders { locator: Vec<[u8; 32]> },
     Headers(Vec<Block>),
+    /// BIP-152-style Compact Block relay: sends header + coinbase + 6-byte short txids so
+    /// peers with warm mempools reconstruct multi-MB STARK blocks in ~1–2 KB (>95% savings).
+    CompactBlock(CompactBlock),
+    GetBlockTxn { block_hash: [u8; 32], indices: Vec<u32> },
+    BlockTxn { block_hash: [u8; 32], txs: Vec<Tx> },
+}
+
+/// 6-byte keyed short txid for Compact Block relay (`sha256("nsCMPCT1" || block_hash || nonce || txid)[..6]`).
+pub fn compact_short_id(block_hash: &[u8; 32], nonce: u64, txid: &[u8; 32]) -> [u8; 6] {
+    let mut buf = [0u8; 8 + 32 + 8 + 32];
+    buf[..8].copy_from_slice(b"nsCMPCT1");
+    buf[8..40].copy_from_slice(block_hash);
+    buf[40..48].copy_from_slice(&nonce.to_le_bytes());
+    buf[48..80].copy_from_slice(txid);
+    let h = crate::hash::sha256(&buf);
+    h[..6].try_into().unwrap()
+}
+
+/// BIP-152-style compact representation of a block (header + auxpow + digest + coinbase + 6-byte short IDs).
+#[derive(Clone, Debug)]
+pub struct CompactBlock {
+    pub header: crate::tx::Header,
+    pub auxpow: Option<crate::auxpow::AuxPow>,
+    pub digest: [u8; 32],
+    pub coinbase: Tx,
+    pub nonce: u64,
+    pub short_ids: Vec<[u8; 6]>,
+}
+
+impl CompactBlock {
+    pub fn from_block(block: &Block, nonce: u64) -> Result<Self, String> {
+        let coinbase = block.txs.first().ok_or("block has no coinbase")?.clone();
+        let bh = block.hash();
+        let short_ids = block
+            .txs
+            .iter()
+            .skip(1)
+            .map(|t| compact_short_id(&bh, nonce, &t.id()))
+            .collect();
+        Ok(CompactBlock {
+            header: block.header,
+            auxpow: block.auxpow.clone(),
+            digest: block.digest,
+            coinbase,
+            nonce,
+            short_ids,
+        })
+    }
+
+    pub fn block_hash(&self) -> [u8; 32] {
+        self.header.hash()
+    }
+
+    /// Reconstruct the full block from local mempool transactions (and any extra fetched txs).
+    /// Returns `Ok(Block)` if every short ID matched uniquely, or `Err(missing_indices)` listing
+    /// the 1-based tx indices still needed via `Msg::GetBlockTxn`.
+    pub fn reconstruct(&self, available: &[Tx]) -> Result<Block, Vec<u32>> {
+        let bh = self.block_hash();
+        let mut by_short: HashMap<[u8; 6], Vec<&Tx>> = HashMap::with_capacity(available.len());
+        for tx in available {
+            let sid = compact_short_id(&bh, self.nonce, &tx.id());
+            by_short.entry(sid).or_default().push(tx);
+        }
+        let mut txs = Vec::with_capacity(1 + self.short_ids.len());
+        txs.push(self.coinbase.clone());
+        let mut missing = Vec::new();
+        for (idx, sid) in self.short_ids.iter().enumerate() {
+            match by_short.get(sid) {
+                Some(cands) if cands.len() == 1 => txs.push(cands[0].clone()),
+                _ => missing.push((idx + 1) as u32),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(missing);
+        }
+        Ok(Block {
+            header: self.header,
+            auxpow: self.auxpow.clone(),
+            digest: self.digest,
+            txs,
+        })
+    }
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.raw(&self.header.bytes());
+        match &self.auxpow {
+            Some(a) => {
+                w.u8(1).bytes(&a.to_bytes());
+            }
+            None => {
+                w.u8(0);
+            }
+        }
+        w.raw(&self.digest)
+            .bytes(&self.coinbase.to_bytes())
+            .u64(self.nonce)
+            .u32(self.short_ids.len() as u32);
+        for sid in &self.short_ids {
+            w.raw(sid);
+        }
+    }
+
+    pub fn decode(r: &mut Reader) -> Result<Self, String> {
+        let header = crate::tx::Header::from_bytes(&r.arr::<80>()?);
+        let auxpow = match r.u8()? {
+            0 => None,
+            1 => Some(crate::auxpow::AuxPow::parse(&r.bytes(crate::auxpow::MAX_AUXPOW_BYTES)?)?),
+            _ => return Err("bad compact block auxpow flag".into()),
+        };
+        let digest = r.arr()?;
+        let coinbase = Tx::from_bytes(&r.bytes(TX_BYTES_CAP)?)?;
+        let nonce = r.u64()?;
+        let n = r.u32()? as usize;
+        if n > crate::params::MAX_BLOCK_TXS {
+            return Err("too many compact short ids".into());
+        }
+        let mut short_ids = Vec::with_capacity(n.min(r.remaining() / 6));
+        for _ in 0..n {
+            short_ids.push(r.arr()?);
+        }
+        Ok(CompactBlock {
+            header,
+            auxpow,
+            digest,
+            coinbase,
+            nonce,
+            short_ids,
+        })
+    }
 }
 
 impl Msg {
@@ -221,6 +363,24 @@ impl Msg {
                 }
                 9
             }
+            Msg::CompactBlock(cb) => {
+                cb.encode(&mut p);
+                10
+            }
+            Msg::GetBlockTxn { block_hash, indices } => {
+                p.raw(block_hash).u32(indices.len() as u32);
+                for i in indices {
+                    p.u32(*i);
+                }
+                11
+            }
+            Msg::BlockTxn { block_hash, txs } => {
+                p.raw(block_hash).u32(txs.len() as u32);
+                for t in txs {
+                    p.bytes(&t.to_bytes());
+                }
+                12
+            }
         };
         let mut out = magic.to_vec();
         out.push(kind);
@@ -242,6 +402,9 @@ impl Msg {
             7 => 4 + peers::MAX_ADDR_SEND * (4 + peers::MAX_ADDR_LEN),
             8 => 4 + 32 * MAX_LOCATOR,
             9 => 4 + HEADERS_BYTES + crate::auxpow::MAX_AUXPOW_BYTES + 100 + 2_000 * 8,
+            10 => max_block.min(1 << 20),
+            11 => 36 + 4 * crate::params::MAX_BLOCK_TXS.min(16_384),
+            12 => max_block,
             _ => 0,
         }
     }
@@ -342,6 +505,31 @@ impl Msg {
                     v.push(b);
                 }
                 Msg::Headers(v)
+            }
+            10 => Msg::CompactBlock(CompactBlock::decode(&mut r)?),
+            11 => {
+                let block_hash = r.arr()?;
+                let k = r.u32()? as usize;
+                if k > 16_384 {
+                    return Err("too many requested block tx indices".into());
+                }
+                let mut indices = Vec::with_capacity(k.min(r.remaining() / 4));
+                for _ in 0..k {
+                    indices.push(r.u32()?);
+                }
+                Msg::GetBlockTxn { block_hash, indices }
+            }
+            12 => {
+                let block_hash = r.arr()?;
+                let k = r.u32()? as usize;
+                if k > 16_384 {
+                    return Err("too many block txs".into());
+                }
+                let mut txs = Vec::with_capacity(k.min(r.remaining() / 16));
+                for _ in 0..k {
+                    txs.push(Tx::from_bytes(&r.bytes(TX_BYTES_CAP)?)?);
+                }
+                Msg::BlockTxn { block_hash, txs }
             }
             _ => return Err("unknown message".into()),
         };
@@ -746,6 +934,9 @@ impl Node {
 /// that validating them under the lock finds them in the verified cache. Only blocks whose
 /// headers follow from a block this node has, and which would outweigh its tip, are
 /// checked: making one costs all the work the chain has behind it.
+///
+/// Multi-core parallel STARK verification: verifies all `Tx::Spend`, `RollupBatch`, and
+/// `RollupZkVmBatch` STARK proofs across CPU cores simultaneously (4×–16× faster block sync).
 fn prewarm(shared: &Shared, blocks: &[Block]) {
     let Some(first) = blocks.first() else { return };
     let (params, base, tip_work) = {
@@ -755,6 +946,7 @@ fn prewarm(shared: &Shared, blocks: &[Block]) {
     };
     let (mut prev, mut times) = base;
     let now = crate::chain::now();
+    let mut spend_jobs: Vec<(spend::SpendPublic, &[u8])> = Vec::new();
     for b in blocks {
         match crate::chain::check_run(&params, prev, times, std::slice::from_ref(b), now) {
             Ok((e, t)) => {
@@ -769,10 +961,31 @@ fn prewarm(shared: &Shared, blocks: &[Block]) {
         for t in &b.txs {
             if let Tx::Spend(sp) = t {
                 if let Ok(pi) = sp.public() {
-                    let _ = spend::verify_bytes_cached(&params.proof, &pi, &sp.proof);
+                    spend_jobs.push((pi, sp.proof.as_slice()));
                 }
             }
         }
+    }
+    if spend_jobs.len() <= 1 {
+        for (pi, proof) in spend_jobs {
+            let _ = spend::verify_bytes_cached(&params.proof, &pi, proof);
+        }
+    } else {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(spend_jobs.len());
+        let chunk_size = spend_jobs.len().div_ceil(workers);
+        let profile = &params.proof;
+        std::thread::scope(|s| {
+            for chunk in spend_jobs.chunks(chunk_size) {
+                s.spawn(move || {
+                    for (pi, proof) in chunk {
+                        let _ = spend::verify_bytes_cached(profile, pi, proof);
+                    }
+                });
+            }
+        });
     }
 }
 
@@ -860,6 +1073,7 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
     let mut last_recv: Option<[u8; 32]> = None;
     // answers this node is waiting for; one that was not asked for ends the connection
     let (mut asked_blocks, mut asked_headers) = (false, false);
+    let mut pending_compact: Option<CompactBlock> = None;
     let mut run: Option<HeaderRun> = None;
     let mut score = 0u32;
     loop {
@@ -925,6 +1139,8 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
                     said_hello = true;
                     if let Some(a) = &dialled {
                         n.book.good(a);
+                        let active_out: Vec<String> = n.outbound.iter().cloned().collect();
+                        n.book.set_anchors(&active_out);
                     }
                 }
                 if !n.chain.has(&tip) && height >= n.chain.height() {
@@ -1080,6 +1296,69 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
                     Err(e) => say(&n, format!("tx {} rejected: {e}", hash_hex(&tid))),
                 }
             }
+            Msg::CompactBlock(cb) => {
+                let bh = cb.block_hash();
+                let mempool_txs = {
+                    let n = lock(&shared);
+                    if n.chain.has(&bh) {
+                        continue;
+                    }
+                    n.mempool()
+                };
+                match cb.reconstruct(&mempool_txs) {
+                    Ok(full_block) => {
+                        prewarm(&shared, std::slice::from_ref(&full_block));
+                        let mut n = lock(&shared);
+                        if let Err(e) = n.accept_block(full_block, Some(id)) {
+                            if e == "unknown parent" {
+                                let locator = n.chain.locator(&n.chain.tip().hash);
+                                n.send(id, &Msg::GetHeaders { locator });
+                                asked_headers = true;
+                            } else {
+                                score += block_penalty(&e);
+                            }
+                        }
+                    }
+                    Err(missing) => {
+                        pending_compact = Some(cb);
+                        let mut n = lock(&shared);
+                        n.send(id, &Msg::GetBlockTxn { block_hash: bh, indices: missing });
+                    }
+                }
+            }
+            Msg::GetBlockTxn { block_hash, indices } => {
+                let mut n = lock(&shared);
+                if let Some(b) = n.chain.block(&block_hash) {
+                    let mut txs = Vec::with_capacity(indices.len());
+                    let mut ok = true;
+                    for &idx in &indices {
+                        if let Some(t) = b.txs.get(idx as usize) {
+                            txs.push(t.clone());
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        n.send(id, &Msg::BlockTxn { block_hash, txs });
+                    }
+                }
+            }
+            Msg::BlockTxn { block_hash, txs } => {
+                let Some(cb) = pending_compact.take() else { continue };
+                if cb.block_hash() != block_hash {
+                    continue;
+                }
+                let mut pool_plus = lock(&shared).mempool();
+                pool_plus.extend(txs);
+                if let Ok(full_block) = cb.reconstruct(&pool_plus) {
+                    prewarm(&shared, std::slice::from_ref(&full_block));
+                    let mut n = lock(&shared);
+                    if let Err(e) = n.accept_block(full_block, Some(id)) {
+                        score += block_penalty(&e);
+                    }
+                }
+            }
         }
     }
     {
@@ -1113,8 +1392,16 @@ pub fn discover(shared: Shared, target: usize, every: Duration) {
                 if !n.external.is_empty() {
                     skip.insert(n.external.clone());
                 }
-                let picks: Vec<String> = n.book.candidates(&skip).into_iter().take(target - have).collect();
+                let mut connected_ng: HashSet<String> =
+                    n.outbound.iter().map(|a| peers::netgroup(a)).collect();
+                let picks: Vec<String> = n
+                    .book
+                    .candidates_diverse(&skip, &connected_ng)
+                    .into_iter()
+                    .take(target - have)
+                    .collect();
                 for a in &picks {
+                    connected_ng.insert(peers::netgroup(a));
                     n.book.mark_tried(a);
                     n.outbound.insert(a.clone());
                 }

@@ -5,7 +5,7 @@ use newsatoshi::chain::{mine, Chain};
 use newsatoshi::job::{self, Action, Job, JobClaim, JobKey, JobPost, Phase, RowOpening};
 use newsatoshi::node::{self, lock, Msg, Node};
 use newsatoshi::note::MAX_NOTE_VALUE;
-use newsatoshi::params::{subsidy, Net, Params, COIN, DEFAULT_FEE, MAX_TX_BYTES};
+use newsatoshi::params::{subsidy, Net, Params, COIN, DEFAULT_FEE};
 use newsatoshi::spend::{self, SpendPublic, MAX_PROOF_BYTES};
 use newsatoshi::tx::{Block, PlainOut, Spend, Tx};
 use newsatoshi::wallet::Wallet;
@@ -160,10 +160,12 @@ fn f2_padded_and_oversized_transactions_are_refused_everywhere() {
     // one over the largest any network takes does not decode: no miner can produce a block
     // its peers cannot read
     let respond = |k: u32| Tx::Act(Action::Respond { job: [9; 32], rows: (0..k).map(|i| RowOpening { i, values: vec![1; 4096], path: vec![] }).collect() });
-    let huge = respond(16);
-    assert!(huge.to_bytes().len() > MAX_TX_BYTES);
-    assert!(respond(24).to_bytes().len() > newsatoshi::params::TX_BYTES_CAP);
-    assert!(Tx::from_bytes(&respond(24).to_bytes()).is_err());
+    let huge = respond(20);
+    assert!(huge.to_bytes().len() > n.chain.params.max_tx_bytes);
+    assert!(huge.to_bytes().len() <= newsatoshi::params::TX_BYTES_CAP);
+    let over_cap = respond(45);
+    assert!(over_cap.to_bytes().len() > newsatoshi::params::TX_BYTES_CAP);
+    assert!(Tx::from_bytes(&over_cap.to_bytes()).is_err());
     let err = n.chain.template(vec![], vec![huge.clone()], vec![]).unwrap_err();
     assert!(err.contains("exceeds"), "{err}");
     assert!(n.accept_tx(huge).is_err());

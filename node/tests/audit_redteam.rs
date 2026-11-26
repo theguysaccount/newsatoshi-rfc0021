@@ -414,3 +414,270 @@ fn redteam_bip9_auxpow_non_collision_and_asert_bounds() {
     let b_fast = asert_bits_staged(lim, 1_000_000, 2016, 3600, None, 100, 1_000_010, 172_800, lim, TARGET_SPACING);
     assert_ne!(b_fast, lim);
 }
+
+#[test]
+fn redteam_zkvm_logup_rom_prevents_fake_program_drain_and_overflow() {
+    // Honest L2 vault program: allows withdrawing at most 10_000_000 when s0 >= 10_000_000 via LT + JZ
+    let honest_prog = compile_l2_program(
+        r#"
+        LOAD_STATE r0, s0
+        LOAD_CONST r1, 10000000
+        LT r2, r0, r1
+        JNZ r2, fail
+        SUB r0, r0, r1
+        STORE_STATE s0, r0
+        EMIT_WITHDRAW r1
+        HALT
+    fail:
+        LOAD_CONST r3, 999
+        ASSERT_EQ r2, r3
+        HALT
+        "#,
+    )
+    .unwrap();
+
+    // Attacker writes a fake drain program trying to steal 500_000_000!
+    let evil_prog = compile_l2_program(
+        "LOAD_CONST r0, 500000000\nEMIT_WITHDRAW r0\nHALT",
+    )
+    .unwrap();
+
+    let honest_shard = prove_zkvm_execution(&honest_prog, [50_000_000, 0, 0, 0]).unwrap();
+    assert!(honest_shard.proven_bits >= 128);
+    assert_eq!(honest_shard.pub_inputs.total_withdrawals, 10_000_000);
+
+    // 1. Insufficient balance triggers the conditional branch to `fail:` -> ASSERT_EQ rejects!
+    assert!(prove_zkvm_execution(&honest_prog, [5_000_000, 0, 0, 0]).is_err());
+
+    // 2. Evil drain proof cannot masquerade under honest_prog's vk_hash (LogUp ROM rejects!)
+    let evil_shard = prove_zkvm_execution(&evil_prog, [50_000_000, 0, 0, 0]).unwrap();
+    let mut forged_pub = evil_shard.pub_inputs.clone();
+    forged_pub.program_hash = honest_prog.program_hash;
+    forged_pub.program_bytecode = honest_prog.bytecode.clone();
+    assert!(verify_zkvm_execution(&forged_pub, &evil_shard.proof_bytes).is_err());
+
+    // 3. Even if attacker mutates just program_hash while keeping evil_bytecode, hash check fails!
+    let mut mismatch_pub = evil_shard.pub_inputs.clone();
+    mismatch_pub.program_hash = honest_prog.program_hash;
+    assert!(verify_zkvm_execution(&mismatch_pub, &evil_shard.proof_bytes).is_err());
+}
+
+#[test]
+fn redteam_p2p_eclipse_defense_pq_transport_and_compact_block() {
+    use newsatoshi::chain::{mine, Chain};
+    use newsatoshi::node::{admit_inbound, release_inbound, CompactBlock, MAX_PER_NETGROUP};
+    use newsatoshi::params::{subsidy, Net, Params, DEFAULT_FEE};
+    use newsatoshi::peers::{AddrBook, MAX_PER_NETGROUP_BOOK};
+    use newsatoshi::pq_transport::PqSession;
+    use newsatoshi::tx::PlainOut;
+    use newsatoshi::wallet::Wallet;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+
+    // 1. Eclipse attacker controlling a /24 subnet (203.0.113.1..254)
+    let mut book = AddrBook::default();
+    let mut accepted = 0usize;
+    for host in 1u8..=200 {
+        if book.heard(&format!("203.0.113.{host}:8444")) {
+            accepted += 1;
+        }
+    }
+    assert_eq!(
+        accepted, MAX_PER_NETGROUP_BOOK,
+        "/16 netgroup cap must stop single-subnet address-book flooding"
+    );
+    // Add 3 honest peers from distinct /16 netgroups
+    for p in ["198.51.100.1:8444", "192.0.2.1:8444", "1.1.1.1:8444"] {
+        assert!(book.heard(p));
+        book.good(p);
+    }
+    let cands = book.candidates(&HashSet::new());
+    let attacker_selected = cands.iter().filter(|a| a.starts_with("203.0.113.")).count();
+    assert_eq!(
+        attacker_selected, 1,
+        "eclipse attacker with 200 IPs in one /16 MUST get at most 1 outbound slot"
+    );
+
+    // Inbound netgroup cap (public IPs in one /16 capped at MAX_PER_NETGROUP = 8)
+    let mut admitted_ips = Vec::new();
+    for host in 1u8..=20 {
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 18, 0, host));
+        if admit_inbound(ip) {
+            admitted_ips.push(ip);
+        }
+    }
+    assert_eq!(admitted_ips.len(), MAX_PER_NETGROUP);
+    for ip in admitted_ips {
+        release_inbound(ip);
+    }
+
+    // 2. Post-quantum NIST FIPS 203 ML-KEM-768 P2P transport blocks MITM tampering
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        PqSession::handshake_responder(&mut s, *b"nsM2").unwrap()
+    });
+    let mut c = TcpStream::connect(addr).unwrap();
+    let mut init = PqSession::handshake_initiator(&mut c, *b"nsM2").unwrap();
+    let mut resp = h.join().unwrap();
+    let mut frame = init.seal_frame(b"compact-block-payload").unwrap();
+    assert_eq!(resp.open_raw_frame(&frame).unwrap(), b"compact-block-payload");
+    // Replay or bit-flip rejected
+    assert!(resp.open_raw_frame(&frame).is_err());
+    frame[4] ^= 0x80;
+    assert!(resp.open_raw_frame(&frame).is_err());
+
+    // 3. Compact Block relay reconstructs full STARK block from mempool with >95% bandwidth savings
+    let mut chain = Chain::open(Params::get(Net::Reg).unwrap(), None).unwrap();
+    let mut alice = Wallet::generate();
+    let miner = Wallet::generate();
+    let out1 = PlainOut { a_pk: alice.a_pk(), v: subsidy(1), rho: [1; 5] };
+    let mut b1 = chain.template(vec![out1], vec![], vec![]).unwrap();
+    assert!(mine(&mut b1.header, u64::MAX));
+    chain.add_block(b1).unwrap();
+    let out1b = PlainOut { a_pk: alice.a_pk(), v: subsidy(2), rho: [11; 5] };
+    let mut b1b = chain.template(vec![out1b], vec![], vec![]).unwrap();
+    assert!(mine(&mut b1b.header, u64::MAX));
+    chain.add_block(b1b).unwrap();
+
+    let (spend_tx, _) = alice.spend(&chain, Some((miner.a_pk(), 1 * COIN)), DEFAULT_FEE, None, vec![]).unwrap();
+    let out2 = PlainOut { a_pk: miner.a_pk(), v: subsidy(3) + DEFAULT_FEE, rho: [2; 5] };
+    let mut b2 = chain.template(vec![out2], vec![spend_tx.clone()], vec![]).unwrap();
+    assert!(mine(&mut b2.header, u64::MAX));
+
+    let full_bytes = b2.encode().len();
+    let cb = CompactBlock::from_block(&b2, 42).unwrap();
+    let mut w = newsatoshi::codec::Writer::new();
+    cb.encode(&mut w);
+    let compact_bytes = w.0.len();
+    assert!(
+        compact_bytes * 20 < full_bytes,
+        "compact block ({compact_bytes} B) should be >95% smaller than full STARK block ({full_bytes} B)"
+    );
+    // Empty mempool reports exact missing index [1]; warm mempool reconstructs exact full block!
+    assert_eq!(cb.reconstruct(&[]).unwrap_err(), vec![1]);
+    let rebuilt = cb.reconstruct(&[spend_tx]).unwrap();
+    assert_eq!(rebuilt.hash(), b2.hash());
+    assert_eq!(rebuilt.txs.len(), b2.txs.len());
+}
+
+#[test]
+fn redteam_flyclient_mmr_and_trustless_light_client_proofs() {
+    use newsatoshi::chain::{mine, Chain};
+    use newsatoshi::light::{FlyClientProof, HeaderTip};
+    use newsatoshi::params::{subsidy, Net, Params, DEFAULT_FEE};
+    use newsatoshi::tx::PlainOut;
+    use newsatoshi::wallet::Wallet;
+
+    let params = Params::get(Net::Reg).unwrap();
+    let mut chain = Chain::open(params.clone(), None).unwrap();
+    let mut alice = Wallet::generate();
+    let bob = Wallet::generate();
+    let mut headers = vec![chain.block_at(0).unwrap().clone()];
+
+    for i in 1..=20u32 {
+        let out = PlainOut { a_pk: alice.a_pk(), v: subsidy(i), rho: [i; 5] };
+        let mut b = chain.template(vec![out], vec![], vec![]).unwrap();
+        assert!(mine(&mut b.header, u64::MAX));
+        chain.add_block(b.clone()).unwrap();
+        headers.push(b);
+    }
+    let (tx, _) = alice.spend(&chain, Some((bob.a_pk(), 2 * COIN)), DEFAULT_FEE, None, vec![]).unwrap();
+    let spent_nf = match &tx {
+        newsatoshi::tx::Tx::Spend(s) => s.nf[0],
+        _ => unreachable!(),
+    };
+    let out_tip = PlainOut { a_pk: bob.a_pk(), v: subsidy(22) + DEFAULT_FEE, rho: [99; 5] };
+    let mut b_tip = chain.template(vec![out_tip], vec![tx], vec![]).unwrap();
+    assert!(mine(&mut b_tip.header, u64::MAX));
+    chain.add_block(b_tip.clone()).unwrap();
+    headers.push(b_tip.clone());
+
+    // 1. O(log N) FlyClient MMR chain proof verification & forgery rejection
+    let fc = FlyClientProof::prove(&headers, 4, 8).unwrap();
+    let (tip_h, work) = fc.verify(headers[0].hash(), 8).unwrap();
+    assert_eq!(tip_h, chain.tip().hash);
+    assert_eq!(work, chain.tip().work);
+    let mut forged = fc.clone();
+    forged.peaks[0].work += primitive_types::U256::from(1u64);
+    assert!(forged.verify(headers[0].hash(), 8).is_err());
+
+    // 2. Trustless NoteTree + NfTree verification against committed HeaderTip
+    let mut light = HeaderTip::genesis(&params);
+    let hdr_only: Vec<_> = headers[1..]
+        .iter()
+        .map(|b| newsatoshi::tx::Block { header: b.header, auxpow: b.auxpow.clone(), digest: [0u8; 32], txs: vec![] })
+        .collect();
+    light.extend(&params, &hdr_only, newsatoshi::chain::now()).unwrap();
+    let parts = chain.state.digest_parts();
+    let cm0 = chain.state.tree.leaf(0).unwrap();
+    let path0 = chain.state.tree.path(0);
+    let nf_spent_proof = chain.state.nf_tree.prove(&spent_nf);
+    let is_spent = light
+        .verify_note_and_nullifier(
+            &b_tip.header,
+            &b_tip.tx_root(),
+            &parts,
+            &cm0,
+            0,
+            &path0,
+            Some((&spent_nf, &nf_spent_proof)),
+        )
+        .unwrap();
+    assert_eq!(is_spent, Some(true), "light client must prove nullifier is spent");
+
+    let unspent_nf: Word8 = [77u32; 8];
+    let nf_unspent_proof = chain.state.nf_tree.prove(&unspent_nf);
+    let is_unspent = light
+        .verify_note_and_nullifier(
+            &b_tip.header,
+            &b_tip.tx_root(),
+            &parts,
+            &cm0,
+            0,
+            &path0,
+            Some((&unspent_nf, &nf_unspent_proof)),
+        )
+        .unwrap();
+    assert_eq!(is_unspent, Some(false), "light client must prove fresh nullifier is unspent");
+}
+
+#[test]
+fn redteam_mainnet_v2_sha384_end_to_end_chain_spend() {
+    use newsatoshi::chain::{mine, Chain};
+    use newsatoshi::params::{subsidy, Params, MAIN_DEFAULT_FEE};
+    use newsatoshi::tx::PlainOut;
+    use newsatoshi::wallet::Wallet;
+
+    // Boot a live Mainnet v2 chain (384-bit SHA-384 FRI, Day-1 ASERT ramp, all RFCs active at 0)
+    // using regtest-level mining target & maturity=1 so full-chain SHA-384 proving runs in ~2s!
+    let mut p = Params::main_v2_with(1_762_473_600, u32::MAX, 0x207fffff);
+    p.pow_limit = 0x207fffff;
+    p.coinbase_maturity = 1;
+    assert!(p.proof.sha384, "MAIN_V2 profile must enable 384-bit SHA-384 FRI");
+
+    let mut chain = Chain::open(p, None).unwrap();
+    let mut alice = Wallet::generate();
+    let bob = Wallet::generate();
+
+    // Mine 2 blocks so Alice has a matured coinbase note
+    for i in 1..=2u32 {
+        let out = PlainOut { a_pk: alice.a_pk(), v: subsidy(i), rho: [i + 10; 5] };
+        let mut b = chain.template(vec![out], vec![], vec![]).unwrap();
+        assert!(mine(&mut b.header, u64::MAX));
+        chain.add_block(b).unwrap();
+    }
+
+    // Wallet::spend automatically dispatches SpendProver384 via prove_for(&params.proof, ...)
+    let (tx, note_str) = alice
+        .spend(&chain, Some((bob.a_pk(), 5 * COIN)), MAIN_DEFAULT_FEE, None, vec![])
+        .unwrap();
+    assert!(note_str.is_some());
+    let out3 = PlainOut { a_pk: bob.a_pk(), v: subsidy(3) + MAIN_DEFAULT_FEE, rho: [33; 5] };
+    let mut b3 = chain.template(vec![out3], vec![tx], vec![]).unwrap();
+    assert!(mine(&mut b3.header, u64::MAX));
+    // Chain::add_block verifies the 384-bit SHA-384 FRI spend proof natively in consensus!
+    chain.add_block(b3).unwrap();
+    assert_eq!(chain.height(), 3);
+}

@@ -27,6 +27,7 @@ pub mod params;
 pub mod peers;
 mod params_genesis;
 pub mod pow;
+pub mod pq_transport;
 pub mod rollup;
 pub mod rpc;
 pub mod script;
