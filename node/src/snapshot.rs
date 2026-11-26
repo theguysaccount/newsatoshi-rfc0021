@@ -12,6 +12,7 @@
 //! 4. On any missing file, corruption, or digest mismatch, `Chain::open` transparently falls back
 //!    to replaying `blocks.dat` from genesis.
 
+use crate::bond::TrustBond;
 use crate::chain::Entry;
 use crate::channel::{Channel, ChannelEnd};
 use crate::codec::{Reader, Res, Writer};
@@ -22,6 +23,7 @@ use crate::lock::{Lock, LockEnd};
 use crate::merkmap::MerkleMap;
 use crate::nftree::NfTree;
 use crate::note::NoteTree;
+use crate::rollup::RollupVault;
 use crate::state::State;
 use crate::tx::PlainOut;
 use primitive_types::U256;
@@ -32,7 +34,7 @@ use std::path::Path;
 
 pub const SNAPSHOT_FILE: &str = "state.snap";
 pub const SNAPSHOT_INTERVAL: u32 = 50;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP01";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP02";
 const MAX_SNAPSHOT_ITEMS: usize = 10_000_000;
 
 /// Metadata for one active block (heights `1..=tip`) stored inside `blocks.dat`.
@@ -203,6 +205,18 @@ fn encode_state(st: &State, w: &mut Writer) {
             w.raw(id);
         }
     }
+
+    // RFC-0024 Universal Trust Bonds (bonds_merkle is canonical & rebuilt on load)
+    w.u32(st.bonds.len() as u32);
+    for b in st.bonds.values() {
+        b.encode(w);
+    }
+
+    // RFC-0023 Sovereign L2 Rollup Vaults (rollups_merkle is canonical & rebuilt on load)
+    w.u32(st.rollups.len() as u32);
+    for rv in st.rollups.values() {
+        rv.encode(w);
+    }
 }
 
 fn decode_state(r: &mut Reader) -> Res<State> {
@@ -372,6 +386,26 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         channels_by_tip.insert(tip, ids);
     }
 
+    // RFC-0024 Universal Trust Bonds + canonical MerkleMap
+    let n_bonds = read_count(r)?;
+    let mut bonds = imbl::OrdMap::new();
+    let mut bonds_merkle = MerkleMap::new();
+    for _ in 0..n_bonds {
+        let b = TrustBond::decode(r)?;
+        bonds_merkle.insert(b.id, b.value_hash());
+        bonds.insert(b.id, b);
+    }
+
+    // RFC-0023 Sovereign L2 Rollup Vaults + canonical MerkleMap
+    let n_rollups = read_count(r)?;
+    let mut rollups = imbl::OrdMap::new();
+    let mut rollups_merkle = MerkleMap::new();
+    for _ in 0..n_rollups {
+        let rv = RollupVault::decode(r)?;
+        rollups_merkle.insert(rv.id, rv.value_hash());
+        rollups.insert(rv.id, rv);
+    }
+
     Ok(State {
         height,
         tree,
@@ -396,6 +430,10 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         channels_merkle,
         channel_ends,
         channels_by_tip,
+        bonds,
+        bonds_merkle,
+        rollups,
+        rollups_merkle,
     })
 }
 

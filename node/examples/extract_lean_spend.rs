@@ -687,12 +687,63 @@ theorem genesis_solvency :
     SolvencyInvariant (LedgerState.mk 0 0 0 0) := by
   rfl
 
+/-- Theorem 7 (RFC-0024 Universal Trust Bond Exact Slashing & Conservation):
+    For any slash `1 ≤ slash_amount ≤ stake`, `miner_fee ≤ slash_amount`, and
+    `slash_burn_bps ≤ 10000`, victim payout + burned penalty + miner fee equals
+    `slash_amount` identically with zero inflation or underflow, preserving
+    `pool + locked + burned = issued`. -/
+theorem rfc0024_trust_bond_slash_conservation
+    (stake slash_amount miner_fee slash_burn_bps : Nat)
+    (h_stake : slash_amount ≤ stake)
+    (h_fee : miner_fee ≤ slash_amount)
+    (h_bps : slash_burn_bps ≤ 10000) :
+    let net := slash_amount - miner_fee
+    let burn_amount := (net * slash_burn_bps) / 10000
+    let victim_payout := net - burn_amount
+    burn_amount ≤ net ∧
+    victim_payout + burn_amount + miner_fee = slash_amount ∧
+    (stake - slash_amount) + victim_payout + burn_amount + miner_fee = stake := by
+  intro net burn_amount victim_payout
+  have hmul : net * slash_burn_bps ≤ net * 10000 := Nat.mul_le_mul_left net h_bps
+  have hble : burn_amount ≤ net := by
+    have hdiv := Nat.div_le_div_right (c := 10000) hmul
+    have hsimp : (net * 10000) / 10000 = net := Nat.mul_div_cancel net (by decide)
+    omega
+  exact ⟨hble, by omega, by omega⟩
+
+/-- Theorem 8 (RFC-0023 Sovereign L2 Rollup Vault Exact Bridge Solvency):
+    Across arbitrary L1 → L2 deposits, STARK-verified batch settlements
+    (`prev_tvl = new_tvl + batch_withdrawals + batch_fee`), and L2 → L1 Merkle-proven
+    withdrawals (`amount ≤ pending_withdrawals`), total vault locked capital +
+    claimed payouts + accumulated miner fees equals total deposited liquidity identically. -/
+theorem rfc0023_rollup_vault_solvency
+    (s : LedgerState)
+    (initial_tvl deposit_amt batch_withdrawals batch_fee withdraw_amt withdraw_fee : Int)
+    (claimed_coinbase : Int)
+    (h_inv : SolvencyInvariant s)
+    (h_batch_le : batch_withdrawals + batch_fee ≤ initial_tvl + deposit_amt)
+    (h_wdr_le : withdraw_amt ≤ batch_withdrawals)
+    (h_wfee_le : withdraw_fee ≤ withdraw_amt) :
+    let total_in := initial_tvl + deposit_amt
+    let tvl_after := total_in - batch_withdrawals - batch_fee
+    let pending_after := batch_withdrawals - withdraw_amt
+    let user_payout := withdraw_amt - withdraw_fee
+    let total_fees := batch_fee + withdraw_fee
+    0 ≤ tvl_after ∧ 0 ≤ pending_after ∧ 0 ≤ user_payout ∧
+    tvl_after + pending_after + user_payout + total_fees = total_in ∧
+    SolvencyInvariant (applyBlockState s total_in 0 0 total_in user_payout 0 total_fees claimed_coinbase) := by
+  intro total_in tvl_after pending_after user_payout total_fees
+  exact ⟨by omega, by omega, by omega, by omega,
+    block_solvency_preserved s total_in 0 0 total_in user_payout 0 total_fees claimed_coinbase h_inv (by omega)⟩
+
 #print axioms extracted_constraint_247_exact
 #print axioms extracted_constraint_248_exact
 #print axioms note_value_strictly_below_2_pow_60
 #print axioms spend_balance_exact_integer_conservation
 #print axioms rfc0022_channel_exact_conservation
 #print axioms block_solvency_preserved
+#print axioms rfc0024_trust_bond_slash_conservation
+#print axioms rfc0023_rollup_vault_solvency
 
 end NewsatoshiSpendBalance
 "#,

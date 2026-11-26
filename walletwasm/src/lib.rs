@@ -119,6 +119,15 @@ pub extern "C" fn delivery_address(p: *const u8, n: usize) -> i32 {
     })())
 }
 
+/// Export a read-only selective-audit viewing key (`nsvk1…`) with zero spend capability.
+#[no_mangle]
+pub extern "C" fn viewing_key(p: *const u8, n: usize) -> i32 {
+    done((|| {
+        let sk = w8(std::str::from_utf8(bytes(p, n)).map_err(|_| "not text")?)?;
+        Ok(newsatoshi::deliver::viewing_key(&sk))
+    })())
+}
+
 /// Envelopes from `GET /api/envelopes`, tried with a key: `{"sk", "items": [{"cm", "env"}]}`
 /// gives the notes among them delivered to it, `[{"cm", "value", "rho", "note"}]`.
 #[no_mangle]
@@ -220,6 +229,14 @@ pub extern "C" fn light_root(p: *const u8, n: usize) -> i32 {
                 Some(J::Str(s)) => Some(hex32(s)?),
                 _ => None,
             },
+            bonds: match p.get("bonds") {
+                Some(J::Str(s)) => Some(hex32(s)?),
+                _ => None,
+            },
+            rollups: match p.get("rollups") {
+                Some(J::Str(s)) => Some(hex32(s)?),
+                _ => None,
+            },
         };
         let root = lc.committed_root(&newsatoshi::tx::Header::from_bytes(&hb), &tx_root, &parts)?;
         let mut out = vec![("root".into(), J::str(hex::encode(words_to_bytes(&root)))), ("height".into(), J::num(parts.height))];
@@ -228,6 +245,12 @@ pub extern "C" fn light_root(p: *const u8, n: usize) -> i32 {
         }
         if let Some(r) = parts.channels {
             out.push(("channels".into(), J::str(hex::encode(r))));
+        }
+        if let Some(r) = parts.bonds {
+            out.push(("bonds".into(), J::str(hex::encode(r))));
+        }
+        if let Some(r) = parts.rollups {
+            out.push(("rollups".into(), J::str(hex::encode(r))));
         }
         Ok(J::Obj(out).to_json())
     })())

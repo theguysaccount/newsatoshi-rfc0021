@@ -1,5 +1,6 @@
 //! Ledger state and the block validity rules.
 
+use crate::bond::{self, TrustBond};
 use crate::channel::{self, Channel, ChannelEnd, MAX_BLOCK_CHANNEL_HASHES};
 use crate::codec::Writer;
 use crate::hash::{sha256, Word8};
@@ -10,6 +11,7 @@ use crate::merkmap::MerkleMap;
 use crate::nftree::NfTree;
 use crate::note::{self, NoteTree, MAX_NOTE_VALUE};
 use crate::params::{subsidy, Params, MAX_COINBASE_EXTRA, MAX_MEMO};
+use crate::rollup::{self, RollupVault};
 use crate::spend;
 use crate::tx::{header_commit, Block, Coinbase, PlainOut, Tx};
 use std::collections::{BTreeMap, VecDeque};
@@ -61,6 +63,12 @@ pub struct State {
     pub channels_merkle: MerkleMap,
     pub channel_ends: HashMap<[u8; 32], ChannelEnd>,
     pub channels_by_tip: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    /// RFC-0024: Persistent Universal Trust Bonds (`crate::bond`) + canonical Merkle map.
+    pub bonds: imbl::OrdMap<[u8; 32], TrustBond>,
+    pub bonds_merkle: MerkleMap,
+    /// RFC-0023: Sovereign L2 Rollup Vaults (`crate::rollup`) + canonical Merkle map.
+    pub rollups: imbl::OrdMap<[u8; 32], RollupVault>,
+    pub rollups_merkle: MerkleMap,
 }
 
 #[derive(Clone, Copy)]
@@ -108,6 +116,10 @@ impl State {
             channels_merkle: MerkleMap::new(),
             channel_ends: HashMap::new(),
             channels_by_tip: HashMap::new(),
+            bonds: imbl::OrdMap::new(),
+            bonds_merkle: MerkleMap::new(),
+            rollups: imbl::OrdMap::new(),
+            rollups_merkle: MerkleMap::new(),
         }
     }
 
@@ -156,6 +168,10 @@ impl State {
         });
         // RFC-0022 PayWord channels: O(1) incremental Merkle root while any are open
         let channels = (!self.channels.is_empty()).then(|| self.channels_merkle.root());
+        // RFC-0024 Universal Trust Bonds: O(1) incremental Merkle root while any exist
+        let bonds = (!self.bonds.is_empty()).then(|| self.bonds_merkle.root());
+        // RFC-0023 Sovereign L2 Rollup Vaults: O(1) incremental Merkle root while any exist
+        let rollups = (!self.rollups.is_empty()).then(|| self.rollups_merkle.root());
         DigestParts {
             height: self.height,
             tree_root: self.tree.root(),
@@ -169,6 +185,8 @@ impl State {
             conds,
             nf_root: self.nf_committed.then(|| crate::hash::words_to_bytes(&self.nf_tree.root())),
             channels,
+            bonds,
+            rollups,
         }
     }
 
@@ -276,6 +294,10 @@ impl State {
                     | Some(Deposit::Cond(_))
                     | Some(Deposit::Channel(_))
                     | Some(Deposit::ChannelBatch(_))
+                    | Some(Deposit::Bond(_))
+                    | Some(Deposit::BondTopUp { .. })
+                    | Some(Deposit::RollupRegister(_))
+                    | Some(Deposit::RollupDeposit { .. })
                     | None => None,
                 };
                 let cond_after = match &sp.deposit {
@@ -334,6 +356,76 @@ impl State {
                     }
                     _ => vec![],
                 };
+                let bond_after = match &sp.deposit {
+                    Some(Deposit::Bond(p)) => {
+                        if !params.rfc0024_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                        }
+                        bond::check_post(p)?;
+                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
+                        let id = bond::bond_id(p, &first_nf);
+                        if self.bonds.contains_key(&id) {
+                            return Err("duplicate trust bond".into());
+                        }
+                        Some(TrustBond {
+                            id,
+                            post: p.clone(),
+                            created_at: h,
+                            settled_count: 0,
+                            settled_volume: 0,
+                            slash_count: 0,
+                            slashed_total: 0,
+                            unbond_requested_at: None,
+                            unbond_amount: 0,
+                            action_nonce: 0,
+                        })
+                    }
+                    Some(Deposit::BondTopUp { bond: id, amount }) => {
+                        if !params.rfc0024_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                        }
+                        let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
+                        bond::apply_topup(&mut b, *amount)?;
+                        Some(b)
+                    }
+                    _ => None,
+                };
+                let rollup_after = match &sp.deposit {
+                    Some(Deposit::RollupRegister(p)) => {
+                        if !params.rfc0023_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
+                        }
+                        rollup::check_post(p)?;
+                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
+                        let id = rollup::rollup_id(p, &first_nf);
+                        if self.rollups.contains_key(&id) {
+                            return Err("duplicate rollup vault".into());
+                        }
+                        Some(RollupVault {
+                            id,
+                            post: p.clone(),
+                            created_at: h,
+                            state_root: p.genesis_root,
+                            deposit_acc: [0u8; 32],
+                            deposit_count: 0,
+                            batch_seq: 0,
+                            total_l2_txs: 0,
+                            tvl: p.initial_tvl,
+                            pending_withdrawals: 0,
+                            withdraw_roots: vec![],
+                            claimed_withdrawals: vec![],
+                        })
+                    }
+                    Some(Deposit::RollupDeposit { rollup: id, l2_recipient, amount }) => {
+                        if !params.rfc0023_from.is_some_and(|f| h >= f) {
+                            return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
+                        }
+                        let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
+                        rollup::apply_deposit(&mut rv, l2_recipient, *amount)?;
+                        Some(rv)
+                    }
+                    _ => None,
+                };
                 if checks.verify_proofs {
                     spend::verify_bytes_cached(&params.proof, &pi, &sp.proof).map_err(|e| format!("proof rejected: {e}"))?;
                 }
@@ -361,6 +453,14 @@ impl State {
                     self.channels_by_tip.entry(ch.post.tip).or_default().push(ch.id);
                     self.channels_merkle.insert(ch.id, ch.value_hash());
                     self.channels.insert(ch.id, ch);
+                }
+                if let Some(b) = bond_after {
+                    self.bonds_merkle.insert(b.id, b.value_hash());
+                    self.bonds.insert(b.id, b);
+                }
+                if let Some(rv) = rollup_after {
+                    self.rollups_merkle.insert(rv.id, rv.value_hash());
+                    self.rollups.insert(rv.id, rv);
                 }
                 let dep_amt = match &sp.deposit {
                     Some(d) => d.checked_amount()? as u128,
@@ -444,6 +544,168 @@ impl State {
                     },
                 );
                 Ok(res.miner_fee)
+            }
+            Tx::Act(Action::BondAttest {
+                bond: id,
+                receipt_hash,
+                settled_amount,
+                fee,
+                owner_sig,
+                counterparty_vk,
+                counterparty_sig,
+            }) => {
+                if !params.rfc0024_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                }
+                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
+                let eff = bond::attest(
+                    &mut b,
+                    receipt_hash,
+                    *settled_amount,
+                    *fee,
+                    owner_sig,
+                    counterparty_vk,
+                    counterparty_sig,
+                )?;
+                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
+                self.bonds_merkle.insert(b.id, b.value_hash());
+                self.bonds.insert(b.id, b);
+                Ok(eff.miner_fee)
+            }
+            Tx::Act(Action::BondSlashEquivocation {
+                bond: id,
+                context_nonce,
+                payload_a,
+                sig_a,
+                payload_b,
+                sig_b,
+                victim_addr,
+                slash_amount,
+                miner_fee,
+            }) => {
+                if !params.rfc0024_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                }
+                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
+                let eff = bond::slash_equivocation(
+                    &mut b,
+                    *context_nonce,
+                    payload_a,
+                    sig_a,
+                    payload_b,
+                    sig_b,
+                    *victim_addr,
+                    *slash_amount,
+                    *miner_fee,
+                )?;
+                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
+                self.bonds_merkle.insert(b.id, b.value_hash());
+                self.bonds.insert(b.id, b);
+                Ok(eff.miner_fee)
+            }
+            Tx::Act(Action::BondSlashQuorum {
+                bond: id,
+                dispute_hash,
+                victim_addr,
+                slash_amount,
+                miner_fee,
+                sigs,
+            }) => {
+                if !params.rfc0024_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                }
+                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
+                let eff = bond::slash_quorum(
+                    &mut b,
+                    dispute_hash,
+                    *victim_addr,
+                    *slash_amount,
+                    *miner_fee,
+                    sigs,
+                )?;
+                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
+                self.bonds_merkle.insert(b.id, b.value_hash());
+                self.bonds.insert(b.id, b);
+                Ok(eff.miner_fee)
+            }
+            Tx::Act(Action::BondUnbondRequest { bond: id, amount, sig }) => {
+                if !params.rfc0024_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                }
+                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
+                bond::request_unbond(&mut b, *amount, sig, h)?;
+                self.bonds_merkle.insert(b.id, b.value_hash());
+                self.bonds.insert(b.id, b);
+                Ok(0)
+            }
+            Tx::Act(Action::BondUnbondComplete { bond: id, miner_fee }) => {
+                if !params.rfc0024_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0024 Trust Bonds are not active at this height".into());
+                }
+                let mut b = self.bonds.get(id).ok_or("unknown trust bond")?.clone();
+                let eff = bond::complete_unbond(&mut b, *miner_fee, h)?;
+                self.pay_out_with_fee(&eff.payouts, eff.burned, eff.miner_fee)?;
+                self.bonds_merkle.insert(b.id, b.value_hash());
+                self.bonds.insert(b.id, b);
+                Ok(eff.miner_fee)
+            }
+            Tx::Act(Action::RollupBatch {
+                rollup: id,
+                new_state_root,
+                withdraw_root,
+                batch_tx_count,
+                batch_withdrawals,
+                batch_fee,
+                sequencer_sig,
+                proof,
+            }) => {
+                if !params.rfc0023_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
+                }
+                let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
+                let fee = rollup::apply_batch(
+                    &mut rv,
+                    *new_state_root,
+                    *withdraw_root,
+                    *batch_tx_count,
+                    *batch_withdrawals,
+                    *batch_fee,
+                    sequencer_sig,
+                    proof,
+                    checks.verify_proofs,
+                )?;
+                self.pay_out_with_fee(&[], 0, fee)?;
+                self.rollups_merkle.insert(rv.id, rv.value_hash());
+                self.rollups.insert(rv.id, rv);
+                Ok(fee)
+            }
+            Tx::Act(Action::RollupWithdraw {
+                rollup: id,
+                batch_seq,
+                withdrawal_id,
+                recipient_addr,
+                amount,
+                miner_fee,
+                proof,
+            }) => {
+                if !params.rfc0023_from.is_some_and(|f| h >= f) {
+                    return Err("RFC-0023 Sovereign L2 Rollups are not active at this height".into());
+                }
+                let mut rv = self.rollups.get(id).ok_or("unknown rollup vault")?.clone();
+                let (payout, fee) = rollup::apply_withdraw(
+                    &mut rv,
+                    *batch_seq,
+                    withdrawal_id,
+                    *recipient_addr,
+                    *amount,
+                    *miner_fee,
+                    proof,
+                )?;
+                let payouts = if payout.v > 0 { vec![payout] } else { vec![] };
+                self.pay_out_with_fee(&payouts, 0, fee)?;
+                self.rollups_merkle.insert(rv.id, rv.value_hash());
+                self.rollups.insert(rv.id, rv);
+                Ok(fee)
             }
             Tx::Act(a) => {
                 let mut j = self.jobs.get(a.job()).ok_or("unknown job")?.clone();
@@ -554,6 +816,10 @@ pub struct DigestParts {
     pub nf_root: Option<[u8; 32]>,
     /// RFC-0022: Open PayWord channels digest (present only while any channels are open).
     pub channels: Option<[u8; 32]>,
+    /// RFC-0024: Universal Trust Bonds Merkle root (present only while any bonds exist).
+    pub bonds: Option<[u8; 32]>,
+    /// RFC-0023: Sovereign L2 Rollup Vaults Merkle root (present only while any rollups exist).
+    pub rollups: Option<[u8; 32]>,
 }
 
 impl DigestParts {
@@ -574,6 +840,12 @@ impl DigestParts {
         }
         if let Some(ch) = &self.channels {
             w.raw(b"P").raw(ch);
+        }
+        if let Some(b) = &self.bonds {
+            w.raw(b"B").raw(b);
+        }
+        if let Some(r) = &self.rollups {
+            w.raw(b"R").raw(r);
         }
         sha256(&w.0)
     }

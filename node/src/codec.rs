@@ -13,6 +13,10 @@ impl Writer {
         self.0.push(v);
         self
     }
+    pub fn u16(&mut self, v: u16) -> &mut Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
     pub fn u32(&mut self, v: u32) -> &mut Self {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
@@ -97,6 +101,9 @@ impl<'a> Reader<'a> {
     }
     pub fn u8(&mut self) -> Res<u8> {
         Ok(self.raw(1)?[0])
+    }
+    pub fn u16(&mut self) -> Res<u16> {
+        Ok(u16::from_le_bytes(self.arr()?))
     }
     pub fn bool(&mut self) -> Res<bool> {
         match self.u8()? {

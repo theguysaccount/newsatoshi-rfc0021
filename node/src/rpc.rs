@@ -919,6 +919,163 @@ pub fn channels_for_tip(shared: &Shared, tip_hash: &[u8; 32]) -> J {
     ])
 }
 
+fn merkle_proof_json(mp: &crate::merkmap::MerkleProof, root: [u8; 32]) -> J {
+    J::Obj(vec![
+        ("root".into(), J::str(hex::encode(root))),
+        ("key".into(), J::str(hex::encode(mp.key))),
+        ("value_hash".into(), J::str(hex::encode(mp.value_hash))),
+        ("siblings".into(), J::Arr(mp.siblings.iter().map(|s| J::str(hex::encode(s))).collect())),
+    ])
+}
+
+/// One RFC-0024 Universal Trust Bond, by bond id, with its canonical Merkle inclusion proof.
+pub fn bond_info(shared: &Shared, id: &[u8; 32]) -> J {
+    let n = lock(shared);
+    let tip = n.chain.height();
+    let st = &n.chain.state;
+    let pool = n.pool_state();
+    let (b, confirmed, mp) = if let Some(b) = st.bonds.get(id) {
+        let proof = st.bonds_merkle.prove(id).map(|p| (p, st.bonds_merkle.root()));
+        (Some(b), true, proof)
+    } else if let Some(b) = pool.bonds.get(id) {
+        (Some(b), false, None)
+    } else {
+        (None, false, None)
+    };
+    let Some(b) = b else {
+        return J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))]);
+    };
+    let mut kv = vec![
+        ("found".into(), J::Bool(true)),
+        ("height".into(), J::num(tip)),
+        ("confirmed".into(), J::Bool(confirmed)),
+        ("id".into(), J::str(hex::encode(b.id))),
+        ("owner_vk".into(), J::str(hex::encode(b.post.owner_vk))),
+        ("owner_address".into(), J::str(encode_address(&b.post.owner_addr))),
+        ("arbiter_vks".into(), J::Arr(b.post.arbiter_vks.iter().map(|v| J::str(hex::encode(v))).collect())),
+        ("quorum_m".into(), J::num(b.post.quorum_m as u64)),
+        ("unbond_delay".into(), J::num(b.post.unbond_delay as u64)),
+        ("slash_burn_bps".into(), J::num(b.post.slash_burn_bps as u64)),
+        ("stake".into(), J::num(b.post.stake)),
+        ("service_tag".into(), J::str(hex::encode(b.post.service_tag))),
+        ("created_at".into(), J::num(b.created_at as u64)),
+        ("settled_count".into(), J::num(b.settled_count)),
+        ("settled_volume".into(), J::str(b.settled_volume.to_string())),
+        ("slash_count".into(), J::num(b.slash_count as u64)),
+        ("slashed_total".into(), J::str(b.slashed_total.to_string())),
+        ("unbond_amount".into(), J::num(b.unbond_amount)),
+        ("action_nonce".into(), J::num(b.action_nonce)),
+    ];
+    if let Some(h) = b.unbond_requested_at {
+        kv.push(("unbond_requested_at".into(), J::num(h as u64)));
+    }
+    if let Some((p, root)) = mp {
+        kv.push(("merkle_proof".into(), merkle_proof_json(&p, root)));
+    }
+    J::Obj(kv)
+}
+
+/// One RFC-0023 Sovereign L2 Rollup Vault, by rollup id, with canonical Merkle inclusion proof.
+pub fn rollup_info(shared: &Shared, id: &[u8; 32]) -> J {
+    let n = lock(shared);
+    let tip = n.chain.height();
+    let st = &n.chain.state;
+    let pool = n.pool_state();
+    let (rv, confirmed, mp) = if let Some(rv) = st.rollups.get(id) {
+        let proof = st.rollups_merkle.prove(id).map(|p| (p, st.rollups_merkle.root()));
+        (Some(rv), true, proof)
+    } else if let Some(rv) = pool.rollups.get(id) {
+        (Some(rv), false, None)
+    } else {
+        (None, false, None)
+    };
+    let Some(rv) = rv else {
+        return J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))]);
+    };
+    let mut kv = vec![
+        ("found".into(), J::Bool(true)),
+        ("height".into(), J::num(tip)),
+        ("confirmed".into(), J::Bool(confirmed)),
+        ("id".into(), J::str(hex::encode(rv.id))),
+        ("vk_hash".into(), J::str(hex::encode(rv.post.vk_hash))),
+        ("genesis_root".into(), J::str(hex::encode(rv.post.genesis_root))),
+        ("state_root".into(), J::str(hex::encode(rv.state_root))),
+        ("deposit_acc".into(), J::str(hex::encode(rv.deposit_acc))),
+        ("deposit_count".into(), J::num(rv.deposit_count)),
+        ("batch_seq".into(), J::num(rv.batch_seq)),
+        ("total_l2_txs".into(), J::num(rv.total_l2_txs)),
+        ("tvl".into(), J::num(rv.tvl)),
+        ("pending_withdrawals".into(), J::num(rv.pending_withdrawals)),
+        ("name_tag".into(), J::str(hex::encode(rv.post.name_tag))),
+        ("created_at".into(), J::num(rv.created_at as u64)),
+        (
+            "withdraw_roots".into(),
+            J::Arr(
+                rv.withdraw_roots
+                    .iter()
+                    .map(|(seq, root)| {
+                        J::Obj(vec![
+                            ("batch_seq".into(), J::num(*seq)),
+                            ("withdraw_root".into(), J::str(hex::encode(root))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("claimed_withdrawals_count".into(), J::num(rv.claimed_withdrawals.len() as u64)),
+    ];
+    if let Some(vk) = &rv.post.sequencer_vk {
+        kv.push(("sequencer_vk".into(), J::str(hex::encode(vk))));
+    }
+    if let Some((p, root)) = mp {
+        kv.push(("merkle_proof".into(), merkle_proof_json(&p, root)));
+    }
+    J::Obj(kv)
+}
+
+/// RFC-0026: Live BIP-9 collective protocol steering & ossification signaling telemetry.
+pub fn signaling_info(shared: &Shared) -> J {
+    let n = lock(shared);
+    let tip = n.chain.height();
+    let (window, threshold) = match n.chain.params.net {
+        crate::params::Net::Main => (2_016, 1_815),
+        crate::params::Net::Test => (144, 130),
+        crate::params::Net::Reg | crate::params::Net::Dry => (10, 9),
+    };
+    let mut versions = Vec::with_capacity(tip as usize + 1);
+    for h in 0..=tip {
+        let v = n.chain.header_at(h).map(|b| b.header.version).unwrap_or(1);
+        versions.push(v);
+    }
+    let deps = crate::signal::standard_deployments(window, threshold);
+    let statuses: Vec<J> = deps
+        .iter()
+        .map(|d| {
+            let st = crate::signal::evaluate_deployment(&versions, d);
+            let mut kv = vec![
+                ("name".into(), J::str(st.name)),
+                ("bit".into(), J::num(st.bit as u64)),
+                ("state".into(), J::str(st.state.as_str())),
+                ("window".into(), J::num(st.window as u64)),
+                ("threshold".into(), J::num(st.threshold as u64)),
+                ("window_start".into(), J::num(st.window_start as u64)),
+                ("blocks_in_window".into(), J::num(st.blocks_in_window as u64)),
+                ("signaled_in_window".into(), J::num(st.signaled_in_window as u64)),
+                ("ossifies_monetary_base".into(), J::Bool(st.ossifies_monetary_base)),
+            ];
+            if let Some(a) = st.active_since {
+                kv.push(("active_since".into(), J::num(a as u64)));
+            }
+            J::Obj(kv)
+        })
+        .collect();
+    J::Obj(vec![
+        ("ok".into(), J::Bool(true)),
+        ("height".into(), J::num(tip as u64)),
+        ("deployments".into(), J::Arr(statuses)),
+    ])
+}
+
 /// Hand a transaction from outside the peer network to the node: checked (the proof
 /// outside the lock), pooled and announced.
 pub fn submit_tx(shared: &Shared, bytes: &[u8]) -> J {
@@ -1050,6 +1207,12 @@ pub fn state_commitment(shared: &Shared) -> J {
     }
     if let Some(ch) = &p.channels {
         parts.push(("channels".into(), h32(ch)));
+    }
+    if let Some(b) = &p.bonds {
+        parts.push(("bonds".into(), h32(b)));
+    }
+    if let Some(rv) = &p.rollups {
+        parts.push(("rollups".into(), h32(rv)));
     }
     J::Obj(vec![
         ("ok".into(), J::Bool(true)),
@@ -1254,6 +1417,15 @@ pub fn serve_public_with(shared: Shared, bind: &str, port: u16, faucet: Option<A
                                     _ => (400, err_json("give id= or tip=, 64 hex characters")),
                                 }
                             }
+                            ("GET", "/api/bond") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
+                                Some(Some(id)) => (200, bond_info(&sh, &id)),
+                                _ => (400, err_json("id= takes 64 hex characters")),
+                            },
+                            ("GET", "/api/rollup") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
+                                Some(Some(id)) => (200, rollup_info(&sh, &id)),
+                                _ => (400, err_json("id= takes 64 hex characters")),
+                            },
+                            ("GET", "/api/signaling") => (200, signaling_info(&sh)),
                             ("GET", "/api/cond") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {
                                 Some(Some(id)) => (200, cond_info(&sh, &id)),
                                 _ => (400, err_json("id= takes 64 hex characters")),

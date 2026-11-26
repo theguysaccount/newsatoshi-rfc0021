@@ -575,6 +575,12 @@ impl Node {
             | Tx::Act(crate::job::Action::ChannelExpire { channel }) => {
                 self.pool_state.channels.get(channel).map(|c| c.post.claim_fee).unwrap_or(0)
             }
+            Tx::Act(crate::job::Action::BondAttest { fee, .. }) => *fee,
+            Tx::Act(crate::job::Action::BondSlashEquivocation { miner_fee, .. })
+            | Tx::Act(crate::job::Action::BondSlashQuorum { miner_fee, .. })
+            | Tx::Act(crate::job::Action::BondUnbondComplete { miner_fee, .. })
+            | Tx::Act(crate::job::Action::RollupWithdraw { miner_fee, .. }) => *miner_fee,
+            Tx::Act(crate::job::Action::RollupBatch { batch_fee, .. }) => *batch_fee,
             _ => 0,
         };
         let mut new = PoolEntry { tx, id, size, fee, seq: self.seq };
@@ -597,7 +603,11 @@ impl Node {
             }
         }
         let h = self.next_height();
-        let applied_fee = self.pool_state.apply_tx(&new.tx, h, &self.chain.params, NO_PROOFS)?;
+        let admit_checks = crate::state::Checks {
+            verify_proofs: matches!(&new.tx, Tx::Act(crate::job::Action::RollupBatch { .. })),
+            check_commit: false,
+        };
+        let applied_fee = self.pool_state.apply_tx(&new.tx, h, &self.chain.params, admit_checks)?;
         new.fee = applied_fee;
         self.seq += 1;
         self.pool_bytes += size;

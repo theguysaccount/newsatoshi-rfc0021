@@ -13,12 +13,15 @@
 //! Authorisations (commit, accept, challenge) are SLH-DSA-SHA2-128s signatures, FIPS 205,
 //! which rest on SHA-256 alone.
 
+use crate::bond::{BondPost, MAX_ARBITERS};
 use crate::channel::{ChannelPost, MAX_BATCH_CHANNELS};
 use crate::codec::{Reader, Res, Writer};
 use crate::hash::{sha256, Word8};
 use crate::cond::CondPost;
 use crate::lock::LockPost;
+use crate::merkmap::MerkleProof;
 use crate::note::Rho;
+use crate::rollup::{RollupPost, MAX_ROLLUP_PROOF_BYTES};
 use rand::Rng;
 use slh_dsa::{Sha2_128s, Signature, SigningKey, VerifyingKey};
 use winterfell::math::{fields::f64::BaseElement as Felt, FieldElement, StarkField};
@@ -229,6 +232,14 @@ pub enum Deposit {
     Channel(ChannelPost),
     /// RFC-0022: Batched open of up to 64 distinct PayWord payment channels in one spend.
     ChannelBatch(Vec<ChannelPost>),
+    /// RFC-0024: Create a persistent Universal Trust Bond (`crate::bond`).
+    Bond(BondPost),
+    /// RFC-0024: Top up an existing Universal Trust Bond's active collateral.
+    BondTopUp { bond: [u8; 32], amount: u64 },
+    /// RFC-0023: Permissionlessly deploy a Sovereign L2 Rollup Vault (`crate::rollup`).
+    RollupRegister(RollupPost),
+    /// RFC-0023: Shielded L1 → L2 bridge deposit into an active Rollup Vault.
+    RollupDeposit { rollup: [u8; 32], l2_recipient: [u8; 32], amount: u64 },
 }
 
 impl Deposit {
@@ -252,6 +263,10 @@ impl Deposit {
                 }
                 Ok(sum)
             }
+            Deposit::Bond(b) => Ok(b.stake),
+            Deposit::BondTopUp { amount, .. } => Ok(*amount),
+            Deposit::RollupRegister(r) => Ok(r.initial_tvl),
+            Deposit::RollupDeposit { amount, .. } => Ok(*amount),
         }
     }
 }
@@ -286,6 +301,62 @@ pub enum Action {
     ChannelClaim { channel: [u8; 32], ticks: u32, token: [u8; 32], sig: Vec<u8> },
     /// RFC-0022: Expire an unclaimed PayWord channel after timeout, refunding buyer and paying miner fee.
     ChannelExpire { channel: [u8; 32] },
+    /// RFC-0024: Dual-signed honest settlement attestation compounding portable reputation.
+    BondAttest {
+        bond: [u8; 32],
+        receipt_hash: [u8; 32],
+        settled_amount: u64,
+        fee: u64,
+        owner_sig: Vec<u8>,
+        counterparty_vk: [u8; 32],
+        counterparty_sig: Vec<u8>,
+    },
+    /// RFC-0024: Permissionless Tier-1/Tier-2 equivocation slash paying victim + burning penalty.
+    BondSlashEquivocation {
+        bond: [u8; 32],
+        context_nonce: u64,
+        payload_a: [u8; 32],
+        sig_a: Vec<u8>,
+        payload_b: [u8; 32],
+        sig_b: Vec<u8>,
+        victim_addr: Word8,
+        slash_amount: u64,
+        miner_fee: u64,
+    },
+    /// RFC-0024: Tier-3 M-of-N arbiter quorum adjudication slash paying victim + burning penalty.
+    BondSlashQuorum {
+        bond: [u8; 32],
+        dispute_hash: [u8; 32],
+        victim_addr: Word8,
+        slash_amount: u64,
+        miner_fee: u64,
+        sigs: Vec<(u8, Vec<u8>)>,
+    },
+    /// RFC-0024: Initiate timelocked bond withdrawal (collateral remains slashable during delay).
+    BondUnbondRequest { bond: [u8; 32], amount: u64, sig: Vec<u8> },
+    /// RFC-0024: Complete timelocked bond withdrawal once cooldown has elapsed.
+    BondUnbondComplete { bond: [u8; 32], miner_fee: u64 },
+    /// RFC-0023: Settle a hyperscale L2 batch via a 128-bit pure-SHA-2 Winterfell STARK proof.
+    RollupBatch {
+        rollup: [u8; 32],
+        new_state_root: [u8; 32],
+        withdraw_root: [u8; 32],
+        batch_tx_count: u64,
+        batch_withdrawals: u64,
+        batch_fee: u64,
+        sequencer_sig: Vec<u8>,
+        proof: Vec<u8>,
+    },
+    /// RFC-0023: Trustless L2 → L1 shielded exit via canonical Merkle proof against `withdraw_root`.
+    RollupWithdraw {
+        rollup: [u8; 32],
+        batch_seq: u64,
+        withdrawal_id: [u8; 32],
+        recipient_addr: Word8,
+        amount: u64,
+        miner_fee: u64,
+        proof: MerkleProof,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,6 +450,20 @@ impl Deposit {
                     ch.encode(w);
                 }
             }
+            Deposit::Bond(b) => {
+                w.u8(7);
+                b.encode(w);
+            }
+            Deposit::BondTopUp { bond, amount } => {
+                w.u8(8).raw(bond).u64(*amount);
+            }
+            Deposit::RollupRegister(r) => {
+                w.u8(9);
+                r.encode(w);
+            }
+            Deposit::RollupDeposit { rollup, l2_recipient, amount } => {
+                w.u8(10).raw(rollup).raw(l2_recipient).u64(*amount);
+            }
         }
     }
     pub fn decode(r: &mut Reader) -> Res<Self> {
@@ -400,6 +485,10 @@ impl Deposit {
                 let list = (0..n).map(|_| ChannelPost::decode(r)).collect::<Res<Vec<_>>>()?;
                 Ok(Deposit::ChannelBatch(list))
             }
+            7 => Ok(Deposit::Bond(BondPost::decode(r)?)),
+            8 => Ok(Deposit::BondTopUp { bond: r.arr()?, amount: r.u64()? }),
+            9 => Ok(Deposit::RollupRegister(RollupPost::decode(r)?)),
+            10 => Ok(Deposit::RollupDeposit { rollup: r.arr()?, l2_recipient: r.arr()?, amount: r.u64()? }),
             _ => Err("bad deposit tag".into()),
         }
     }
@@ -441,6 +530,12 @@ impl Action {
             Action::Unlock { lock, .. } | Action::Expire { lock } => lock,
             Action::Fulfil { cond, .. } => cond,
             Action::ChannelClaim { channel, .. } | Action::ChannelExpire { channel } => channel,
+            Action::BondAttest { bond, .. }
+            | Action::BondSlashEquivocation { bond, .. }
+            | Action::BondSlashQuorum { bond, .. }
+            | Action::BondUnbondRequest { bond, .. }
+            | Action::BondUnbondComplete { bond, .. } => bond,
+            Action::RollupBatch { rollup, .. } | Action::RollupWithdraw { rollup, .. } => rollup,
         }
     }
     pub fn encode(&self, w: &mut Writer) {
@@ -492,6 +587,107 @@ impl Action {
             }
             Action::ChannelExpire { channel } => {
                 w.u8(12).raw(channel);
+            }
+            Action::BondAttest {
+                bond,
+                receipt_hash,
+                settled_amount,
+                fee,
+                owner_sig,
+                counterparty_vk,
+                counterparty_sig,
+            } => {
+                w.u8(13)
+                    .raw(bond)
+                    .raw(receipt_hash)
+                    .u64(*settled_amount)
+                    .u64(*fee)
+                    .bytes(owner_sig)
+                    .raw(counterparty_vk)
+                    .bytes(counterparty_sig);
+            }
+            Action::BondSlashEquivocation {
+                bond,
+                context_nonce,
+                payload_a,
+                sig_a,
+                payload_b,
+                sig_b,
+                victim_addr,
+                slash_amount,
+                miner_fee,
+            } => {
+                w.u8(14)
+                    .raw(bond)
+                    .u64(*context_nonce)
+                    .raw(payload_a)
+                    .bytes(sig_a)
+                    .raw(payload_b)
+                    .bytes(sig_b)
+                    .word8(victim_addr)
+                    .u64(*slash_amount)
+                    .u64(*miner_fee);
+            }
+            Action::BondSlashQuorum { bond, dispute_hash, victim_addr, slash_amount, miner_fee, sigs } => {
+                w.u8(15)
+                    .raw(bond)
+                    .raw(dispute_hash)
+                    .word8(victim_addr)
+                    .u64(*slash_amount)
+                    .u64(*miner_fee)
+                    .u8(sigs.len() as u8);
+                for (idx, sig) in sigs {
+                    w.u8(*idx).bytes(sig);
+                }
+            }
+            Action::BondUnbondRequest { bond, amount, sig } => {
+                w.u8(16).raw(bond).u64(*amount).bytes(sig);
+            }
+            Action::BondUnbondComplete { bond, miner_fee } => {
+                w.u8(17).raw(bond).u64(*miner_fee);
+            }
+            Action::RollupBatch {
+                rollup,
+                new_state_root,
+                withdraw_root,
+                batch_tx_count,
+                batch_withdrawals,
+                batch_fee,
+                sequencer_sig,
+                proof,
+            } => {
+                w.u8(18)
+                    .raw(rollup)
+                    .raw(new_state_root)
+                    .raw(withdraw_root)
+                    .u64(*batch_tx_count)
+                    .u64(*batch_withdrawals)
+                    .u64(*batch_fee)
+                    .bytes(sequencer_sig)
+                    .bytes(proof);
+            }
+            Action::RollupWithdraw {
+                rollup,
+                batch_seq,
+                withdrawal_id,
+                recipient_addr,
+                amount,
+                miner_fee,
+                proof,
+            } => {
+                w.u8(19)
+                    .raw(rollup)
+                    .u64(*batch_seq)
+                    .raw(withdrawal_id)
+                    .word8(recipient_addr)
+                    .u64(*amount)
+                    .u64(*miner_fee)
+                    .raw(&proof.key)
+                    .raw(&proof.value_hash)
+                    .u16(proof.siblings.len() as u16);
+                for s in &proof.siblings {
+                    w.raw(s);
+                }
             }
         }
     }
@@ -547,6 +743,82 @@ impl Action {
                 sig: r.bytes(MAX_SIG)?,
             },
             12 => Action::ChannelExpire { channel: r.arr()? },
+            13 => Action::BondAttest {
+                bond: r.arr()?,
+                receipt_hash: r.arr()?,
+                settled_amount: r.u64()?,
+                fee: r.u64()?,
+                owner_sig: r.bytes(MAX_SIG)?,
+                counterparty_vk: r.arr()?,
+                counterparty_sig: r.bytes(MAX_SIG)?,
+            },
+            14 => Action::BondSlashEquivocation {
+                bond: r.arr()?,
+                context_nonce: r.u64()?,
+                payload_a: r.arr()?,
+                sig_a: r.bytes(MAX_SIG)?,
+                payload_b: r.arr()?,
+                sig_b: r.bytes(MAX_SIG)?,
+                victim_addr: r.word8()?,
+                slash_amount: r.u64()?,
+                miner_fee: r.u64()?,
+            },
+            15 => {
+                let bond = r.arr()?;
+                let dispute_hash = r.arr()?;
+                let victim_addr = r.word8()?;
+                let slash_amount = r.u64()?;
+                let miner_fee = r.u64()?;
+                let n = r.u8()? as usize;
+                if n == 0 || n > MAX_ARBITERS {
+                    return Err("quorum sig count out of range".into());
+                }
+                let mut sigs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    sigs.push((r.u8()?, r.bytes(MAX_SIG)?));
+                }
+                Action::BondSlashQuorum { bond, dispute_hash, victim_addr, slash_amount, miner_fee, sigs }
+            }
+            16 => Action::BondUnbondRequest {
+                bond: r.arr()?,
+                amount: r.u64()?,
+                sig: r.bytes(MAX_SIG)?,
+            },
+            17 => Action::BondUnbondComplete { bond: r.arr()?, miner_fee: r.u64()? },
+            18 => Action::RollupBatch {
+                rollup: r.arr()?,
+                new_state_root: r.arr()?,
+                withdraw_root: r.arr()?,
+                batch_tx_count: r.u64()?,
+                batch_withdrawals: r.u64()?,
+                batch_fee: r.u64()?,
+                sequencer_sig: r.bytes(MAX_SIG)?,
+                proof: r.bytes(MAX_ROLLUP_PROOF_BYTES)?,
+            },
+            19 => {
+                let rollup = r.arr()?;
+                let batch_seq = r.u64()?;
+                let withdrawal_id = r.arr()?;
+                let recipient_addr = r.word8()?;
+                let amount = r.u64()?;
+                let miner_fee = r.u64()?;
+                let key = r.arr()?;
+                let value_hash = r.arr()?;
+                let ns = r.u16()? as usize;
+                if ns > 256 {
+                    return Err("rollup withdrawal Merkle proof too deep".into());
+                }
+                let siblings = (0..ns).map(|_| r.arr()).collect::<Res<Vec<_>>>()?;
+                Action::RollupWithdraw {
+                    rollup,
+                    batch_seq,
+                    withdrawal_id,
+                    recipient_addr,
+                    amount,
+                    miner_fee,
+                    proof: MerkleProof { key, value_hash, siblings },
+                }
+            }
             _ => return Err("bad action tag".into()),
         })
     }

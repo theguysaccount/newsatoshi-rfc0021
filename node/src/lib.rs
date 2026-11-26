@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod auxpow;
+pub mod bond;
 pub mod chain;
 pub mod channel;
 pub mod deliver;
@@ -25,8 +26,10 @@ pub mod params;
 pub mod peers;
 mod params_genesis;
 pub mod pow;
+pub mod rollup;
 pub mod rpc;
 pub mod script;
+pub mod signal;
 pub mod snapshot;
 pub mod spend;
 pub mod state;

@@ -28,6 +28,8 @@ type Dk = <MlKem768 as KemCore>::DecapsulationKey;
 type Ek = <MlKem768 as KemCore>::EncapsulationKey;
 
 pub const EK_BYTES: usize = 1184;
+/// ML-KEM-768 decapsulation key byte length (FIPS 203).
+pub const DK_BYTES: usize = 2400;
 const CT_BYTES: usize = 1088;
 const BOX_BYTES: usize = 28;
 const TAG_BYTES: usize = 16;
@@ -147,6 +149,51 @@ pub fn open(sk: &Word8, cm: &Word8, env: &[u8]) -> Option<(u64, Rho)> {
     Scanner::new(sk).open(cm, env)
 }
 
+/// A read-only selective-audit viewing key (`nsvk1…`).
+///
+/// Allows a third-party auditor, regulator, treasury accountant, or watch-only AI service to
+/// decrypt every incoming `nsd1…` delivery envelope and change box for this wallet and verify
+/// exact on-chain commitments (`note::commit(a_pk, v, rho) == cm`), WITHOUT ever possessing
+/// `sk` or being able to derive nullifiers, sign SLH-DSA authorizations, or spend any coin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewingKey {
+    pub a_pk: Word8,
+    pub own: [u8; 32],
+    pub dk: Vec<u8>,
+}
+
+/// Export a wallet's read-only selective-audit viewing key (`nsvk1…`).
+pub fn viewing_key(sk: &Word8) -> String {
+    let (dk, _) = keys(sk);
+    let a_pk = note::address(sk);
+    let own = own_key(sk);
+    let mut body = Vec::with_capacity(32 + 32 + DK_BYTES);
+    body.extend_from_slice(&words_to_bytes(&a_pk));
+    body.extend_from_slice(&own);
+    body.extend_from_slice(dk.as_bytes().as_slice());
+    format!("nsvk1{}{}", hex::encode(&body), hex::encode(&sha256(&body)[..4]))
+}
+
+/// Parse and checksum-verify a read-only viewing key (`nsvk1…`).
+pub fn parse_viewing_key(s: &str) -> Result<ViewingKey, String> {
+    let h = s.trim().strip_prefix("nsvk1").ok_or("a viewing key starts with nsvk1")?;
+    if h.bytes().any(|c| c.is_ascii_uppercase()) {
+        return Err("a viewing key is in lower case".into());
+    }
+    let b = hex::decode(h).map_err(|_| "a viewing key is hex after nsvk1")?;
+    if b.len() != 32 + 32 + DK_BYTES + 4 {
+        return Err("a viewing key has the wrong length".into());
+    }
+    let (body, check) = b.split_at(32 + 32 + DK_BYTES);
+    if &sha256(body)[..4] != check {
+        return Err("a viewing key with a typo (checksum)".into());
+    }
+    let a_pk = bytes_to_words(&body[..32].try_into().unwrap());
+    let own: [u8; 32] = body[32..64].try_into().unwrap();
+    let dk = body[64..].to_vec();
+    Ok(ViewingKey { a_pk, own, dk })
+}
+
 /// A wallet's scanner: its keys, derived once.
 pub struct Scanner {
     dk: Dk,
@@ -157,6 +204,21 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(sk: &Word8) -> Scanner {
         Scanner { dk: keys(sk).0, own: own_key(sk), a_pk: note::address(sk) }
+    }
+
+    /// Construct a watch-only scanner from a `ViewingKey` (`nsvk1…`) with zero spend capability.
+    pub fn from_viewing_key(vk: &ViewingKey) -> Result<Scanner, String> {
+        if vk.dk.len() != DK_BYTES {
+            return Err("bad viewing key decapsulation length".into());
+        }
+        let arr: &[u8; DK_BYTES] = vk.dk.as_slice().try_into().map_err(|_| "bad viewing key")?;
+        let dk = Dk::from_bytes(arr.into());
+        Ok(Scanner { dk, own: vk.own, a_pk: vk.a_pk })
+    }
+
+    /// The public payment address (`a_pk`) bound to this scanner.
+    pub fn address(&self) -> Word8 {
+        self.a_pk
     }
 
     /// Open an envelope (sealed to this wallet's delivery key) or a box (sealed by this
@@ -328,5 +390,41 @@ mod tests {
         assert_eq!(unpack_memo(b"plain"), ([None, None], b"plain".as_slice()));
         let full = pack_memo([Some(e.clone()), Some(e)], &[1u8; MEMO_TEXT_BYTES]).unwrap();
         assert_eq!(full.len(), MAX_MEMO_BYTES);
+    }
+
+    #[test]
+    fn viewing_key_enables_read_only_selective_audit_without_sk() {
+        let alice: Word8 = rand::random();
+        let bob: Word8 = rand::random();
+        let vk_str = viewing_key(&alice);
+        assert!(vk_str.starts_with("nsvk1"));
+        let vk = parse_viewing_key(&vk_str).unwrap();
+        assert_eq!(vk.a_pk, note::address(&alice));
+        let auditor = Scanner::from_viewing_key(&vk).unwrap();
+        assert_eq!(auditor.address(), note::address(&alice));
+
+        // Incoming payment sealed to Alice's delivery address
+        let (a_pk, ek) = parse_delivery_address(&delivery_address(&alice)).unwrap();
+        let rho_in: Rho = rand::random();
+        let cm_in = note::commit(&a_pk, 75_000_000, &rho_in);
+        let env_in = seal(&ek, &cm_in, 75_000_000, &rho_in, rand::random()).unwrap();
+        assert_eq!(auditor.open(&cm_in, &env_in), Some((75_000_000, rho_in)));
+
+        // Change box sealed by Alice to herself
+        let rho_ch: Rho = rand::random();
+        let cm_ch = note::commit(&a_pk, 12_500_000, &rho_ch);
+        let box_ch = seal_own(&alice, &cm_ch, 12_500_000, &rho_ch);
+        assert_eq!(auditor.open(&cm_ch, &box_ch), Some((12_500_000, rho_ch)));
+
+        // Auditor cannot open Bob's notes, and corrupted checksum is rejected
+        let (b_pk, b_ek) = parse_delivery_address(&delivery_address(&bob)).unwrap();
+        let cm_bob = note::commit(&b_pk, 99, &rho_in);
+        let env_bob = seal(&b_ek, &cm_bob, 99, &rho_in, rand::random()).unwrap();
+        assert_eq!(auditor.open(&cm_bob, &env_bob), None);
+
+        let mut bad = vk_str.into_bytes();
+        let last = bad.len() - 1;
+        bad[last] = if bad[last] == b'0' { b'1' } else { b'0' };
+        assert!(parse_viewing_key(std::str::from_utf8(&bad).unwrap()).is_err());
     }
 }
