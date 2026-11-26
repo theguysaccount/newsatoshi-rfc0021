@@ -39,7 +39,7 @@
 //!     `NEWSATOSHI patch`). Proofs made before carry no `ZK_META` and still verify on the
 //!     test network, whose history holds them.
 
-use crate::hash::{self, compress, Sha2_256, Word8, IV, K};
+use crate::hash::{self, compress, Sha2_256, Sha2_384, Word8, IV, K};
 use crate::note::{self, Rho, DEPTH, MAX_NOTE_VALUE, TAG_ADDR, TAG_CM, TAG_NF};
 use rand::Rng;
 use winterfell::{
@@ -56,6 +56,11 @@ use winterfell::{
 pub type Hash = Sha2_256<Felt>;
 pub type Coin = DefaultRandomCoin<Hash>;
 pub type Vc = MerkleTree<Hash>;
+
+/// Mainnet v2 384-bit SHA-2 STARK commitment stack (192-bit classical / 128-bit QROM collision).
+pub type Hash384 = Sha2_384<Felt>;
+pub type Coin384 = DefaultRandomCoin<Hash384>;
+pub type Vc384 = MerkleTree<Hash384>;
 
 pub const ROWS: usize = 8192;
 pub const BLK: usize = 64;
@@ -1168,6 +1173,118 @@ pub fn main_options() -> ProofOptions {
 
 /// Largest proof the main network accepts. Proofs at its parameters measure about 460 KB.
 pub const MAIN_MAX_PROOF_BYTES: usize = 520_000;
+
+/// Largest Mainnet v2 SHA-384 proof (384-bit FRI commitments + 128 queries + ZK masking).
+pub const MAIN_V2_MAX_PROOF_BYTES: usize = 700_000;
+
+/// Mainnet v2 spend profile: 128 queries, 384-bit SHA-384 FRI/Merkle commitments (128-bit
+/// QROM post-quantum collision resistance, 192-bit classical), Haböck–Al Kindi ZK masking.
+pub const MAIN_V2: Profile = Profile {
+    queries: MAIN_QUERIES,
+    tag: b"/main-v2-sha384",
+    unmasked: false,
+    max_proof_bytes: MAIN_V2_MAX_PROOF_BYTES,
+};
+
+pub struct SpendProver384 {
+    options: ProofOptions,
+    pi: SpendPublic,
+}
+
+impl Prover for SpendProver384 {
+    type BaseField = Felt;
+    type Air = SpendAir;
+    type Trace = TraceTable<Felt>;
+    type HashFn = Hash384;
+    type VC = Vc384;
+    type RandomCoin = Coin384;
+    type TraceLde<E: FieldElement<BaseField = Felt>> = DefaultTraceLde<E, Hash384, Vc384>;
+    type ConstraintCommitment<E: FieldElement<BaseField = Felt>> = DefaultConstraintCommitment<E, Hash384, Vc384>;
+    type ConstraintEvaluator<'a, E: FieldElement<BaseField = Felt>> = DefaultConstraintEvaluator<'a, SpendAir, E>;
+
+    fn get_pub_inputs(&self, _trace: &Self::Trace) -> SpendPublic {
+        self.pi.clone()
+    }
+
+    fn options(&self) -> &ProofOptions {
+        &self.options
+    }
+
+    fn new_trace_lde<E: FieldElement<BaseField = Felt>>(
+        &self,
+        trace_info: &TraceInfo,
+        main_trace: &ColMatrix<Felt>,
+        domain: &StarkDomain<Felt>,
+        partition_option: PartitionOptions,
+    ) -> (Self::TraceLde<E>, TracePolyTable<E>) {
+        DefaultTraceLde::new(trace_info, main_trace, domain, partition_option)
+    }
+
+    fn build_constraint_commitment<E: FieldElement<BaseField = Felt>>(
+        &self,
+        composition_poly_trace: CompositionPolyTrace<E>,
+        num_constraint_composition_columns: usize,
+        domain: &StarkDomain<Felt>,
+        partition_options: PartitionOptions,
+    ) -> (Self::ConstraintCommitment<E>, CompositionPoly<E>) {
+        if num_constraint_composition_columns > plain_composition_columns() {
+            let k = zk_mask_len(&self.options);
+            let masks: Vec<Vec<E>> = (1..num_constraint_composition_columns).map(|_| random_elements::<E>(k)).collect();
+            DefaultConstraintCommitment::new_masked(composition_poly_trace, num_constraint_composition_columns, domain.trace_length() - k, &masks, domain, partition_options)
+        } else {
+            DefaultConstraintCommitment::new(composition_poly_trace, num_constraint_composition_columns, domain, partition_options)
+        }
+    }
+
+    fn new_evaluator<'a, E: FieldElement<BaseField = Felt>>(
+        &self,
+        air: &'a SpendAir,
+        aux_rand_elements: Option<AuxRandElements<E>>,
+        composition_coefficients: ConstraintCompositionCoefficients<E>,
+    ) -> Self::ConstraintEvaluator<'a, E> {
+        DefaultConstraintEvaluator::new(air, aux_rand_elements, composition_coefficients)
+    }
+}
+
+/// Prove a Mainnet v2 spend with 384-bit SHA-384 FRI commitments (>= 128-bit QROM soundness).
+pub fn prove_v2_sha384(wit: &SpendWitness, bind: Word8) -> Result<(SpendPublic, Proof), String> {
+    let pi = wit.public(bind)?;
+    let trace = build_trace_with(wit, &MAIN_V2.meta());
+    let proof = SpendProver384 { options: MAIN_V2.options(), pi: pi.clone() }
+        .prove(trace)
+        .map_err(|e| format!("prover: {e}"))?;
+    Ok((pi, proof))
+}
+
+/// Verify a serialized Mainnet v2 SHA-384 spend proof (canonical encoding + exact OptionSet + catch_unwind).
+pub fn verify_v2_sha384_bytes(pi: &SpendPublic, proof: &[u8]) -> Result<(), String> {
+    if proof.len() > MAIN_V2.max_proof_bytes {
+        return Err("proof too large".into());
+    }
+    if pi.value_balance.unsigned_abs() >= MAX_VALUE_BALANCE {
+        return Err("value balance out of range".into());
+    }
+    let options = MAIN_V2.options();
+    if !proof.starts_with(&context_prefix_for(&MAIN_V2, pi)) {
+        return Err("proof is not for Mainnet v2 SHA-384 circuit".into());
+    }
+    let run = || -> Result<(), String> {
+        let p = Proof::from_bytes(proof).map_err(|e| format!("malformed proof: {e}"))?;
+        if p.to_bytes() != proof {
+            return Err("proof is not canonically encoded".into());
+        }
+        let acceptable = winterfell::AcceptableOptions::OptionSet(vec![options.clone()]);
+        winterfell::verify::<SpendAir, Hash384, Coin384, Vc384>(p, pi.clone(), &acceptable).map_err(|e| format!("{e}"))
+    };
+    #[cfg(panic = "unwind")]
+    {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| Err("malformed proof".into()))
+    }
+    #[cfg(not(panic = "unwind"))]
+    {
+        run()
+    }
+}
 
 /// Prove with the given options: `options()` for the test network, `main_options()` for
 /// the main network.

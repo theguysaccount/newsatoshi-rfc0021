@@ -70,6 +70,11 @@ pub struct Params {
     pub magic: [u8; 4],
     pub pow_limit: u32,
     pub half_life: i64,
+    /// Optional anti-instamine launch ramp: for heights `< launch_blocks`, ASERT uses
+    /// `launch_half_life` (e.g., 3,600 s = 6 blocks/doubling), then transitions continuously
+    /// to `half_life` anchored at block `launch_blocks`. `0` disables the ramp (v0.1.0 compat).
+    pub launch_blocks: u32,
+    pub launch_half_life: i64,
     /// Seconds between blocks that difficulty aims for: Bitcoin's ten minutes on the main
     /// network; one minute on the test network, so that testing a payment takes minutes.
     pub target_spacing: i64,
@@ -127,6 +132,8 @@ impl Params {
                 magic: *b"nsT0",
                 pow_limit: 0x1e0fffff,
                 half_life: 3600,
+                launch_blocks: 0,
+                launch_half_life: 3600,
                 target_spacing: 60,
                 coinbase_maturity: 10,
                 max_block_bytes: 8_000_000,
@@ -151,6 +158,8 @@ impl Params {
                 magic: *b"nsR0",
                 pow_limit: 0x207fffff,
                 half_life: 3600,
+                launch_blocks: 0,
+                launch_half_life: 3600,
                 target_spacing: 600,
                 coinbase_maturity: 1,
                 max_block_bytes: 8_000_000,
@@ -200,6 +209,8 @@ impl Params {
             magic: *b"nsM0",
             pow_limit: 0x1d00ffff,
             half_life: 2 * 24 * 3600,
+            launch_blocks: 0,
+            launch_half_life: 3600,
             target_spacing: 600,
             coinbase_maturity: 100,
             max_block_bytes: 8_000_000,
@@ -217,6 +228,20 @@ impl Params {
             rfc0021_from: None,
             rfc0022_from: None,
             seeds: &["newsatoshi-seed.fly.dev:8444"],
+        }
+    }
+
+    /// Audited Mainnet v2 launch rules: anti-instamine Day-1 ASERT ramp (1-hour half-life for
+    /// the first 2,016 blocks → 48-hour steady state), RFC-0021 (128-bit proven covenants) and
+    /// RFC-0022 (seller-signed 64× batched PayWord channels) active from genesis.
+    pub fn main_v2_with(genesis_time: u32, genesis_nonce: u32, genesis_bits: u32) -> Params {
+        Params {
+            genesis_bits,
+            launch_blocks: 2_016,
+            launch_half_life: 3_600,
+            rfc0021_from: Some(0),
+            rfc0022_from: Some(0),
+            ..Self::main_with(genesis_time, genesis_nonce)
         }
     }
 

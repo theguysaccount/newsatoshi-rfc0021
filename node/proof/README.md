@@ -119,6 +119,20 @@ That is the theorem. ∎
 - **Not covered here:** the rules outside the circuit (a nullifier spent only once, the
   ledger's counters of issued and burned coins, fees), which `tests/` exercise but nothing
   proves; the conditions' script language; the chain proof, not yet built.
-- **The higher bar:** Zcash's Ironwood proved its balance in Lean, every step by machine,
-  the composition included. The same structure (extraction, exactness, ranges, induction)
-  carries over to Lean, and the induction above is the part a proof assistant would add.
+- **The higher bar (NOW MACHINE-CHECKED IN LEAN 4):** Zcash's Ironwood proved its balance
+  in Lean, every step by machine, the composition included. `examples/extract_lean_spend.rs`
+  now extracts Constraint #247 (balance register), Constraint #248 (note `< 2^60` range
+  check), and the exact 8,192-row selector schedule directly out of live compiling
+  `spend::eval_constraints`, `spend::periodic_table`, and `spend::assertion_cells` into
+  `proof/SpendBalance.lean` (zero `sorry`, zero Mathlib, zero custom axioms; checked under
+  Lean 4.36.0):
+
+      cargo run --release --example extract_lean_spend -- proof/SpendBalance.lean
+      lean proof/SpendBalance.lean
+
+  `SpendBalance.lean` proves `extracted_constraint_247_exact`, `extracted_constraint_248_exact`,
+  `note_value_strictly_below_2_pow_60`, `spend_balance_exact_integer_conservation` (full
+  4,607-step induction + Goldilocks no-wrap lifting to exact `Int` equality),
+  `rfc0022_channel_exact_conservation`, and `block_solvency_preserved` (`pool + locked + burned = issued`).
+  Note: full SHA-256 64-round compression equivalence remains verified by `proof/check.py` (Z3)
+  above; `SpendBalance.lean` covers the balance/range induction and ledger solvency composition.

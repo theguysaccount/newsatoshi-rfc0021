@@ -9,7 +9,7 @@
 //!     (MerkleCRH = SHA256Compress, protocol spec §5.4.1.3).
 
 use core::marker::PhantomData;
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha384};
 use winterfell::crypto::{Digest, ElementHasher, Hasher};
 use winterfell::math::{FieldElement, StarkField};
 use winter_utils::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable};
@@ -240,6 +240,107 @@ impl<B: StarkField> ElementHasher for Sha2_256<B> {
             let mut w = ShaWriter(Sha256::new());
             w.write_many(elements);
             ShaDigest(w.0.finalize().into())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Winterfell SHA-384 hasher (384-bit / 48-byte commitments for >= 128-bit QROM soundness)
+// ---------------------------------------------------------------------------------------
+
+pub fn sha384(data: &[u8]) -> [u8; 48] {
+    Sha384::digest(data).into()
+}
+
+/// 384-bit (48-byte) FIPS 180-4 SHA-384 digest for Mainnet v2 STARK FRI & Merkle trees.
+/// Provides 192-bit classical collision resistance and 128-bit QROM post-quantum collision
+/// resistance against Brassard–Høyer–Tapp (384 / 3 = 128), staying 100% pure SHA-2.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct ShaDigest384(pub [u8; 48]);
+
+impl Default for ShaDigest384 {
+    fn default() -> Self {
+        ShaDigest384([0u8; 48])
+    }
+}
+
+impl Digest for ShaDigest384 {
+    /// Returns the first 32 bytes for Winterfell's `DefaultRandomCoin` field-element & grinding
+    /// draws (256 bits of challenge entropy >= 128-bit Grover); all Merkle commitments, tree
+    /// merges, and coin reseeds use the full 48-byte (384-bit) digest via `Serializable`/`merge`.
+    fn as_bytes(&self) -> [u8; 32] {
+        self.0[..32].try_into().unwrap()
+    }
+}
+
+impl Serializable for ShaDigest384 {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        target.write_bytes(&self.0);
+    }
+}
+
+impl Deserializable for ShaDigest384 {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        Ok(ShaDigest384(source.read_array()?))
+    }
+}
+
+/// FIPS 180-4 SHA-384 as the STARK v2 hasher: 384-bit Merkle commitments, Fiat–Shamir & grinding.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Sha2_384<B: StarkField>(PhantomData<B>);
+
+impl<B: StarkField> Hasher for Sha2_384<B> {
+    type Digest = ShaDigest384;
+    const COLLISION_RESISTANCE: u32 = 192;
+
+    fn hash(bytes: &[u8]) -> ShaDigest384 {
+        ShaDigest384(sha384(bytes))
+    }
+
+    fn merge(values: &[ShaDigest384; 2]) -> ShaDigest384 {
+        let mut h = Sha384::new();
+        h.update(values[0].0);
+        h.update(values[1].0);
+        ShaDigest384(h.finalize().into())
+    }
+
+    fn merge_many(values: &[ShaDigest384]) -> ShaDigest384 {
+        let mut h = Sha384::new();
+        for v in values {
+            h.update(v.0);
+        }
+        ShaDigest384(h.finalize().into())
+    }
+
+    fn merge_with_int(seed: ShaDigest384, value: u64) -> ShaDigest384 {
+        let mut h = Sha384::new();
+        h.update(seed.0);
+        h.update(value.to_le_bytes());
+        ShaDigest384(h.finalize().into())
+    }
+}
+
+struct Sha384Writer(Sha384);
+
+impl ByteWriter for Sha384Writer {
+    fn write_u8(&mut self, value: u8) {
+        self.0.update([value]);
+    }
+    fn write_bytes(&mut self, values: &[u8]) {
+        self.0.update(values);
+    }
+}
+
+impl<B: StarkField> ElementHasher for Sha2_384<B> {
+    type BaseField = B;
+
+    fn hash_elements<E: FieldElement<BaseField = B>>(elements: &[E]) -> ShaDigest384 {
+        if B::IS_CANONICAL {
+            ShaDigest384(sha384(E::elements_as_bytes(elements)))
+        } else {
+            let mut w = Sha384Writer(Sha384::new());
+            w.write_many(elements);
+            ShaDigest384(w.0.finalize().into())
         }
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::params::{Net, Params, MAX_FUTURE_SECS};
 use crate::auxpow;
-use crate::pow::{self, asert_bits, meets};
+use crate::pow::{self, meets};
 use crate::state::{Checks, State, FULL};
 use crate::tx::{header_commit, Block, Coinbase, Header, PlainOut, Tx};
 use primitive_types::U256;
@@ -100,14 +100,26 @@ pub struct Entry {
 
 /// The block's proof of work: the hash of its own header, or, for a merge-mined block, the
 /// hash of the Bitcoin header whose coinbase commits to it (white paper §4).
-/// The difficulty a block on top of `parent` must carry: ASERT from the genesis anchor.
+/// The difficulty a block on top of `parent` must carry: ASERT from the genesis anchor
+/// (with optional anti-instamine Day-1 launch ramp when `params.launch_blocks > 0`).
 pub fn next_bits_for(params: &Params, parent: &Entry) -> u32 {
+    next_bits_for_with_anchor(params, parent, None)
+}
+
+pub fn next_bits_for_with_anchor(
+    params: &Params,
+    parent: &Entry,
+    steady_anchor: Option<(u32, i64)>,
+) -> u32 {
     if params.net == Net::Reg {
         return params.pow_limit;
     }
-    asert_bits(
+    pow::asert_bits_staged(
         params.genesis_bits,
         params.genesis_time as i64 - params.target_spacing,
+        params.launch_blocks,
+        params.launch_half_life,
+        steady_anchor,
         parent.height,
         parent.time as i64,
         params.half_life,
@@ -507,7 +519,30 @@ impl Chain {
     }
 
     pub fn next_bits(&self, parent: &Entry) -> u32 {
-        next_bits_for(&self.params, parent)
+        let steady_anchor = if self.params.launch_blocks > 0 && parent.height >= self.params.launch_blocks {
+            let lb = self.params.launch_blocks;
+            let anchor_hash = if self.is_active(&parent.hash) {
+                self.active.get(lb as usize).copied()
+            } else {
+                let mut cur = parent.hash;
+                while let Some(e) = self.index.get(&cur) {
+                    if e.height == lb {
+                        break;
+                    }
+                    if e.height < lb {
+                        break;
+                    }
+                    cur = e.prev;
+                }
+                self.index.get(&cur).filter(|e| e.height == lb).map(|e| e.hash)
+            };
+            anchor_hash
+                .and_then(|h| self.index.get(&h))
+                .map(|e| (e.bits, e.time as i64))
+        } else {
+            None
+        };
+        next_bits_for_with_anchor(&self.params, parent, steady_anchor)
     }
 
     /// Median time of the last eleven blocks ending at `h`.

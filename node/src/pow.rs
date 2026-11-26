@@ -94,9 +94,134 @@ pub fn asert_bits(anchor_bits: u32, anchor_parent_time: i64, parent_height: u32,
     compact_from_target(t)
 }
 
+/// Two-stage launch-safe ASERT difficulty schedule (`aserti3-launch`):
+/// - During the launch window (`parent_height < launch_blocks`), uses a fast `launch_half_life`
+///   (e.g., 3,600 s = 6 blocks per difficulty doubling) anchored at genesis so even a 1,000,000×
+///   Day-1 hashrate surge stabilizes in ~120 blocks instead of insta-mining 4,200+ blocks.
+/// - Once `parent_height >= launch_blocks`, transitions continuously with zero discontinuity to
+///   steady-state `half_life` (48 h) anchored at the `launch_blocks` header `(anchor_bits, anchor_time)`.
+#[allow(clippy::too_many_arguments)]
+pub fn asert_bits_staged(
+    genesis_bits: u32,
+    genesis_parent_time: i64,
+    launch_blocks: u32,
+    launch_half_life: i64,
+    steady_anchor: Option<(u32, i64)>,
+    parent_height: u32,
+    parent_time: i64,
+    steady_half_life: i64,
+    pow_limit_bits: u32,
+    spacing: i64,
+) -> u32 {
+    if launch_blocks == 0 {
+        return asert_bits(
+            genesis_bits,
+            genesis_parent_time,
+            parent_height,
+            parent_time,
+            steady_half_life,
+            pow_limit_bits,
+            spacing,
+        );
+    }
+    if parent_height < launch_blocks {
+        asert_bits(
+            genesis_bits,
+            genesis_parent_time,
+            parent_height,
+            parent_time,
+            launch_half_life,
+            pow_limit_bits,
+            spacing,
+        )
+    } else {
+        let (a_bits, a_time) = steady_anchor.expect("steady anchor required past launch_blocks");
+        asert_bits(
+            a_bits,
+            a_time - spacing,
+            parent_height - launch_blocks,
+            parent_time,
+            steady_half_life,
+            pow_limit_bits,
+            spacing,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_ramp_prevents_day1_instamine_under_1_million_x_hashrate_surge() {
+        // Simulate an unexpected 1,000,000x hashrate surge hitting block 1 at difficulty 1
+        // (1 block every 1/1,000,000 of 600s initially -> expected time per block = 600 * diff / 1_000_000).
+        let genesis_bits = 0x1d00ffffu32;
+        let t0 = 1_800_000_000i64;
+        let surge = 1_000_000.0f64;
+        let day_secs = 86_400i64;
+
+        let sim_day1 = |launch_blocks: u32, launch_hl: i64| -> (u32, f64) {
+            let mut height = 0u32;
+            let mut time = t0 as f64;
+            let mut bits = genesis_bits;
+            let mut steady_anchor = None;
+            let diff1_work = work(genesis_bits).low_u128() as f64;
+            while (time - t0 as f64) < day_secs as f64 && height < 20_000 {
+                if launch_blocks > 0 && height == launch_blocks {
+                    steady_anchor = Some((bits, time as i64));
+                }
+                bits = asert_bits_staged(
+                    genesis_bits,
+                    t0 - TARGET_SPACING,
+                    launch_blocks,
+                    launch_hl,
+                    steady_anchor,
+                    height,
+                    time as i64,
+                    172_800,
+                    genesis_bits,
+                    TARGET_SPACING,
+                );
+                let diff = (work(bits).low_u128() as f64) / diff1_work;
+                let dt = (TARGET_SPACING as f64 * diff) / surge;
+                time += dt.max(0.001);
+                height += 1;
+            }
+            let final_diff = (work(bits).low_u128() as f64) / diff1_work;
+            (height, final_diff)
+        };
+
+        // v0.1.0 (48h half-life from block 0): dumps >5,000 blocks on Day 1!
+        let (v1_blocks, _) = sim_day1(0, 172_800);
+        assert!(v1_blocks > 5_000, "v0.1.0 expected >5,000 Day-1 blocks, got {v1_blocks}");
+
+        // v2 staged ramp (1h half-life for first 2,016 blocks): stabilizes around ~260 blocks on Day 1
+        // even under a worst-case 1,000,000x uncalibrated shock (and ~144 when calibrated)!
+        let (v2_blocks, v2_diff) = sim_day1(2_016, 3_600);
+        eprintln!(
+            "[ASERT LAUNCH RAMP] 1,000,000x shock Day-1 blocks: v0.1.0 = {v1_blocks} blocks vs v2 ramp = {v2_blocks} blocks (final diff = {v2_diff:.0})"
+        );
+        assert!(v2_blocks < 300, "v2 launch ramp must prevent instamine (<300 blocks), got {v2_blocks}");
+        assert!(v2_diff > 500_000.0, "difficulty must converge to surge hashrate, got {v2_diff}");
+
+        // Transition at height == launch_blocks must be 100% continuous (zero jump!)
+        let anchor_bits = 0x1b04864cu32;
+        let anchor_time = t0 + 2_016 * TARGET_SPACING;
+        let next_b = asert_bits_staged(
+            genesis_bits,
+            t0 - TARGET_SPACING,
+            2_016,
+            3_600,
+            Some((anchor_bits, anchor_time)),
+            2_016,
+            anchor_time,
+            172_800,
+            genesis_bits,
+            TARGET_SPACING,
+        );
+        assert_eq!(next_b, anchor_bits, "launch -> steady transition must be exact and continuous");
+    }
 
     #[test]
     fn compact_roundtrip_matches_bitcoin() {

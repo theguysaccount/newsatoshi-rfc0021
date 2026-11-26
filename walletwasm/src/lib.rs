@@ -216,11 +216,18 @@ pub extern "C" fn light_root(p: *const u8, n: usize) -> i32 {
                 Some(J::Str(s)) => Some(hex32(s)?),
                 _ => None,
             },
+            channels: match p.get("channels") {
+                Some(J::Str(s)) => Some(hex32(s)?),
+                _ => None,
+            },
         };
         let root = lc.committed_root(&newsatoshi::tx::Header::from_bytes(&hb), &tx_root, &parts)?;
         let mut out = vec![("root".into(), J::str(hex::encode(words_to_bytes(&root)))), ("height".into(), J::num(parts.height))];
         if let Some(r) = parts.nf_root {
             out.push(("nf_root".into(), J::str(hex::encode(r))));
+        }
+        if let Some(r) = parts.channels {
+            out.push(("channels".into(), J::str(hex::encode(r))));
         }
         Ok(J::Obj(out).to_json())
     })())
