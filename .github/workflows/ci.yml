@@ -18,5 +18,5 @@ jobs:
       - working-directory: node
         run: |
           cargo test --lib
-          cargo test --test covenant_stark_softfork --test conds --test auxpow --test locks --test mainnet_params --test chain
+          cargo test --release --test payword_channel --test covenant_stark_softfork --test conds --test auxpow --test locks --test light --test mainnet_params --test chain
           cargo build --bin newsatoshi

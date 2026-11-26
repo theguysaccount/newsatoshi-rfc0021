@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod auxpow;
 pub mod chain;
+pub mod channel;
 pub mod deliver;
 pub mod codec;
 pub mod cond;

@@ -1,5 +1,6 @@
 //! Ledger state and the block validity rules.
 
+use crate::channel::{self, Channel, ChannelEnd, MAX_BLOCK_CHANNEL_HASHES};
 use crate::codec::Writer;
 use crate::hash::{sha256, Word8};
 use crate::job::{self, Action, Deposit, Job, Payout, Phase};
@@ -53,6 +54,10 @@ pub struct State {
     pub conds: BTreeMap<[u8; 32], Cond>,
     pub cond_ends: HashMap<[u8; 32], CondEnd>,
     pub locks_by_hash: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    /// RFC-0022: Open unilateral partial-claim PayWord payment channels (`crate::channel`).
+    pub channels: BTreeMap<[u8; 32], Channel>,
+    pub channel_ends: HashMap<[u8; 32], ChannelEnd>,
+    pub channels_by_tip: HashMap<[u8; 32], Vec<[u8; 32]>>,
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +101,9 @@ impl State {
             conds: BTreeMap::new(),
             cond_ends: HashMap::new(),
             locks_by_hash: HashMap::new(),
+            channels: BTreeMap::new(),
+            channel_ends: HashMap::new(),
+            channels_by_tip: HashMap::new(),
         }
     }
 
@@ -142,6 +150,15 @@ impl State {
             }
             sha256(&cw.0)
         });
+        // RFC-0022 PayWord channels likewise, while any are open
+        let channels = (!self.channels.is_empty()).then(|| {
+            let mut pw = Writer::new();
+            pw.raw(b"nsCHANS");
+            for ch in self.channels.values() {
+                ch.encode(&mut pw);
+            }
+            sha256(&pw.0)
+        });
         DigestParts {
             height: self.height,
             tree_root: self.tree.root(),
@@ -154,13 +171,22 @@ impl State {
             locks,
             conds,
             nf_root: self.nf_committed.then(|| crate::hash::words_to_bytes(&self.nf_tree.root())),
+            channels,
         }
     }
 
     /// Pay out of escrow: the value leaves `locked`, and the note joins the tree with its
     /// opening public. Checked before anything changes.
     fn pay_out(&mut self, payouts: &[Payout], burned: u64) -> Result<(), String> {
-        let out: u128 = payouts.iter().map(|p| p.v as u128).sum::<u128>() + burned as u128;
+        self.pay_out_with_fee(payouts, burned, 0)
+    }
+
+    /// Pay out of escrow while also routing an explicit pre-funded `miner_fee` into the
+    /// block's fee pool (`locked` decreases by `payouts + burned + miner_fee`).
+    fn pay_out_with_fee(&mut self, payouts: &[Payout], burned: u64, miner_fee: u64) -> Result<(), String> {
+        let out: u128 = payouts.iter().map(|p| p.v as u128).sum::<u128>()
+            + burned as u128
+            + miner_fee as u128;
         let locked = self.locked.checked_sub(out).ok_or("escrow accounting underflow")?;
         let cms = payouts.iter().map(|p| note::try_commit(&p.a_pk, p.v, &p.rho)).collect::<Result<Vec<_>, _>>()?;
         self.locked = locked;
@@ -249,7 +275,11 @@ impl State {
                         job::apply_claim(&mut j, c, h)?;
                         Some(j)
                     }
-                    Some(Deposit::Lock(_)) | Some(Deposit::Cond(_)) | None => None,
+                    Some(Deposit::Lock(_))
+                    | Some(Deposit::Cond(_))
+                    | Some(Deposit::Channel(_))
+                    | Some(Deposit::ChannelBatch(_))
+                    | None => None,
                 };
                 let cond_after = match &sp.deposit {
                     Some(Deposit::Cond(p)) => {
@@ -276,6 +306,31 @@ impl State {
                     }
                     _ => None,
                 };
+                let channels_after = match &sp.deposit {
+                    Some(Deposit::Channel(p)) => {
+                        channel::check_post(p, h)?;
+                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
+                        let id = channel::channel_id(p, &first_nf, 0);
+                        if self.channels.contains_key(&id) {
+                            return Err("duplicate channel".into());
+                        }
+                        vec![Channel { id, post: p.clone(), at: h }]
+                    }
+                    Some(Deposit::ChannelBatch(list)) => {
+                        channel::check_batch(list, h)?;
+                        let first_nf = if sp.dummy[0] { sp.nf[1] } else { sp.nf[0] };
+                        let mut out = Vec::with_capacity(list.len());
+                        for (idx, p) in list.iter().enumerate() {
+                            let id = channel::channel_id(p, &first_nf, idx as u32);
+                            if self.channels.contains_key(&id) {
+                                return Err("duplicate channel".into());
+                            }
+                            out.push(Channel { id, post: p.clone(), at: h });
+                        }
+                        out
+                    }
+                    _ => vec![],
+                };
                 if checks.verify_proofs {
                     spend::verify_bytes_cached(&params.proof, &pi, &sp.proof).map_err(|e| format!("proof rejected: {e}"))?;
                 }
@@ -299,7 +354,15 @@ impl State {
                 if let Some(c) = cond_after {
                     self.conds.insert(c.id, c);
                 }
-                self.locked += sp.deposit.as_ref().map(|d| d.amount() as u128).unwrap_or(0);
+                for ch in channels_after {
+                    self.channels_by_tip.entry(ch.post.tip).or_default().push(ch.id);
+                    self.channels.insert(ch.id, ch);
+                }
+                let dep_amt = match &sp.deposit {
+                    Some(d) => d.checked_amount()? as u128,
+                    None => 0,
+                };
+                self.locked += dep_amt;
                 Ok(sp.fee)
             }
             Tx::Act(Action::Unlock { lock: id, preimage }) => {
@@ -332,6 +395,42 @@ impl State {
                 let l = self.locks.remove(id).expect("checked above");
                 self.lock_ends.insert(*id, LockEnd { lock: l, height: h, preimage: None });
                 Ok(0)
+            }
+            Tx::Act(Action::ChannelClaim { channel: id, ticks, token }) => {
+                let ch = self.channels.get(id).ok_or("unknown channel")?;
+                let res = channel::claim(ch, *ticks, token, h)?;
+                self.pay_out_with_fee(&res.payouts, 0, res.miner_fee)?;
+                let ch = self.channels.remove(id).expect("checked above");
+                self.channel_ends.insert(
+                    *id,
+                    ChannelEnd {
+                        channel: ch,
+                        height: h,
+                        claimed: Some((*ticks, *token)),
+                        seller_paid: res.seller_paid,
+                        buyer_refunded: res.buyer_refunded,
+                        miner_fee: res.miner_fee,
+                    },
+                );
+                Ok(res.miner_fee)
+            }
+            Tx::Act(Action::ChannelExpire { channel: id }) => {
+                let ch = self.channels.get(id).ok_or("unknown channel")?;
+                let res = channel::expire(ch, h)?;
+                self.pay_out_with_fee(&res.payouts, 0, res.miner_fee)?;
+                let ch = self.channels.remove(id).expect("checked above");
+                self.channel_ends.insert(
+                    *id,
+                    ChannelEnd {
+                        channel: ch,
+                        height: h,
+                        claimed: None,
+                        seller_paid: 0,
+                        buyer_refunded: res.buyer_refunded,
+                        miner_fee: res.miner_fee,
+                    },
+                );
+                Ok(res.miner_fee)
             }
             Tx::Act(a) => {
                 let mut j = self.jobs.get(a.job()).ok_or("unknown job")?.clone();
@@ -398,7 +497,18 @@ impl State {
         }
 
         let mut fees: u128 = 0;
+        let mut channel_hashes: u64 = 0;
         for (i, tx) in block.txs.iter().enumerate().skip(1) {
+            if let Tx::Act(Action::ChannelClaim { ticks, .. }) = tx {
+                channel_hashes = channel_hashes
+                    .checked_add(*ticks as u64)
+                    .ok_or_else(|| format!("tx {i}: block channel hash budget overflow"))?;
+                if channel_hashes > MAX_BLOCK_CHANNEL_HASHES {
+                    return Err(format!(
+                        "tx {i}: block channel SHA-256 budget ({channel_hashes}) exceeds {MAX_BLOCK_CHANNEL_HASHES}"
+                    ));
+                }
+            }
             fees += s.apply_tx_sized(tx, h, params, checks).map_err(|e| format!("tx {i}: {e}"))? as u128;
         }
         s.finish_block(cb, fees, h, genesis)?;
@@ -429,6 +539,8 @@ pub struct DigestParts {
     pub conds: Option<[u8; 32]>,
     /// The nullifier tree's root, from `Params::nf_tree_from`.
     pub nf_root: Option<[u8; 32]>,
+    /// RFC-0022: Open PayWord channels digest (present only while any channels are open).
+    pub channels: Option<[u8; 32]>,
 }
 
 impl DigestParts {
@@ -446,6 +558,9 @@ impl DigestParts {
         }
         if let Some(n) = &self.nf_root {
             w.raw(b"N").raw(n);
+        }
+        if let Some(ch) = &self.channels {
+            w.raw(b"P").raw(ch);
         }
         sha256(&w.0)
     }

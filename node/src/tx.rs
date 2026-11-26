@@ -48,7 +48,10 @@ impl Spend {
     }
 
     pub fn value_balance(&self) -> Res<i64> {
-        let d = self.deposit.as_ref().map(|d| d.amount()).unwrap_or(0);
+        let d = match &self.deposit {
+            Some(dep) => dep.checked_amount()?,
+            None => 0,
+        };
         let total = self.fee.checked_add(d).ok_or("value overflow")?;
         i64::try_from(total).map_err(|_| "value overflow".into())
     }

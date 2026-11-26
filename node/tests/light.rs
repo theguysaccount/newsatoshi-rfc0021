@@ -76,6 +76,7 @@ fn committed(port: u16, lc: &HeaderTip, tamper: bool) -> Result<Word8, String> {
         locks: p.get("locks").map(|l| h32(l.as_str().unwrap())),
         conds: p.get("conds").map(|l| h32(l.as_str().unwrap())),
         nf_root: p.get("nf_root").map(|l| h32(l.as_str().unwrap())),
+        channels: p.get("channels").map(|l| h32(l.as_str().unwrap())),
     };
     if tamper {
         parts.issued += 1;

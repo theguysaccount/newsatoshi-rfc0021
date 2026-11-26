@@ -13,6 +13,7 @@
 //! Authorisations (commit, accept, challenge) are SLH-DSA-SHA2-128s signatures, FIPS 205,
 //! which rest on SHA-256 alone.
 
+use crate::channel::{ChannelPost, MAX_BATCH_CHANNELS};
 use crate::codec::{Reader, Res, Writer};
 use crate::hash::{sha256, Word8};
 use crate::cond::CondPost;
@@ -224,15 +225,33 @@ pub enum Deposit {
     Lock(LockPost),
     /// Coins locked to a condition, a program that releases them (`crate::cond`).
     Cond(CondPost),
+    /// RFC-0022: Unilateral partial-claim PayWord payment channel (`crate::channel`).
+    Channel(ChannelPost),
+    /// RFC-0022: Batched open of up to 64 distinct PayWord payment channels in one spend.
+    ChannelBatch(Vec<ChannelPost>),
 }
 
 impl Deposit {
     pub fn amount(&self) -> u64 {
+        self.checked_amount().unwrap_or(u64::MAX)
+    }
+
+    pub fn checked_amount(&self) -> Res<u64> {
         match self {
-            Deposit::Post(p) => p.pay,
-            Deposit::Claim(c) => c.bond,
-            Deposit::Lock(l) => l.amount,
-            Deposit::Cond(c) => c.amount,
+            Deposit::Post(p) => Ok(p.pay),
+            Deposit::Claim(c) => Ok(c.bond),
+            Deposit::Lock(l) => Ok(l.amount),
+            Deposit::Cond(c) => Ok(c.amount),
+            Deposit::Channel(ch) => ch.total_deposit(),
+            Deposit::ChannelBatch(list) => {
+                let mut sum: u64 = 0;
+                for ch in list {
+                    sum = sum
+                        .checked_add(ch.total_deposit()?)
+                        .ok_or("channel batch deposit overflow")?;
+                }
+                Ok(sum)
+            }
         }
     }
 }
@@ -261,6 +280,11 @@ pub enum Action {
     /// Release coins under a condition to one of its payouts by running its program
     /// (`crate::cond`): the salt and program its commitment names, and a witness.
     Fulfil { cond: [u8; 32], payout: u8, salt: [u8; 32], program: Vec<u8>, witness: Vec<Vec<u8>> },
+    /// RFC-0022: Unilateral seller claim of `ticks` vouchers from a PayWord channel,
+    /// atomically splitting `ticks * unit_price` to seller, remainder to buyer, and fee to miner.
+    ChannelClaim { channel: [u8; 32], ticks: u32, token: [u8; 32] },
+    /// RFC-0022: Expire an unclaimed PayWord channel after timeout, refunding buyer and paying miner fee.
+    ChannelExpire { channel: [u8; 32] },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -344,6 +368,16 @@ impl Deposit {
                 w.u8(4);
                 c.encode(w);
             }
+            Deposit::Channel(ch) => {
+                w.u8(5);
+                ch.encode(w);
+            }
+            Deposit::ChannelBatch(list) => {
+                w.u8(6).u8(list.len() as u8);
+                for ch in list {
+                    ch.encode(w);
+                }
+            }
         }
     }
     pub fn decode(r: &mut Reader) -> Res<Self> {
@@ -356,6 +390,15 @@ impl Deposit {
             2 => Ok(Deposit::Claim(JobClaim { job: r.arr()?, worker_vk: r.bytes(VK_LEN)?, worker_addr: r.word8()?, bond: r.u64()? })),
             3 => Ok(Deposit::Lock(LockPost::decode(r)?)),
             4 => Ok(Deposit::Cond(CondPost::decode(r)?)),
+            5 => Ok(Deposit::Channel(ChannelPost::decode(r)?)),
+            6 => {
+                let n = r.u8()? as usize;
+                if n == 0 || n > MAX_BATCH_CHANNELS {
+                    return Err("channel batch size out of range".into());
+                }
+                let list = (0..n).map(|_| ChannelPost::decode(r)).collect::<Res<Vec<_>>>()?;
+                Ok(Deposit::ChannelBatch(list))
+            }
             _ => Err("bad deposit tag".into()),
         }
     }
@@ -396,6 +439,7 @@ impl Action {
             | Action::Refund { job } => job,
             Action::Unlock { lock, .. } | Action::Expire { lock } => lock,
             Action::Fulfil { cond, .. } => cond,
+            Action::ChannelClaim { channel, .. } | Action::ChannelExpire { channel } => channel,
         }
     }
     pub fn encode(&self, w: &mut Writer) {
@@ -441,6 +485,12 @@ impl Action {
                 for x in witness {
                     w.bytes(x);
                 }
+            }
+            Action::ChannelClaim { channel, ticks, token } => {
+                w.u8(11).raw(channel).u32(*ticks).raw(token);
+            }
+            Action::ChannelExpire { channel } => {
+                w.u8(12).raw(channel);
             }
         }
     }
@@ -489,6 +539,8 @@ impl Action {
                 }
                 Action::Fulfil { cond, payout, salt, program, witness }
             }
+            11 => Action::ChannelClaim { channel: r.arr()?, ticks: r.u32()?, token: r.arr()? },
+            12 => Action::ChannelExpire { channel: r.arr()? },
             _ => return Err("bad action tag".into()),
         })
     }

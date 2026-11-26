@@ -605,6 +605,7 @@ pub fn status(shared: &Shared) -> J {
         ("nullifiers".into(), J::num(s.nullifiers.len())),
         ("locks".into(), J::num(s.locks.len())),
         ("conditions".into(), J::num(s.conds.len())),
+        ("channels".into(), J::num(s.channels.len())),
         ("auxpow_chainid".into(), J::num(auxpow::CHAIN_ID)),
         ("recent".into(), J::Arr(recent)),
     ])
@@ -947,6 +948,9 @@ pub fn state_commitment(shared: &Shared) -> J {
     }
     if let Some(r) = &p.nf_root {
         parts.push(("nf_root".into(), h32(r)));
+    }
+    if let Some(ch) = &p.channels {
+        parts.push(("channels".into(), h32(ch)));
     }
     J::Obj(vec![
         ("ok".into(), J::Bool(true)),

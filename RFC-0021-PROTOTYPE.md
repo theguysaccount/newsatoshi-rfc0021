@@ -31,4 +31,5 @@ cargo run --bin newsatoshi -- program \
 ```
 
 ## Companion Stack
+- **RFC-0022 Unilateral Partial-Claim PayWord Channels & 64× Batched Opens:** [`RFC-0022-PAYWORD-CHANNELS.md`](RFC-0022-PAYWORD-CHANNELS.md) (`node/src/channel.rs`, `node/tests/payword_channel.rs`)
 - **Phase 1 CSV Engine, Live Dual-Chain Mirror & Legal Airlock:** https://github.com/theguysaccount/newsatoshi-commons (`https://commons.newsatoshi.org`)
