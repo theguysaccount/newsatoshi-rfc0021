@@ -243,6 +243,8 @@ pub struct Chain {
     /// Blocks already in `blocks.dat`.
     persisted: HashSet<[u8; 32]>,
     pub dir: Option<PathBuf>,
+    /// True when `Chain::open` restored verified state from `state.snap`.
+    pub fast_boot: bool,
 }
 
 pub fn now() -> i64 {
@@ -275,6 +277,7 @@ impl Chain {
             place: HashMap::new(),
             persisted: HashSet::from([gh]),
             dir: dir.map(|d| d.to_path_buf()),
+            fast_boot: false,
         };
         if let Some(d) = dir {
             std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
@@ -283,11 +286,45 @@ impl Chain {
             // the next block written does not land after half a record
             let mut whole = None;
             if path.exists() {
-                let file = File::open(&path).map_err(|e| e.to_string())?;
+                let mut file = File::open(&path).map_err(|e| e.to_string())?;
                 let size = file.metadata().map_err(|e| e.to_string())?.len();
                 c.store = Some(Store { append: OpenOptions::new().append(true).open(&path).map_err(|e| e.to_string())?, reader: Mutex::new(File::open(&path).map_err(|e| e.to_string())?), end: size, trim: false });
+                let mut at = 0u64;
+                if let Some(snap_res) = crate::snapshot::load_verified(d, &c.genesis, size) {
+                    match snap_res {
+                        Ok(snap) if !snap.blocks.is_empty() => {
+                            let last = snap.blocks.last().unwrap();
+                            let tip_ok = c
+                                .store
+                                .as_ref()
+                                .and_then(|s| s.read(last.at, last.len as usize).ok())
+                                .and_then(|bytes| Block::decode(&bytes).ok())
+                                .is_some_and(|b| b.hash() == snap.tip_hash && b.digest == snap.tip_digest);
+                            if tip_ok && file.seek(SeekFrom::Start(snap.blocks_dat_end)).is_ok() {
+                                for rec in snap.blocks {
+                                    let h = rec.entry.hash;
+                                    c.index.insert(h, rec.entry);
+                                    c.active.push(h);
+                                    c.sizes.insert(h, (rec.size, rec.txs));
+                                    c.place.insert(h, Place { side: false, at: rec.at, len: rec.len });
+                                    c.persisted.insert(h);
+                                }
+                                c.state = snap.state;
+                                c.snapshots.insert(snap.tip_hash, c.state.clone());
+                                at = snap.blocks_dat_end;
+                                c.fast_boot = true;
+                            } else {
+                                eprintln!("state.snap tip mismatch with blocks.dat; replaying from genesis");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("state.snap ignored ({e}); replaying blocks.dat from genesis");
+                        }
+                    }
+                }
                 let mut r = BufReader::with_capacity(1 << 20, file);
-                let (mut at, mut buf) = (0u64, vec![]);
+                let mut buf = vec![];
                 let (mut records, mut kept, mut old_records) = (0usize, 0usize, 0usize);
                 c.loading = true;
                 loop {
@@ -545,6 +582,14 @@ impl Chain {
             self.reconsider();
         }
         self.persist_active()?;
+        if !self.loading
+            && self.dir.is_some()
+            && self.tip().hash == h
+            && self.height() > 0
+            && self.height() % crate::snapshot::SNAPSHOT_INTERVAL == 0
+        {
+            let _ = self.save_snapshot();
+        }
         // kept but not connected: its body goes to side.dat rather than staying in memory
         if !self.loading && !self.persisted.contains(&h) && !self.place.contains_key(&h) && self.blocks.contains_key(&h) {
             if self.side.is_none() {
@@ -639,6 +684,43 @@ impl Chain {
             self.persisted.insert(h);
         }
         Ok(())
+    }
+
+    /// Persist a cryptographically verified fast-boot snapshot (`state.snap`) of the current
+    /// active tip and state, written atomically (`tmp` → `fsync` → `rename`).
+    pub fn save_snapshot(&self) -> Result<(), String> {
+        let dir = self.dir.as_ref().ok_or("in-memory chain has no directory")?;
+        let store = self.store.as_ref().ok_or("no block store")?;
+        if self.active.len() <= 1 {
+            return Ok(());
+        }
+        let mut blocks = Vec::with_capacity(self.active.len() - 1);
+        for h in self.active.iter().skip(1) {
+            let entry = self.index.get(h).ok_or("missing active entry")?.clone();
+            let (size, txs) = self.sizes.get(h).copied().unwrap_or((0, 0));
+            let place = self.place.get(h).ok_or("active block not persisted in blocks.dat")?;
+            if place.side {
+                return Err("active block resides in side.dat".into());
+            }
+            blocks.push(crate::snapshot::BlockRecord {
+                entry,
+                size,
+                txs,
+                at: place.at,
+                len: place.len,
+            });
+        }
+        let tip_hash = self.tip().hash;
+        let tip_digest = self.state.digest();
+        let snap = crate::snapshot::ChainSnapshot {
+            genesis: self.genesis,
+            tip_hash,
+            tip_digest,
+            blocks_dat_end: store.end,
+            blocks,
+            state: self.state.clone(),
+        };
+        crate::snapshot::save_atomic(dir, &snap)
     }
 
     /// After a failed activation, move to the best chain that does validate.

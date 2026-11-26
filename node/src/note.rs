@@ -138,6 +138,33 @@ impl NoteTree {
     pub fn find(&self, cm: &Word8) -> Option<u32> {
         self.levels[0].iter().position(|x| x == cm).map(|p| p as u32)
     }
+
+    /// Snapshot export: every leaf commitment in insertion order.
+    pub fn leaves(&self) -> Vec<Word8> {
+        self.levels[0].iter().copied().collect()
+    }
+
+    /// Fast O(N) bottom-up reconstruction of a `NoteTree` from its leaves.
+    pub fn from_leaves(leaves: &[Word8]) -> Self {
+        let empty = empty_roots();
+        let mut levels = vec![Vector::new(); DEPTH + 1];
+        if leaves.is_empty() {
+            return Self { levels, empty };
+        }
+        levels[0] = leaves.iter().copied().collect();
+        for level in 0..DEPTH {
+            let prev = &levels[level];
+            let parents = prev.len().div_ceil(2);
+            let mut next = Vector::new();
+            for p in 0..parents {
+                let left = prev[p * 2];
+                let right = prev.get(p * 2 + 1).copied().unwrap_or(empty[level]);
+                next.push_back(node(&left, &right));
+            }
+            levels[level + 1] = next;
+        }
+        Self { levels, empty }
+    }
 }
 
 /// Recompute a root from a leaf, its position and its siblings.

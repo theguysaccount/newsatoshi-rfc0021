@@ -573,6 +573,45 @@ impl Job {
             }
         }
     }
+
+    pub fn decode(r: &mut Reader) -> Res<Self> {
+        let id = r.arr()?;
+        let post = JobPost::decode(r)?;
+        let posted_at = r.u32()?;
+        let phase = match r.u8()? {
+            0 => Phase::Open,
+            1 => Phase::Claimed {
+                worker_vk: r.bytes(VK_LEN)?,
+                worker_addr: r.word8()?,
+                bond: r.u64()?,
+                at: r.u32()?,
+            },
+            2 => Phase::Committed {
+                worker_vk: r.bytes(VK_LEN)?,
+                worker_addr: r.word8()?,
+                bond: r.u64()?,
+                c_root: r.arr()?,
+                at: r.u32()?,
+                challenged: r.bool()?,
+            },
+            3 => {
+                let worker_vk = r.bytes(VK_LEN)?;
+                let worker_addr = r.word8()?;
+                let bond = r.u64()?;
+                let c_root = r.arr()?;
+                let at = r.u32()?;
+                let n = r.u32()? as usize;
+                if n > MAX_CHALLENGE_ROWS {
+                    return Err("too many challenged rows".into());
+                }
+                let rows = (0..n).map(|_| r.u32()).collect::<Res<Vec<_>>>()?;
+                Phase::Challenged { worker_vk, worker_addr, bond, c_root, rows, at }
+            }
+            4 => Phase::Closed { paid_worker: r.bool()? },
+            _ => return Err("bad job phase tag".into()),
+        };
+        Ok(Job { id, post, posted_at, phase })
+    }
 }
 
 /// Bytes of the transaction that answers a challenge of `MAX_CHALLENGE_ROWS` rows of an

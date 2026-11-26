@@ -49,9 +49,26 @@ Consistent with `node/src/lock.rs` and `node/src/cond.rs`, RFC-0022 channels cur
 
 ---
 
-## 4. Verification Command
+## 4. Phase 1 Production Hardening (`v0.2.1-rfc0022`)
+
+1. **O(log N) Canonical `MerkleMap` State Commitments (`node/src/merkmap.rs`):**
+   - Replaces linear O(N) per-block hashing of open channels with a persistent, insertion-order-independent SHA-256 binary Merkle trie (`nsMKL` / `nsMKB`).
+   - Measured benchmark: 10,000 inserts in `61.18 ms` (`0.0061 ms/op`), 1,000 removes in `6.17 ms` (`0.0062 ms/op`), average inclusion proof depth `14.53` siblings (~465 bytes), O(1) root lookup at block finalization.
+2. **Live Public HTTP RPC (`GET /api/channel?id=<64hex>` & `?tip=<64hex>` in `node/src/rpc.rs`):**
+   - Exposes open, claimed, and expired channel terms, settlement payouts, confirmations, and canonical SHA-256 `merkle_proof` objects verifiable by light clients and SDKs against `GET /api/state` (`parts.channels`).
+3. **Mempool Fee Ordering, Block Hash Anti-DoS Cap & Miner Coinbase Payouts (`node/src/node.rs`):**
+   - `Node::admit`, `Node::select_with_fees`, and `Node::block_template` extract real `claim_fee` values for `ChannelClaim` and `ChannelExpire`, prioritize fee-bearing claims by fee rate, enforce `MAX_BLOCK_CHANNEL_HASHES` (`2,000,000`) during template assembly, and credit pre-funded `claim_fee`s directly into the miner coinbase.
+4. **Verified Fast-Boot Disk Snapshots (`node/src/snapshot.rs`, `node/src/chain.rs`):**
+   - Atomic `state.snap` (`tmp` → `fsync` → `rename`) with trailing SHA-256 checksum, genesis binding, tip-block verification against `blocks.dat`, and recomputed `state.digest()` check — automatically catching up trailing blocks or falling back cleanly to `blocks.dat` replay on any mismatch/corruption.
+5. **NIST FIPS 203 & FIPS 205 Determinism / KAT Regression Suite (`node/tests/crypto_kats.rs`):**
+   - Locks byte lengths, determinism, and 1-bit tamper rejection for `SLH-DSA-SHA2-128s` and `ML-KEM-768` plus snapshot integrity.
+
+---
+
+## 5. Verification Commands
 
 ```bash
 cd node
-cargo test --release --lib channel --test payword_channel --test locks --test conds --test light --test covenant_stark_softfork -- --nocapture
+cargo test --release --lib -- --nocapture
+cargo test --release --test payword_channel --test crypto_kats --test locks --test conds --test light --test covenant_stark_softfork --test mainnet_params --test chain --test auxpow -- --nocapture
 ```

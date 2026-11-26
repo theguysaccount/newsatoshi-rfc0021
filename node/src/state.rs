@@ -6,6 +6,7 @@ use crate::hash::{sha256, Word8};
 use crate::job::{self, Action, Deposit, Job, Payout, Phase};
 use crate::cond::{self, Cond, CondEnd};
 use crate::lock::{self, Lock, LockEnd};
+use crate::merkmap::MerkleMap;
 use crate::nftree::NfTree;
 use crate::note::{self, NoteTree, MAX_NOTE_VALUE};
 use crate::params::{subsidy, Params, MAX_COINBASE_EXTRA, MAX_MEMO};
@@ -55,7 +56,9 @@ pub struct State {
     pub cond_ends: HashMap<[u8; 32], CondEnd>,
     pub locks_by_hash: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// RFC-0022: Open unilateral partial-claim PayWord payment channels (`crate::channel`).
-    pub channels: BTreeMap<[u8; 32], Channel>,
+    pub channels: imbl::OrdMap<[u8; 32], Channel>,
+    /// O(log N) incremental canonical SHA-256 Merkle map committing to open channels.
+    pub channels_merkle: MerkleMap,
     pub channel_ends: HashMap<[u8; 32], ChannelEnd>,
     pub channels_by_tip: HashMap<[u8; 32], Vec<[u8; 32]>>,
 }
@@ -101,7 +104,8 @@ impl State {
             conds: BTreeMap::new(),
             cond_ends: HashMap::new(),
             locks_by_hash: HashMap::new(),
-            channels: BTreeMap::new(),
+            channels: imbl::OrdMap::new(),
+            channels_merkle: MerkleMap::new(),
             channel_ends: HashMap::new(),
             channels_by_tip: HashMap::new(),
         }
@@ -150,15 +154,8 @@ impl State {
             }
             sha256(&cw.0)
         });
-        // RFC-0022 PayWord channels likewise, while any are open
-        let channels = (!self.channels.is_empty()).then(|| {
-            let mut pw = Writer::new();
-            pw.raw(b"nsCHANS");
-            for ch in self.channels.values() {
-                ch.encode(&mut pw);
-            }
-            sha256(&pw.0)
-        });
+        // RFC-0022 PayWord channels: O(1) incremental Merkle root while any are open
+        let channels = (!self.channels.is_empty()).then(|| self.channels_merkle.root());
         DigestParts {
             height: self.height,
             tree_root: self.tree.root(),
@@ -356,6 +353,7 @@ impl State {
                 }
                 for ch in channels_after {
                     self.channels_by_tip.entry(ch.post.tip).or_default().push(ch.id);
+                    self.channels_merkle.insert(ch.id, ch.value_hash());
                     self.channels.insert(ch.id, ch);
                 }
                 let dep_amt = match &sp.deposit {
@@ -401,6 +399,7 @@ impl State {
                 let res = channel::claim(ch, *ticks, token, h)?;
                 self.pay_out_with_fee(&res.payouts, 0, res.miner_fee)?;
                 let ch = self.channels.remove(id).expect("checked above");
+                self.channels_merkle.remove(id);
                 self.channel_ends.insert(
                     *id,
                     ChannelEnd {
@@ -419,6 +418,7 @@ impl State {
                 let res = channel::expire(ch, h)?;
                 self.pay_out_with_fee(&res.payouts, 0, res.miner_fee)?;
                 let ch = self.channels.remove(id).expect("checked above");
+                self.channels_merkle.remove(id);
                 self.channel_ends.insert(
                     *id,
                     ChannelEnd {

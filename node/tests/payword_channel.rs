@@ -329,3 +329,263 @@ fn timeout_refund_and_block_hash_dos_cap_hold() {
     assert_eq!(MAX_BLOCK_CHANNEL_HASHES, 2_000_000);
     assert!(COIN > 0);
 }
+
+#[test]
+fn live_http_channel_rpc_merkle_proof_and_mempool_fee_mining() {
+    use newsatoshi::merkmap::{verify_proof, MerkleProof};
+    use newsatoshi::node::{lock, Node};
+    use newsatoshi::rpc::{self, J};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let http_get = |port: u16, path: &str| -> J {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        J::parse(resp.split("\r\n\r\n").nth(1).unwrap().as_bytes()).unwrap()
+    };
+    let http_post = |port: u16, path: &str, body: &[u8]| -> J {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(
+            format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len())
+                .as_bytes(),
+        )
+        .unwrap();
+        s.write_all(body).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        J::parse(resp.split("\r\n\r\n").nth(1).unwrap().as_bytes()).unwrap()
+    };
+    let mine_template = |shared: &newsatoshi::node::Shared, to: &Wallet| -> u64 {
+        let mut n = lock(shared);
+        let (mut b, value) = n.block_template(to.a_pk(), b"test-template").unwrap();
+        assert!(mine(&mut b.header, u64::MAX));
+        assert!(n.accept_block(b, None).unwrap());
+        value
+    };
+
+    let params = Params::get(Net::Reg).unwrap();
+    let shared = Node::new(Chain::open(params, None).unwrap());
+    lock(&shared).log = false;
+    let port = rpc::serve_public(shared.clone(), "127.0.0.1", 0, None).unwrap();
+
+    let mut buyer = Wallet::generate();
+    let seller = Wallet::generate();
+    let miner = Wallet::generate();
+    for _ in 0..2 {
+        mine_template(&shared, &buyer);
+    }
+
+    let unit_price = 10_000u64;
+    let claim_fee = 5_000u64;
+    let pw = build_payword_chain(sha256(b"http-rpc-live-channel-seed"), 1_000);
+    let tip = *pw.last().unwrap();
+    let post = ChannelPost {
+        tip,
+        max_ticks: 1_000,
+        unit_price,
+        claim_fee,
+        timeout: lock(&shared).chain.height() + 50,
+        seller_addr: seller.a_pk(),
+        refund_addr: buyer.a_pk(),
+    };
+    let (open_tx, _) = {
+        let n = lock(&shared);
+        buyer
+            .spend(&n.chain, None, DEFAULT_FEE, Some(Deposit::Channel(post.clone())), vec![])
+            .unwrap()
+    };
+    let Tx::Spend(sp) = &open_tx else { unreachable!() };
+    let cid = channel_id(&post, &sp.nf[0], 0);
+    let cid_hex = hex::encode(cid);
+    let tip_hex = hex::encode(tip);
+
+    // 1. Submit open tx via live HTTP POST /api/tx
+    let r = http_post(port, "/api/tx", &open_tx.to_bytes());
+    assert_eq!(r.get("ok"), Some(&J::Bool(true)), "open tx rejected: {}", r.to_json());
+
+    // 2. Query GET /api/channel?tip= while unconfirmed in mempool
+    let pending_resp = http_get(port, &format!("/api/channel?tip={tip_hex}"));
+    let Some(J::Arr(arr)) = pending_resp.get("channels") else { panic!("missing channels array") };
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0].get("state"), Some(&J::str("open")));
+    assert_eq!(arr[0].get("confirmed"), Some(&J::Bool(false)));
+
+    // 3. Mine block using Node::block_template (collects spend fee!)
+    let open_height = lock(&shared).chain.height() + 1;
+    let open_cb = mine_template(&shared, &miner);
+    assert_eq!(open_cb, subsidy(open_height) + DEFAULT_FEE);
+
+    // 4. Query GET /api/channel?id= & verify Merkle inclusion proof against GET /api/state!
+    let info = http_get(port, &format!("/api/channel?id={cid_hex}"));
+    assert_eq!(info.get("found"), Some(&J::Bool(true)));
+    assert_eq!(info.get("state"), Some(&J::str("open")));
+    assert_eq!(info.get("confirmed"), Some(&J::Bool(true)));
+    assert_eq!(info.get("max_ticks"), Some(&J::num(1_000)));
+    assert_eq!(info.get("unit_price"), Some(&J::num(unit_price)));
+    assert_eq!(info.get("claim_fee"), Some(&J::num(claim_fee)));
+
+    let state_resp = http_get(port, "/api/state");
+    let committed_root: [u8; 32] = hex::decode(
+        state_resp
+            .get("parts")
+            .unwrap()
+            .get("channels")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let mp = info.get("merkle_proof").expect("confirmed open channel must include merkle_proof");
+    let proof_root: [u8; 32] = hex::decode(mp.get("root").unwrap().as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(proof_root, committed_root);
+    let Some(J::Arr(sibs_j)) = mp.get("siblings") else { panic!() };
+    let siblings: Vec<[u8; 32]> = sibs_j
+        .iter()
+        .map(|s| hex::decode(s.as_str().unwrap()).unwrap().try_into().unwrap())
+        .collect();
+    let proof = MerkleProof {
+        key: hex::decode(mp.get("key").unwrap().as_str().unwrap()).unwrap().try_into().unwrap(),
+        value_hash: hex::decode(mp.get("value_hash").unwrap().as_str().unwrap()).unwrap().try_into().unwrap(),
+        siblings,
+    };
+    assert!(verify_proof(&committed_root, &proof), "RPC Merkle inclusion proof must verify against block state root");
+
+    // 5. Submit 70-byte unilateral ChannelClaim(237) via live HTTP POST /api/tx
+    let claim_tx = Tx::Act(Action::ChannelClaim {
+        channel: cid,
+        ticks: 237,
+        token: pw[1_000 - 237],
+    });
+    let r_claim = http_post(port, "/api/tx", &claim_tx.to_bytes());
+    assert_eq!(r_claim.get("ok"), Some(&J::Bool(true)), "claim tx rejected: {}", r_claim.to_json());
+
+    // 6. Mine via Node::block_template — proves miner coinbase collects pre-funded claim_fee!
+    let claim_height = lock(&shared).chain.height() + 1;
+    let claim_cb = mine_template(&shared, &miner);
+    assert_eq!(
+        claim_cb,
+        subsidy(claim_height) + claim_fee,
+        "block_template must pay pre-funded ChannelClaim miner fee into coinbase"
+    );
+
+    // 7. Query GET /api/channel?id= after settlement: exact 237/763 split confirmed!
+    let closed = http_get(port, &format!("/api/channel?id={cid_hex}"));
+    assert_eq!(closed.get("found"), Some(&J::Bool(true)));
+    assert_eq!(closed.get("state"), Some(&J::str("claimed")));
+    assert_eq!(closed.get("confirmed"), Some(&J::Bool(true)));
+    assert_eq!(closed.get("claimed_ticks"), Some(&J::num(237)));
+    assert_eq!(closed.get("seller_paid"), Some(&J::num(237 * unit_price)));
+    assert_eq!(closed.get("buyer_refunded"), Some(&J::num(763 * unit_price)));
+    assert_eq!(closed.get("miner_fee"), Some(&J::num(claim_fee)));
+}
+
+#[test]
+fn mempool_select_orders_channel_claims_by_fee_and_caps_block_hashes() {
+    use newsatoshi::node::{lock, Node};
+
+    let params = Params::get(Net::Reg).unwrap();
+    let shared = Node::new(Chain::open(params, None).unwrap());
+    lock(&shared).log = false;
+
+    let mut buyer = Wallet::generate();
+    let seller = Wallet::generate();
+    let miner = Wallet::generate();
+    let mine_template = |shared: &newsatoshi::node::Shared, to: &Wallet| {
+        let mut n = lock(shared);
+        let (mut b, _) = n.block_template(to.a_pk(), b"cap-test").unwrap();
+        assert!(mine(&mut b.header, u64::MAX));
+        assert!(n.accept_block(b, None).unwrap());
+    };
+    for _ in 0..2 {
+        mine_template(&shared, &buyer);
+    }
+
+    // Open 3 channels in a single batch: two with 1,000,000 max_ticks and one with 500,000 max_ticks
+    // with distinct claim_fees: low (1_000), high (9_000), mid (4_000).
+    // Submitting all 3 claims totals 2,500,000 ticks > MAX_BLOCK_CHANNEL_HASHES (2,000,000)!
+    let c_low = build_payword_chain(sha256(b"dos-cap-low"), 1_000_000);
+    let c_high = build_payword_chain(sha256(b"dos-cap-high"), 1_000_000);
+    let c_mid = build_payword_chain(sha256(b"dos-cap-mid"), 500_000);
+    let h_now = lock(&shared).chain.height();
+    let posts = vec![
+        ChannelPost {
+            tip: *c_low.last().unwrap(),
+            max_ticks: 1_000_000,
+            unit_price: 1,
+            claim_fee: 1_000,
+            timeout: h_now + 50,
+            seller_addr: seller.a_pk(),
+            refund_addr: buyer.a_pk(),
+        },
+        ChannelPost {
+            tip: *c_high.last().unwrap(),
+            max_ticks: 1_000_000,
+            unit_price: 1,
+            claim_fee: 9_000,
+            timeout: h_now + 50,
+            seller_addr: seller.a_pk(),
+            refund_addr: buyer.a_pk(),
+        },
+        ChannelPost {
+            tip: *c_mid.last().unwrap(),
+            max_ticks: 500_000,
+            unit_price: 1,
+            claim_fee: 4_000,
+            timeout: h_now + 50,
+            seller_addr: seller.a_pk(),
+            refund_addr: buyer.a_pk(),
+        },
+    ];
+    let (batch_tx, _) = {
+        let n = lock(&shared);
+        buyer
+            .spend(&n.chain, None, DEFAULT_FEE, Some(Deposit::ChannelBatch(posts.clone())), vec![])
+            .unwrap()
+    };
+    let Tx::Spend(sp) = &batch_tx else { unreachable!() };
+    let cid_low = channel_id(&posts[0], &sp.nf[0], 0);
+    let cid_high = channel_id(&posts[1], &sp.nf[0], 1);
+    let cid_mid = channel_id(&posts[2], &sp.nf[0], 2);
+    lock(&shared).accept_tx(batch_tx).unwrap();
+    mine_template(&shared, &miner);
+
+    // Submit claims in arrival order: low (1M ticks, fee 1k), high (1M ticks, fee 9k), mid (500k ticks, fee 4k)
+    let tx_low = Tx::Act(Action::ChannelClaim { channel: cid_low, ticks: 1_000_000, token: c_low[0] });
+    let tx_high = Tx::Act(Action::ChannelClaim { channel: cid_high, ticks: 1_000_000, token: c_high[0] });
+    let tx_mid = Tx::Act(Action::ChannelClaim { channel: cid_mid, ticks: 500_000, token: c_mid[0] });
+    {
+        let mut n = lock(&shared);
+        n.accept_tx(tx_low).unwrap();
+        n.accept_tx(tx_high).unwrap();
+        n.accept_tx(tx_mid).unwrap();
+    }
+
+    // select_with_fees() MUST pick high (9k, 1M ticks) + mid (4k, 500k ticks) = 1.5M ticks (fee 13k),
+    // skipping low (1k, 1M ticks) because 1.5M + 1M = 2.5M > MAX_BLOCK_CHANNEL_HASHES (2.0M)!
+    let (selected, total_fees) = lock(&shared).select_with_fees();
+    assert_eq!(selected.len(), 2);
+    assert_eq!(total_fees, 9_000 + 4_000);
+    let selected_ids: Vec<[u8; 32]> = selected
+        .iter()
+        .map(|t| match t {
+            Tx::Act(Action::ChannelClaim { channel, .. }) => *channel,
+            _ => panic!("expected ChannelClaim"),
+        })
+        .collect();
+    assert_eq!(selected_ids, vec![cid_high, cid_mid]);
+
+    // Mining 1 block confirms high + mid cleanly; next block automatically confirms low!
+    mine_template(&shared, &miner);
+    assert_eq!(lock(&shared).chain.state.channels.len(), 1);
+    assert!(lock(&shared).chain.state.channels.contains_key(&cid_low));
+    mine_template(&shared, &miner);
+    assert_eq!(lock(&shared).chain.state.channels.len(), 0);
+}

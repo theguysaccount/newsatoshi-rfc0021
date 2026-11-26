@@ -79,6 +79,9 @@ impl Lock {
         self.post.encode(w);
         w.u32(self.at);
     }
+    pub fn decode(r: &mut Reader) -> Res<Self> {
+        Ok(Lock { id: r.arr()?, post: LockPost::decode(r)?, at: r.u32()? })
+    }
 }
 
 /// A lock's identity: its terms and the first nullifier of the spend that funds it, which

@@ -224,7 +224,14 @@ fn run() -> Result<(), String> {
             let port: u16 = flag(&o.rest, "--port").and_then(|x| x.parse().ok()).unwrap_or(p.default_port);
             std::fs::write(o.dir.join("port"), port.to_string()).map_err(|e| e.to_string())?;
             let chain = open_chain(&o)?;
-            println!("newsatoshi {} on {} — height {} tip {}", env!("CARGO_PKG_VERSION"), p.name, chain.height(), hash_hex(&chain.tip().hash));
+            println!(
+                "newsatoshi {} on {} — height {} tip {}{}",
+                env!("CARGO_PKG_VERSION"),
+                p.name,
+                chain.height(),
+                hash_hex(&chain.tip().hash),
+                if chain.fast_boot { " (verified fast-boot snapshot)" } else { "" }
+            );
             let shared = Node::new(chain);
             {
                 let mut n = node::lock(&shared);
@@ -254,9 +261,17 @@ fn run() -> Result<(), String> {
                 }
             }
             if !named && !o.rest.iter().any(|a| a == "--no-seeds") {
-                for addr in p.seeds {
+                let mut seeds: Vec<String> = p.seeds.iter().map(|s| s.to_string()).collect();
+                if let Ok(extra) = std::env::var("NEWSATOSHI_SEEDS") {
+                    for s in extra.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                        if !seeds.iter().any(|e| e == s) {
+                            seeds.push(s.to_string());
+                        }
+                    }
+                }
+                for addr in seeds {
                     println!("seed {addr}");
-                    node::keep_connected(shared.clone(), addr.to_string());
+                    node::keep_connected(shared.clone(), addr);
                 }
             }
             if let Some(sport) = flag(&o.rest, "--status") {

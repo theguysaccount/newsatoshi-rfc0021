@@ -820,6 +820,104 @@ pub fn locks_for_hash(shared: &Shared, hash: &[u8; 32]) -> J {
     J::Obj(vec![("locks".into(), J::Arr(ids.iter().map(|id| lock_info(shared, id)).collect()))])
 }
 
+fn channel_json(
+    ch: &crate::channel::Channel,
+    state: &str,
+    confirmed: bool,
+    tip_height: u32,
+    end: Option<&crate::channel::ChannelEnd>,
+    merkle_proof: Option<(&crate::merkmap::MerkleProof, [u8; 32])>,
+) -> J {
+    let p = &ch.post;
+    let budget = p.budget().unwrap_or(0);
+    let total_deposit = p.total_deposit().unwrap_or(0);
+    let mut kv = vec![
+        ("id".into(), J::str(hex::encode(ch.id))),
+        ("state".into(), J::str(state)),
+        ("confirmed".into(), J::Bool(confirmed)),
+        ("tip".into(), J::str(hex::encode(p.tip))),
+        ("max_ticks".into(), J::num(p.max_ticks)),
+        ("unit_price".into(), J::num(p.unit_price)),
+        ("claim_fee".into(), J::num(p.claim_fee)),
+        ("budget".into(), J::num(budget)),
+        ("total_deposit".into(), J::num(total_deposit)),
+        ("timeout".into(), J::num(p.timeout)),
+        ("seller".into(), J::str(encode_address(&p.seller_addr))),
+        ("refund".into(), J::str(encode_address(&p.refund_addr))),
+        ("at".into(), J::num(ch.at)),
+        ("confirmations".into(), J::num(if confirmed { (tip_height + 1).saturating_sub(ch.at) } else { 0 })),
+    ];
+    if let Some((proof, root)) = merkle_proof {
+        kv.push((
+            "merkle_proof".into(),
+            J::Obj(vec![
+                ("root".into(), J::str(hex::encode(root))),
+                ("key".into(), J::str(hex::encode(proof.key))),
+                ("value_hash".into(), J::str(hex::encode(proof.value_hash))),
+                (
+                    "siblings".into(),
+                    J::Arr(proof.siblings.iter().map(|s| J::str(hex::encode(s))).collect()),
+                ),
+            ]),
+        ));
+    }
+    if let Some(e) = end {
+        kv.push(("ended_at".into(), J::num(e.height)));
+        kv.push(("claimed_ticks".into(), e.claimed.map(|(t, _)| J::num(t)).unwrap_or(J::Null)));
+        kv.push(("token".into(), e.claimed.map(|(_, tok)| J::str(hex::encode(tok))).unwrap_or(J::Null)));
+        kv.push(("seller_paid".into(), J::num(e.seller_paid)));
+        kv.push(("buyer_refunded".into(), J::num(e.buyer_refunded)));
+        kv.push(("miner_fee".into(), J::num(e.miner_fee)));
+    }
+    J::Obj(kv)
+}
+
+/// One RFC-0022 PayWord channel, by channel id: its terms, settlement state (`open`, `claimed`,
+/// or `expired`), whether that state is confirmed in a block or pending in the mempool, and a
+/// canonical Merkle inclusion proof when open and confirmed.
+pub fn channel_info(shared: &Shared, id: &[u8; 32]) -> J {
+    let n = lock(shared);
+    let tip = n.chain.height();
+    let st = &n.chain.state;
+    let pool = n.pool_state();
+    let base = |found: bool, mut kv: Vec<(String, J)>| {
+        kv.insert(0, ("found".into(), J::Bool(found)));
+        kv.push(("height".into(), J::num(tip)));
+        J::Obj(kv)
+    };
+    let end_state = |e: &crate::channel::ChannelEnd| if e.claimed.is_some() { "claimed" } else { "expired" };
+    let body = if let Some(e) = st.channel_ends.get(id) {
+        Some(channel_json(&e.channel, end_state(e), true, tip, Some(e), None))
+    } else if let Some(e) = pool.channel_ends.get(id) {
+        let made = st.channels.contains_key(id);
+        Some(channel_json(&e.channel, end_state(e), false, tip, Some(e), None).with_made(made))
+    } else if let Some(ch) = st.channels.get(id) {
+        let mp = st.channels_merkle.prove(id).map(|p| (p, st.channels_merkle.root()));
+        Some(channel_json(ch, "open", true, tip, None, mp.as_ref().map(|(p, r)| (p, *r))))
+    } else {
+        pool.channels.get(id).map(|ch| channel_json(ch, "open", false, tip, None, None))
+    };
+    match body {
+        Some(J::Obj(kv)) => base(true, kv),
+        _ => base(false, vec![]),
+    }
+}
+
+/// Every RFC-0022 PayWord channel funded for a PayWord chain tip, newest last.
+pub fn channels_for_tip(shared: &Shared, tip_hash: &[u8; 32]) -> J {
+    let (height, ids): (u32, Vec<[u8; 32]>) = {
+        let n = lock(shared);
+        (
+            n.chain.height(),
+            n.pool_state().channels_by_tip.get(tip_hash).cloned().unwrap_or_default(),
+        )
+    };
+    J::Obj(vec![
+        ("height".into(), J::num(height)),
+        ("channels".into(), J::Arr(ids.iter().map(|id| channel_info(shared, id)).collect())),
+    ])
+}
+
 /// Hand a transaction from outside the peer network to the node: checked (the proof
 /// outside the lock), pooled and announced.
 pub fn submit_tx(shared: &Shared, bytes: &[u8]) -> J {
@@ -1144,6 +1242,15 @@ pub fn serve_public_with(shared: Shared, bind: &str, port: u16, faucet: Option<A
                                     (Some(Ok(w)), _) => (200, lock_info(&sh, &crate::hash::words_to_bytes(&w))),
                                     (None, Some(Ok(w))) => (200, locks_for_hash(&sh, &crate::hash::words_to_bytes(&w))),
                                     _ => (400, err_json("give id= or hash=, 64 hex characters")),
+                                }
+                            }
+                            ("GET", "/api/channel") => {
+                                let id = req.param("id").map(|x| hex_word8(Some(x)));
+                                let tip = req.param("tip").map(|x| hex_word8(Some(x)));
+                                match (id, tip) {
+                                    (Some(Ok(w)), _) => (200, channel_info(&sh, &crate::hash::words_to_bytes(&w))),
+                                    (None, Some(Ok(w))) => (200, channels_for_tip(&sh, &crate::hash::words_to_bytes(&w))),
+                                    _ => (400, err_json("give id= or tip=, 64 hex characters")),
                                 }
                             }
                             ("GET", "/api/cond") => match req.param("id").map(|x| hex::decode(x).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())) {

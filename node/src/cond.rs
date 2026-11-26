@@ -81,6 +81,9 @@ impl Cond {
         self.post.encode(w);
         w.u32(self.at);
     }
+    pub fn decode(r: &mut Reader) -> Res<Self> {
+        Ok(Cond { id: r.arr()?, post: CondPost::decode(r)?, at: r.u32()? })
+    }
 }
 
 /// The commitment to a program: SHA-256 of a domain tag, a 32-byte salt and the program.

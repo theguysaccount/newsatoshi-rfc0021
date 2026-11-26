@@ -118,6 +118,44 @@ impl NfTree {
         }
         NfProof { index: i, value, next, path }
     }
+
+    /// Snapshot export: every `(nullifier, next)` leaf in insertion order (including sentinel leaf 0).
+    pub fn raw_leaves(&self) -> Vec<(Word8, Word8)> {
+        self.leaves.iter().copied().collect()
+    }
+
+    /// Fast O(N) bottom-up reconstruction of an `NfTree` from its raw leaves.
+    pub fn from_raw_leaves(raw: Vec<(Word8, Word8)>) -> Result<Self, String> {
+        if raw.is_empty() || raw[0].0 != ZERO {
+            return Err("invalid nullifier tree sentinel".into());
+        }
+        let empty = empty_roots();
+        let mut leaves = Vector::new();
+        let mut index = BTreeMap::new();
+        let mut level0 = Vector::new();
+        for (i, (v, nxt)) in raw.into_iter().enumerate() {
+            let k = key(&v);
+            if index.insert(k, i as u32).is_some() {
+                return Err("duplicate nullifier in snapshot".into());
+            }
+            leaves.push_back((v, nxt));
+            level0.push_back(node(&v, &nxt));
+        }
+        let mut levels = vec![Vector::new(); DEPTH + 1];
+        levels[0] = level0;
+        for level in 0..DEPTH {
+            let prev = &levels[level];
+            let parents = prev.len().div_ceil(2);
+            let mut next = Vector::new();
+            for p in 0..parents {
+                let left = prev[p * 2];
+                let right = prev.get(p * 2 + 1).copied().unwrap_or(empty[level]);
+                next.push_back(node(&left, &right));
+            }
+            levels[level + 1] = next;
+        }
+        Ok(NfTree { leaves, index, levels, empty })
+    }
 }
 
 /// Check a proof against a root: `Some(true)` if it shows `nf` spent, `Some(false)` if it

@@ -131,6 +131,22 @@ impl Channel {
         self.post.encode(w);
         w.u32(self.at);
     }
+
+    pub fn decode(r: &mut Reader) -> Res<Self> {
+        Ok(Channel {
+            id: r.arr()?,
+            post: ChannelPost::decode(r)?,
+            at: r.u32()?,
+        })
+    }
+
+    /// Domain-separated value hash stored as the leaf payload in `State::channels_merkle`.
+    pub fn value_hash(&self) -> [u8; 32] {
+        let mut w = Writer::new();
+        w.raw(b"nsCHV");
+        self.encode(&mut w);
+        sha256(&w.0)
+    }
 }
 
 /// Deterministic channel identity binding terms, funding spend's first nullifier, and batch slot.

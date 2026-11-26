@@ -560,16 +560,24 @@ impl Node {
     }
 
     /// Admit a transaction whose `precheck` passed: it must apply on top of the tip and
-    /// everything already pooled. When the pool is full, cheaper spends make room; job
-    /// actions (which carry deadlines and no fee) outrank every spend.
+    /// everything already pooled. When the pool is full, cheaper spends make room; actions
+    /// (which carry deadlines) outrank spends, and channel claims/expires carry their
+    /// pre-funded `claim_fee` for fee-rate prioritization and miner coinbase payouts.
     fn admit(&mut self, tx: Tx) -> Result<bool, String> {
         let id = tx.id();
         if self.pool.iter().any(|e| e.id == id) {
             return Ok(false);
         }
         let size = tx.to_bytes().len();
-        let fee = if let Tx::Spend(s) = &tx { s.fee } else { 0 };
-        let new = PoolEntry { tx, id, size, fee, seq: self.seq };
+        let fee = match &tx {
+            Tx::Spend(s) => s.fee,
+            Tx::Act(crate::job::Action::ChannelClaim { channel, .. })
+            | Tx::Act(crate::job::Action::ChannelExpire { channel }) => {
+                self.pool_state.channels.get(channel).map(|c| c.post.claim_fee).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let mut new = PoolEntry { tx, id, size, fee, seq: self.seq };
         let cap = MEMPOOL_BLOCKS * self.chain.params.max_block_bytes;
         let mut victims = vec![];
         let mut room = cap.saturating_sub(self.pool_bytes);
@@ -589,7 +597,8 @@ impl Node {
             }
         }
         let h = self.next_height();
-        self.pool_state.apply_tx(&new.tx, h, &self.chain.params, NO_PROOFS)?;
+        let applied_fee = self.pool_state.apply_tx(&new.tx, h, &self.chain.params, NO_PROOFS)?;
+        new.fee = applied_fee;
         self.seq += 1;
         self.pool_bytes += size;
         self.pool.push(new);
@@ -609,8 +618,9 @@ impl Node {
         let h = self.next_height();
         let old = std::mem::take(&mut self.pool);
         self.pool_bytes = 0;
-        for e in old {
-            if st.apply_tx(&e.tx, h, &self.chain.params, NO_PROOFS).is_ok() {
+        for mut e in old {
+            if let Ok(applied_fee) = st.apply_tx(&e.tx, h, &self.chain.params, NO_PROOFS) {
+                e.fee = applied_fee;
                 self.pool_bytes += e.size;
                 self.pool.push(e);
             }
@@ -618,17 +628,33 @@ impl Node {
         self.pool_state = st;
     }
 
-    /// Transactions for the next block: job actions first, in arrival order (they carry
-    /// deadlines and no fee), then spends by fee rate. Anything that does not apply yet is
-    /// retried after the rest, so an action can follow the deposit it depends on.
+    /// Transactions for the next block: deadline actions first (fee-bearing channel claims
+    /// and expires ordered by fee rate ahead of zero-fee actions, tie-broken by arrival),
+    /// then spends by fee rate. Enforces both block byte budget and `MAX_BLOCK_CHANNEL_HASHES`.
+    /// Anything that does not apply yet is retried after the rest, so an action can follow
+    /// the deposit it depends on.
     pub fn select(&self) -> Vec<Tx> {
+        self.select_with_fees().0
+    }
+
+    /// Like `select()`, also returning the exact sum of consensus fees (including pre-funded
+    /// `ChannelClaim` and `ChannelExpire` miner fees) earned by the selected transactions.
+    pub fn select_with_fees(&self) -> (Vec<Tx>, u64) {
         let h = self.next_height();
         let mut st = self.fresh_pool_state();
         let mut order: Vec<&PoolEntry> = self.pool.iter().collect();
         order.sort_by(|a, b| match (a.is_spend(), b.is_spend()) {
             (false, true) => std::cmp::Ordering::Less,
             (true, false) => std::cmp::Ordering::Greater,
-            (false, false) => a.seq.cmp(&b.seq),
+            (false, false) => {
+                if b.cheaper_than(a) {
+                    std::cmp::Ordering::Less
+                } else if a.cheaper_than(b) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    a.seq.cmp(&b.seq)
+                }
+            }
             (true, true) => {
                 if b.cheaper_than(a) {
                     std::cmp::Ordering::Less
@@ -641,6 +667,8 @@ impl Node {
         });
         let budget = self.chain.params.max_block_bytes.saturating_sub(crate::tx::BLOCK_OVERHEAD + COINBASE_ROOM);
         let mut size = 0;
+        let mut channel_hashes: u64 = 0;
+        let mut total_fees: u64 = 0;
         let mut out = vec![];
         loop {
             let mut progress = false;
@@ -649,8 +677,17 @@ impl Node {
                 if size + 4 + e.size > budget {
                     continue;
                 }
-                if st.apply_tx(&e.tx, h, &self.chain.params, NO_PROOFS).is_ok() {
+                let tx_hashes = match &e.tx {
+                    Tx::Act(crate::job::Action::ChannelClaim { ticks, .. }) => *ticks as u64,
+                    _ => 0,
+                };
+                if channel_hashes.saturating_add(tx_hashes) > crate::channel::MAX_BLOCK_CHANNEL_HASHES {
+                    continue;
+                }
+                if let Ok(tx_fee) = st.apply_tx(&e.tx, h, &self.chain.params, NO_PROOFS) {
                     size += 4 + e.size;
+                    channel_hashes += tx_hashes;
+                    total_fees = total_fees.saturating_add(tx_fee);
                     out.push(e.tx.clone());
                     progress = true;
                 } else {
@@ -658,7 +695,7 @@ impl Node {
                 }
             }
             if !progress || rest.is_empty() {
-                return out;
+                return (out, total_fees);
             }
             order = rest;
         }
@@ -1163,8 +1200,7 @@ impl Node {
     /// A block on the tip paying `a_pk` the subsidy and the fees of the transactions the
     /// pool would put in it. The direct miner and the merged-mining RPC both use it.
     pub fn block_template(&self, a_pk: crate::hash::Word8, extra: &[u8]) -> Result<(Block, u64), String> {
-        let txs = self.select();
-        let fees: u64 = txs.iter().map(|t| if let Tx::Spend(s) = t { s.fee } else { 0 }).sum();
+        let (txs, fees) = self.select_with_fees();
         let value = subsidy(self.chain.height() + 1) + fees;
         let out = PlainOut { a_pk, v: value, rho: rand::thread_rng().gen() };
         Ok((self.chain.template(vec![out], txs, extra.to_vec())?, value))
