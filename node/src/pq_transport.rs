@@ -309,6 +309,51 @@ impl PqSession {
         let tag: [u8; TAG_BYTES] = raw[4 + n..].try_into().unwrap();
         self.recv.open_frame(ct, &tag)
     }
+
+    /// Split an established `NSPQ1` session into independent send/receive halves so full-duplex
+    /// P2P writer and reader threads can encrypt/decrypt concurrently without mutex contention.
+    pub fn split(self) -> (PqSender, PqReceiver) {
+        (
+            PqSender { send: self.send },
+            PqReceiver { recv: self.recv },
+        )
+    }
+}
+
+/// Outbound half of an established `NSPQ1` ML-KEM-768 P2P transport session.
+pub struct PqSender {
+    send: CipherHalf,
+}
+
+impl PqSender {
+    pub fn write_frame<W: Write>(&mut self, w: &mut W, plaintext: &[u8]) -> Result<(), String> {
+        let frame = self.send.seal_frame(plaintext)?;
+        w.write_all(&frame).map_err(|e| format!("PQ write frame: {e}"))
+    }
+}
+
+/// Inbound half of an established `NSPQ1` ML-KEM-768 P2P transport session.
+pub struct PqReceiver {
+    recv: CipherHalf,
+}
+
+impl PqReceiver {
+    pub fn read_frame<R: Read>(&mut self, r: &mut R, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let mut len_buf = [0u8; 4];
+        r.read_exact(&mut len_buf)
+            .map_err(|e| format!("PQ read len: {e}"))?;
+        let n = u32::from_le_bytes(len_buf) as usize;
+        if n > max_bytes.min(MAX_ENCRYPTED_FRAME_BYTES) {
+            return Err("PQ encrypted frame too large".into());
+        }
+        let mut ct = vec![0u8; n];
+        r.read_exact(&mut ct)
+            .map_err(|e| format!("PQ read ct: {e}"))?;
+        let mut tag = [0u8; TAG_BYTES];
+        r.read_exact(&mut tag)
+            .map_err(|e| format!("PQ read tag: {e}"))?;
+        self.recv.open_frame(&ct, &tag)
+    }
 }
 
 #[cfg(test)]

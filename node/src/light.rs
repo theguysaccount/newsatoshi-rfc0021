@@ -295,6 +295,53 @@ impl HeaderMmr {
         bag_mmr_peaks(&self.peaks())
     }
 
+    pub fn root(&self) -> [u8; 32] {
+        self.root_and_work().0
+    }
+
+    /// Encode the MMR leaf nodes for persistent `state.snap` fast-boot storage.
+    pub fn encode(&self, w: &mut Writer) {
+        let leaves = self.levels.first().map(|v| v.as_slice()).unwrap_or(&[]);
+        w.u32(leaves.len() as u32);
+        for leaf in leaves {
+            let mut work = [0u8; 32];
+            leaf.work.to_big_endian(&mut work);
+            w.raw(&leaf.hash).raw(&work);
+        }
+    }
+
+    /// Reconstruct the complete binary MMR tree from persisted leaf `(hash, work)` entries.
+    pub fn decode(r: &mut Reader) -> Res<HeaderMmr> {
+        let n = r.u32()? as usize;
+        if n > 10_000_000 {
+            return Err("too many HeaderMmr leaves in snapshot".into());
+        }
+        let mut mmr = HeaderMmr::new();
+        if n == 0 {
+            return Ok(mmr);
+        }
+        mmr.levels.push(Vec::with_capacity(n.min(4096)));
+        for _ in 0..n {
+            let hash = r.arr::<32>()?;
+            let work = U256::from_big_endian(&r.arr::<32>()?);
+            mmr.levels[0].push(MmrNode { hash, work, height: 0 });
+            let mut lvl = 0usize;
+            while mmr.levels[lvl].len() >= 2 && mmr.levels[lvl].len() % 2 == 0 {
+                let len = mmr.levels[lvl].len();
+                let left = mmr.levels[lvl][len - 2].clone();
+                let right = mmr.levels[lvl][len - 1].clone();
+                let (parent, _) = mmr_parent_hash(&left, &right);
+                if mmr.levels.len() <= lvl + 1 {
+                    mmr.levels.push(Vec::new());
+                }
+                mmr.levels[lvl + 1].push(parent);
+                lvl += 1;
+            }
+            mmr.leaf_count += 1;
+        }
+        Ok(mmr)
+    }
+
     /// Build an $O(\log N)$ Merkle inclusion proof for leaf height `leaf_idx` up to its MMR peak.
     pub fn prove_leaf(&self, leaf_idx: u32) -> Result<MmrLeafProof, String> {
         if leaf_idx >= self.leaf_count {

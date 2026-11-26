@@ -62,13 +62,44 @@ usage: newsatoshi [--net regtest|testnet|rehearsal] [--datadir DIR] <command>
 struct Opts {
     net: Net,
     dir: PathBuf,
+    genesis_v2: Option<Params>,
     rest: Vec<String>,
+}
+
+fn load_genesis_v2_params(path: &str) -> Result<Params, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let extract = |key: &str| -> Result<String, String> {
+        let pat = format!("\"{key}\":");
+        let pos = text.find(&pat).ok_or_else(|| format!("{path}: missing field {key}"))?;
+        let rest = text[pos + pat.len()..].trim_start();
+        if let Some(after) = rest.strip_prefix('"') {
+            let end = after.find('"').ok_or_else(|| format!("{path}: unterminated {key}"))?;
+            Ok(after[..end].to_string())
+        } else {
+            let end = rest.find([',', '\n', '}', ' ']).unwrap_or(rest.len());
+            Ok(rest[..end].trim().to_string())
+        }
+    };
+    let msg = extract("genesis_message")?;
+    if msg.len() > newsatoshi::params::MAX_COINBASE_EXTRA {
+        return Err("genesis_message exceeds MAX_COINBASE_EXTRA".into());
+    }
+    let time: u32 = extract("genesis_time")?.parse().map_err(|_| "bad genesis_time")?;
+    let bits_str = extract("genesis_bits")?;
+    let bits: u32 = u32::from_str_radix(bits_str.trim_start_matches("0x"), 16)
+        .map_err(|_| "bad hex genesis_bits")?;
+    let nonce: u32 = extract("genesis_nonce")?.parse().map_err(|_| "bad genesis_nonce")?;
+    let msg_static: &'static str = Box::leak(msg.into_boxed_str());
+    let mut p = Params::main_v2_with(time, nonce, bits);
+    p.genesis_message = msg_static;
+    Ok(p)
 }
 
 fn opts() -> Result<Opts, String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut net = Net::Reg;
     let mut dir = None;
+    let mut genesis_v2 = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -80,26 +111,35 @@ fn opts() -> Result<Opts, String> {
                 dir = Some(PathBuf::from(&args[i + 1]));
                 args.drain(i..i + 2);
             }
+            "--genesis-v2" => {
+                genesis_v2 = Some(load_genesis_v2_params(&args[i + 1])?);
+                net = Net::Main;
+                args.drain(i..i + 2);
+            }
             _ => i += 1,
         }
     }
     // every command needs a network that exists, except the one that mines the main
     // network's genesis block
-    let name = match Params::get(net) {
-        Ok(p) => p.name,
-        Err(_)
-            if net == Net::Main
-                && args
-                    .first()
-                    .map(|a| a == "genesis" || a == "genesis-v2")
-                    .unwrap_or(false) =>
-        {
-            "mainnet"
+    let name = if let Some(ref p) = genesis_v2 {
+        p.name
+    } else {
+        match Params::get(net) {
+            Ok(p) => p.name,
+            Err(_)
+                if net == Net::Main
+                    && args
+                        .first()
+                        .map(|a| a == "genesis" || a == "genesis-v2")
+                        .unwrap_or(false) =>
+            {
+                "mainnet"
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     };
     let dir = dir.unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or(".".into())).join(".newsatoshi").join(name));
-    Ok(Opts { net, dir, rest: args })
+    Ok(Opts { net, dir, genesis_v2, rest: args })
 }
 
 fn flag(rest: &[String], name: &str) -> Option<String> {
@@ -194,8 +234,15 @@ fn parse_job(s: &str) -> Result<[u8; 32], String> {
     hex::decode(s).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| "job id must be 64 hex characters".into())
 }
 
+fn active_params(o: &Opts) -> Result<Params, String> {
+    match &o.genesis_v2 {
+        Some(p) => Ok(p.clone()),
+        None => Params::get(o.net),
+    }
+}
+
 fn open_chain(o: &Opts) -> Result<Chain, String> {
-    Chain::open(Params::get(o.net)?, Some(&o.dir))
+    Chain::open(active_params(o)?, Some(&o.dir))
 }
 
 /// The wallet, with any payments delivered to it since it last looked.
@@ -209,9 +256,9 @@ fn synced(path: &std::path::Path, c: &Chain) -> Result<Wallet, String> {
 }
 
 fn submit(o: &Opts, tx: &Tx) -> Result<(), String> {
-    let p = Params::get(o.net)?;
+    let p = active_params(o)?;
     let port = std::fs::read_to_string(o.dir.join("port")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(p.default_port);
-    node::submit(&format!("127.0.0.1:{port}"), p.magic, tx)?;
+    node::submit_with_pq(&format!("127.0.0.1:{port}"), p.magic, tx, p.pq_transport)?;
     println!("submitted {}", hash_hex(&tx.id()));
     Ok(())
 }
@@ -228,7 +275,7 @@ fn run() -> Result<(), String> {
     let wallet_path = o.dir.join("wallet.dat");
     match cmd.as_slice() {
         ["node", ..] => {
-            let p = Params::get(o.net)?;
+            let p = active_params(&o)?;
             let port: u16 = flag(&o.rest, "--port").and_then(|x| x.parse().ok()).unwrap_or(p.default_port);
             std::fs::write(o.dir.join("port"), port.to_string()).map_err(|e| e.to_string())?;
             let chain = open_chain(&o)?;
@@ -626,8 +673,9 @@ fn run() -> Result<(), String> {
             } else {
                 None
             };
-            println!(
-                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_security_profile\": \"MAIN_V2_384_BIT_PURE_SHA2\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"rfc_activation_height\": 0,\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
+            let json_out = format!(
+                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"magic\": \"nsM2\",\n  \"default_port\": {},\n  \"pq_transport\": true,\n  \"flyclient_mmr_from\": 0,\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_security_profile\": \"MAIN_V2_384_BIT_PURE_SHA2\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"rfc_activation_height\": 0,\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
+                p.default_port,
                 p.launch_blocks,
                 p.launch_half_life,
                 p.half_life,
@@ -642,6 +690,10 @@ fn run() -> Result<(), String> {
                 mined_ms.map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
                 fp
             );
+            if let Some(out_path) = flag(&o.rest, "--out") {
+                std::fs::write(&out_path, &json_out).map_err(|e| format!("{out_path}: {e}"))?;
+            }
+            println!("{json_out}");
         }
         ["demo"] => demo()?,
         _ => {

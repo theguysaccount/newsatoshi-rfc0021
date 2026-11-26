@@ -80,6 +80,7 @@ fn committed(port: u16, lc: &HeaderTip, tamper: bool) -> Result<Word8, String> {
         bonds: p.get("bonds").map(|l| h32(l.as_str().unwrap())),
         rollups: p.get("rollups").map(|l| h32(l.as_str().unwrap())),
         missions: p.get("missions").map(|l| h32(l.as_str().unwrap())),
+        header_mmr: p.get("header_mmr").map(|l| h32(l.as_str().unwrap())),
     };
     if tamper {
         parts.issued += 1;

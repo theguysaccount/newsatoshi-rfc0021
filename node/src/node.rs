@@ -448,8 +448,43 @@ impl Msg {
             buf.extend_from_slice(&chunk[..got]);
         }
         s.set_read_timeout(None).ok();
-        let mut r = Reader::new(&buf);
-        let m = match h[4] {
+        Self::decode_payload(h[4], &buf, max_block)
+    }
+
+    /// Read one message from an `NSPQ1` post-quantum ML-KEM-768 encrypted stream.
+    pub fn read_asked_pq(
+        s: &mut TcpStream,
+        pq_rx: &mut crate::pq_transport::PqReceiver,
+        magic: [u8; 4],
+        max_block: usize,
+        wait: Option<Duration>,
+        blocks: bool,
+        headers: bool,
+    ) -> Result<Msg, String> {
+        s.set_read_timeout(wait).ok();
+        let cap = (Self::cap(2, max_block) + 9).min(crate::pq_transport::MAX_ENCRYPTED_FRAME_BYTES);
+        let raw = pq_rx.read_frame(s, cap)?;
+        s.set_read_timeout(None).ok();
+        if raw.len() < 9 {
+            return Err("truncated PQ P2P frame".into());
+        }
+        if raw[..4] != magic {
+            return Err("wrong network".into());
+        }
+        let kind = raw[4];
+        if (kind == 2 && !blocks) || (kind == 9 && !headers) {
+            return Err("an answer nobody asked for".into());
+        }
+        let n = u32::from_le_bytes(raw[5..9].try_into().unwrap()) as usize;
+        if n > Self::cap(kind, max_block) || raw.len() != 9 + n {
+            return Err("frame too large".into());
+        }
+        Self::decode_payload(kind, &raw[9..], max_block)
+    }
+
+    fn decode_payload(kind: u8, buf: &[u8], max_block: usize) -> Result<Msg, String> {
+        let mut r = Reader::new(buf);
+        let m = match kind {
             0 => Msg::Hello { height: r.u32()?, tip: r.arr()? },
             1 => {
                 let k = r.u32()? as usize;
@@ -1034,6 +1069,31 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
         let n = lock(&shared);
         (n.magic(), n.chain.params.max_block_bytes, n.chain.params.clone())
     };
+    // Post-Quantum `NSPQ1` ML-KEM-768 P2P transport negotiation:
+    // - When `params.pq_transport` is true (Mainnet v2): mandatory NIST FIPS 203 ML-KEM-768
+    //   `NSPQ1` handshake on every link (outbound initiates, inbound responds; plaintext rejected).
+    // - When `params.pq_transport` is false (v0.1.0 compatibility): immediate plaintext framing.
+    let (mut pq_tx, mut pq_rx) = if params.pq_transport {
+        let hs_timeout = Duration::from_millis(HANDSHAKE_MS.load(Ordering::SeqCst));
+        s.set_read_timeout(Some(hs_timeout)).ok();
+        s.set_write_timeout(Some(hs_timeout)).ok();
+        let res = if !inbound {
+            crate::pq_transport::PqSession::handshake_initiator(&mut s, magic)
+        } else {
+            crate::pq_transport::PqSession::handshake_responder(&mut s, magic)
+        };
+        s.set_read_timeout(None).ok();
+        s.set_write_timeout(None).ok();
+        match res {
+            Ok(sess) => {
+                let (tx_h, rx_h) = sess.split();
+                (Some(tx_h), Some(rx_h))
+            }
+            Err(_) => return,
+        }
+    } else {
+        (None, None)
+    };
     let (tx, rx) = sync_channel::<Arc<Vec<u8>>>(PEER_QUEUE);
     let Ok(mut w) = s.try_clone() else {
         return;
@@ -1045,7 +1105,12 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
     thread::spawn(move || {
         let mut alive = true;
         for m in rx {
-            if alive && w.write_all(&m).is_err() {
+            let send_err = if let Some(ref mut pq) = pq_tx {
+                alive && pq.write_frame(&mut w, &m).is_err()
+            } else {
+                alive && w.write_all(&m).is_err()
+            };
+            if send_err {
                 alive = false;
                 let _ = w.shutdown(Shutdown::Both);
             }
@@ -1093,7 +1158,11 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
             }
             left
         };
-        let m = match Msg::read_asked(&mut s, magic, max_block, Some(wait), asked_blocks, asked_headers) {
+        let m = match if let Some(ref mut rx_pq) = pq_rx {
+            Msg::read_asked_pq(&mut s, rx_pq, magic, max_block, Some(wait), asked_blocks, asked_headers)
+        } else {
+            Msg::read_asked(&mut s, magic, max_block, Some(wait), asked_blocks, asked_headers)
+        } {
             Ok(m) => m,
             Err(_) => break,
         };
@@ -1494,8 +1563,19 @@ pub fn keepalive(shared: Shared) {
 
 /// Send one transaction to a node and return.
 pub fn submit(addr: &str, magic: [u8; 4], tx: &Tx) -> Result<(), String> {
+    submit_with_pq(addr, magic, tx, false)
+}
+
+/// Send one transaction to a node (using `NSPQ1` ML-KEM-768 transport when `pq` is true).
+pub fn submit_with_pq(addr: &str, magic: [u8; 4], tx: &Tx, pq: bool) -> Result<(), String> {
     let mut s = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
-    s.write_all(&Msg::Tx(tx.clone()).encode(magic)).map_err(|e| e.to_string())?;
+    let frame = Msg::Tx(tx.clone()).encode(magic);
+    if pq {
+        let mut sess = crate::pq_transport::PqSession::handshake_initiator(&mut s, magic)?;
+        sess.write_frame(&mut s, &frame)?;
+    } else {
+        s.write_all(&frame).map_err(|e| e.to_string())?;
+    }
     thread::sleep(Duration::from_millis(200));
     Ok(())
 }

@@ -33,6 +33,9 @@ pub const DEFAULT_FEE: u64 = 300_000;
 /// The wallet's default fee on the main network, whose payments are about 460 KB: covers a
 /// spend up to 600 KB at the minimum rate.
 pub const MAIN_DEFAULT_FEE: u64 = 600_000;
+/// The wallet's default fee on Mainnet v2, whose 384-bit SHA-384 FRI proofs are ~570–640 KB
+/// with encrypted memos: covers a spend up to 800 KB at `MIN_RELAY_FEE_PER_KB`.
+pub const MAIN_V2_DEFAULT_FEE: u64 = 800_000;
 
 /// Base units as coins, for people: "50", "1.5", "0.0025".
 pub fn fmt_coins(v: u64) -> String {
@@ -116,6 +119,12 @@ pub struct Params {
     /// Height from which RFC-0027 (Mission Launchpads & Agent Swarm Pools) is active
     /// (`None` preserves v0.1.0 rejection).
     pub rfc0027_from: Option<u32>,
+    /// Height from which blocks commit to the ancestor FlyClient Header MMR root
+    /// (`DigestParts::header_mmr`, Zcash ZIP-221 style). `Some(0)` on Mainnet v2; `None` on v0.1.0.
+    pub mmr_from: Option<u32>,
+    /// Require post-quantum `NSPQ1` (NIST FIPS 203 ML-KEM-768 + SHA-256 AEAD) P2P encryption
+    /// on all peer links (`true` on Mainnet v2; `false` preserves v0.1.0 plaintext peers).
+    pub pq_transport: bool,
     /// Nodes to reach when none is named with `--peer`. Any node can be one; these are
     /// only where a new node first looks.
     pub seeds: &'static [&'static str],
@@ -165,6 +174,8 @@ impl Params {
                 rfc0023_from: None,
                 rfc0024_from: None,
                 rfc0027_from: None,
+                mmr_from: None,
+                pq_transport: false,
                 seeds: &["newsatoshi-seed.fly.dev:18444"],
             }),
             Net::Reg => Ok(Params {
@@ -194,6 +205,8 @@ impl Params {
                 rfc0023_from: Some(0),
                 rfc0024_from: Some(0),
                 rfc0027_from: Some(0),
+                mmr_from: None,
+                pq_transport: false,
                 seeds: &[],
             }),
             // The main network's rules, with what makes it a rehearsal: its own name (in
@@ -214,6 +227,8 @@ impl Params {
                 rfc0023_from: Some(0),
                 rfc0024_from: Some(0),
                 rfc0027_from: Some(0),
+                mmr_from: None,
+                pq_transport: false,
                 seeds: &[],
                 ..Self::main_with(0, 0)
             }),
@@ -251,17 +266,23 @@ impl Params {
             rfc0023_from: None,
             rfc0024_from: None,
             rfc0027_from: None,
+            mmr_from: None,
+            pq_transport: false,
             seeds: &["newsatoshi-seed.fly.dev:8444"],
         }
     }
 
-    /// Audited Mainnet v2 launch rules: anti-instamine Day-1 ASERT ramp (1-hour half-life for
-    /// the first 2,016 blocks → 48-hour steady state), 384-bit pure-SHA-2 FRI (`spend::MAIN_V2`),
-    /// RFC-0021 (128-bit proven covenants), RFC-0022 (seller-signed 64× batched PayWord channels),
-    /// RFC-0023 (sovereign L2 rollup vaults + permissionless on-chain L2 zkVM STARKs),
-    /// RFC-0024 (universal trust bonds), and RFC-0027 (mission launchpads) active from genesis.
+    /// Audited Mainnet v2 launch rules: isolated network magic (`nsM2`), anti-instamine Day-1
+    /// ASERT ramp (1-hour half-life for the first 2,016 blocks → 48-hour steady state), 384-bit
+    /// pure-SHA-384 FRI (`spend::MAIN_V2`), consensus-committed FlyClient Header MMR (`mmr_from: Some(0)`),
+    /// mandatory post-quantum ML-KEM-768 P2P transport (`pq_transport: true`), RFC-0021..0027
+    /// active from Genesis #0.
     pub fn main_v2_with(genesis_time: u32, genesis_nonce: u32, genesis_bits: u32) -> Params {
         Params {
+            name: "mainnet-v2",
+            magic: *b"nsM2",
+            default_port: 8_445,
+            default_fee: MAIN_V2_DEFAULT_FEE,
             genesis_bits,
             launch_blocks: 2_016,
             launch_half_life: 3_600,
@@ -272,6 +293,8 @@ impl Params {
             rfc0023_from: Some(0),
             rfc0024_from: Some(0),
             rfc0027_from: Some(0),
+            mmr_from: Some(0),
+            pq_transport: true,
             ..Self::main_with(genesis_time, genesis_nonce)
         }
     }

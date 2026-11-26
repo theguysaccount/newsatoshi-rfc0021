@@ -35,7 +35,7 @@ use std::path::Path;
 
 pub const SNAPSHOT_FILE: &str = "state.snap";
 pub const SNAPSHOT_INTERVAL: u32 = 50;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP03";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP04";
 const MAX_SNAPSHOT_ITEMS: usize = 10_000_000;
 
 /// Metadata for one active block (heights `1..=tip`) stored inside `blocks.dat`.
@@ -224,6 +224,18 @@ fn encode_state(st: &State, w: &mut Writer) {
     for m in st.missions.values() {
         m.encode(w);
     }
+
+    // FlyClient consensus Header MMR commitment + last_header
+    w.bool(st.mmr_committed);
+    match &st.last_header {
+        Some(hd) => {
+            w.bool(true).raw(&hd.bytes());
+        }
+        None => {
+            w.bool(false);
+        }
+    }
+    st.header_mmr.encode(w);
 }
 
 fn decode_state(r: &mut Reader) -> Res<State> {
@@ -423,6 +435,15 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         missions.insert(m.id, m);
     }
 
+    // FlyClient consensus Header MMR + last_header
+    let mmr_committed = r.bool()?;
+    let last_header = if r.bool()? {
+        Some(crate::tx::Header::from_bytes(&r.arr::<80>()?))
+    } else {
+        None
+    };
+    let header_mmr = crate::light::HeaderMmr::decode(r)?;
+
     Ok(State {
         height,
         tree,
@@ -453,6 +474,9 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         rollups_merkle,
         missions,
         missions_merkle,
+        mmr_committed,
+        header_mmr,
+        last_header,
     })
 }
 

@@ -1281,6 +1281,9 @@ pub fn state_commitment(shared: &Shared) -> J {
     if let Some(m) = &p.missions {
         parts.push(("missions".into(), h32(m)));
     }
+    if let Some(f) = &p.header_mmr {
+        parts.push(("header_mmr".into(), h32(f)));
+    }
     J::Obj(vec![
         ("ok".into(), J::Bool(true)),
         ("height".into(), J::num(p.height as u64)),

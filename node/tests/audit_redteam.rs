@@ -646,18 +646,39 @@ fn redteam_flyclient_mmr_and_trustless_light_client_proofs() {
 #[test]
 fn redteam_mainnet_v2_sha384_end_to_end_chain_spend() {
     use newsatoshi::chain::{mine, Chain};
-    use newsatoshi::params::{subsidy, Params, MAIN_DEFAULT_FEE};
-    use newsatoshi::tx::PlainOut;
+    use newsatoshi::node::{self, lock, Msg, Node};
+    use newsatoshi::params::{subsidy, Params, MAIN_V2_DEFAULT_FEE};
+    use newsatoshi::tx::{Block, PlainOut, Tx};
     use newsatoshi::wallet::Wallet;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
 
-    // Boot a live Mainnet v2 chain (384-bit SHA-384 FRI, Day-1 ASERT ramp, all RFCs active at 0)
-    // using regtest-level mining target & maturity=1 so full-chain SHA-384 proving runs in ~2s!
+    // Boot a live Mainnet v2 chain (nsM2 magic, 384-bit SHA-384 FRI, Day-1 ASERT ramp,
+    // consensus-committed FlyClient Header MMR, mandatory ML-KEM-768 NSPQ1 P2P, RFC-0021..0027)
+    // using regtest-level mining target & maturity=1 so full-chain proving + P2P sync runs in ~3s!
     let mut p = Params::main_v2_with(1_762_473_600, u32::MAX, 0x207fffff);
+    assert_eq!(p.magic, *b"nsM2");
+    assert_eq!(p.default_port, 8_445);
+    assert_eq!(p.default_fee, MAIN_V2_DEFAULT_FEE);
+    assert_eq!(p.mmr_from, Some(0));
+    assert!(p.pq_transport);
+    assert!(p.proof.sha384, "MAIN_V2 profile must enable 384-bit SHA-384 FRI");
     p.pow_limit = 0x207fffff;
     p.coinbase_maturity = 1;
-    assert!(p.proof.sha384, "MAIN_V2 profile must enable 384-bit SHA-384 FRI");
 
-    let mut chain = Chain::open(p, None).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "ns-v2-e2e-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut chain = Chain::open(p.clone(), Some(&dir)).unwrap();
+    // Genesis commits to empty FlyClient MMR root
+    assert!(chain.state.digest_parts().header_mmr.is_some());
+    assert_eq!(chain.state.header_mmr.leaf_count, 0);
+
     let mut alice = Wallet::generate();
     let bob = Wallet::generate();
 
@@ -668,16 +689,76 @@ fn redteam_mainnet_v2_sha384_end_to_end_chain_spend() {
         assert!(mine(&mut b.header, u64::MAX));
         chain.add_block(b).unwrap();
     }
+    assert_eq!(chain.state.header_mmr.leaf_count, 2);
 
     // Wallet::spend automatically dispatches SpendProver384 via prove_for(&params.proof, ...)
     let (tx, note_str) = alice
-        .spend(&chain, Some((bob.a_pk(), 5 * COIN)), MAIN_DEFAULT_FEE, None, vec![])
+        .spend(&chain, Some((bob.a_pk(), 5 * COIN)), MAIN_V2_DEFAULT_FEE, None, vec![])
         .unwrap();
     assert!(note_str.is_some());
-    let out3 = PlainOut { a_pk: bob.a_pk(), v: subsidy(3) + MAIN_DEFAULT_FEE, rho: [33; 5] };
-    let mut b3 = chain.template(vec![out3], vec![tx], vec![]).unwrap();
+
+    // CRITICAL WIRE TEST: Mainnet v2 SHA-384 spend (~570 KB > old 520 KB cap!) MUST round-trip
+    // cleanly through Tx::from_bytes & Block::decode!
+    let tx_bytes = tx.to_bytes();
+    assert!(tx_bytes.len() > 520_000, "expected SHA-384 spend > 520 KB, got {}", tx_bytes.len());
+    let tx_decoded = Tx::from_bytes(&tx_bytes).expect("MAIN_V2 SHA-384 tx must decode cleanly");
+    assert_eq!(tx_decoded, tx);
+
+    let out3 = PlainOut { a_pk: bob.a_pk(), v: subsidy(3) + MAIN_V2_DEFAULT_FEE, rho: [33; 5] };
+    let mut b3 = chain.template(vec![out3], vec![tx_decoded], vec![]).unwrap();
     assert!(mine(&mut b3.header, u64::MAX));
-    // Chain::add_block verifies the 384-bit SHA-384 FRI spend proof natively in consensus!
-    chain.add_block(b3).unwrap();
+    let b3_decoded = Block::decode(&b3.encode()).expect("MAIN_V2 SHA-384 block must decode cleanly");
+    assert_eq!(b3_decoded, b3);
+
+    // Chain::add_block verifies the 384-bit SHA-384 FRI spend proof AND commits ancestor MMR!
+    chain.add_block(b3_decoded).unwrap();
     assert_eq!(chain.height(), 3);
+    assert_eq!(chain.state.header_mmr.leaf_count, 3);
+    let committed_mmr = chain.state.digest_parts().header_mmr.unwrap();
+    assert_eq!(committed_mmr, chain.state.header_mmr.root());
+    assert_ne!(committed_mmr, [0u8; 32]);
+
+    // Verify fast-boot nsSNAP04 snapshot preserves consensus HeaderMmr + exact tip digest!
+    chain.save_snapshot().unwrap();
+    let tip_hash = chain.tip().hash;
+    let tip_digest = chain.state.digest();
+    drop(chain);
+    let reopened = Chain::open(p.clone(), Some(&dir)).unwrap();
+    assert!(reopened.fast_boot, "MAIN_V2 nsSNAP04 snapshot must fast-boot cleanly");
+    assert_eq!(reopened.tip().hash, tip_hash);
+    assert_eq!(reopened.state.digest(), tip_digest);
+    assert_eq!(reopened.state.header_mmr.leaf_count, 3);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // LIVE POST-QUANTUM NSPQ1 P2P SYNC TEST:
+    // Node A holds the height-3 SHA-384 chain; Node B starts at genesis and syncs over mandatory
+    // ML-KEM-768 NSPQ1 encryption! Meanwhile a plaintext downgrade probe MUST be rejected.
+    let port_a = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let node_a = Node::new(reopened);
+    lock(&node_a).log = false;
+    node::listen(node_a.clone(), port_a).unwrap();
+
+    // Plaintext downgrade attack against Mainnet v2 listener MUST fail immediately
+    let mut probe = TcpStream::connect(("127.0.0.1", port_a)).unwrap();
+    probe.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let _ = probe.write_all(&Msg::Hello { height: 0, tip: [0u8; 32] }.encode(p.magic));
+    assert!(
+        Msg::read(&mut probe, p.magic, p.max_block_bytes).is_err(),
+        "Mainnet v2 listener MUST reject plaintext downgrade probes"
+    );
+
+    // Honest Mainnet v2 peer B dials A over ML-KEM-768 NSPQ1 and syncs all 3 blocks (incl. SHA-384 spend)!
+    let node_b = Node::new(Chain::open(p.clone(), None).unwrap());
+    lock(&node_b).log = false;
+    node::keep_connected(node_b.clone(), format!("127.0.0.1:{port_a}"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while lock(&node_b).chain.height() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "Node B failed to sync height-3 SHA-384 chain over live NSPQ1 ML-KEM-768 P2P"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(lock(&node_b).chain.tip().hash, tip_hash);
+    assert_eq!(lock(&node_b).chain.state.header_mmr.root(), committed_mmr);
 }

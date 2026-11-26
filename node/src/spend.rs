@@ -1017,7 +1017,7 @@ pub const MAX_PROOF_BYTES: usize = 300_000;
 
 /// Largest proof any network accepts: what a decoder will read. Each network's own limit
 /// (`Profile::max_proof_bytes`) is enforced when a payment is checked.
-pub const PROOF_BYTES_CAP: usize = MAIN_MAX_PROOF_BYTES;
+pub const PROOF_BYTES_CAP: usize = MAIN_V2_MAX_PROOF_BYTES;
 
 /// |value_balance| must stay below this. Inputs are below 2^61 in total, so nothing larger
 /// can balance, and the bound keeps the signed encoding into the field one-to-one.

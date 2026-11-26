@@ -73,6 +73,14 @@ pub struct State {
     /// RFC-0027: Mission Launchpads & Decentralized Agent Swarm Pools + canonical Merkle map.
     pub missions: imbl::OrdMap<[u8; 32], MissionPool>,
     pub missions_merkle: MerkleMap,
+    /// Whether this state's digest commits to the ancestor FlyClient Header MMR root
+    /// (`Params::mmr_from`, `Some(0)` on Mainnet v2).
+    pub mmr_committed: bool,
+    /// Consensus FlyClient Header MMR over ancestor block headers `[0..height-1]`.
+    pub header_mmr: crate::light::HeaderMmr,
+    /// Last applied block header (pushed into `header_mmr` when applying `height + 1`).
+    /// Derived continuity field; not directly part of `digest()`.
+    pub last_header: Option<crate::tx::Header>,
 }
 
 #[derive(Clone, Copy)]
@@ -126,6 +134,9 @@ impl State {
             rollups_merkle: MerkleMap::new(),
             missions: imbl::OrdMap::new(),
             missions_merkle: MerkleMap::new(),
+            mmr_committed: false,
+            header_mmr: crate::light::HeaderMmr::new(),
+            last_header: None,
         }
     }
 
@@ -180,6 +191,8 @@ impl State {
         let rollups = (!self.rollups.is_empty()).then(|| self.rollups_merkle.root());
         // RFC-0027 Mission Launchpads: O(1) incremental Merkle root while any exist
         let missions = (!self.missions.is_empty()).then(|| self.missions_merkle.root());
+        // FlyClient Header MMR root over ancestor headers [0..height-1] (Mainnet v2 from Genesis #0)
+        let header_mmr = self.mmr_committed.then(|| self.header_mmr.root());
         DigestParts {
             height: self.height,
             tree_root: self.tree.root(),
@@ -196,6 +209,7 @@ impl State {
             bonds,
             rollups,
             missions,
+            header_mmr,
         }
     }
 
@@ -891,6 +905,13 @@ impl State {
 
         let mut s = self.clone();
         s.nf_committed = params.nf_tree_from.is_some_and(|f| h >= f);
+        s.mmr_committed = params.mmr_from.is_some_and(|f| h >= f);
+        if s.mmr_committed && !genesis {
+            if let Some(prev_hd) = s.last_header {
+                s.header_mmr
+                    .push(prev_hd.hash(), crate::pow::work(prev_hd.bits));
+            }
+        }
         s.begin_block(h, params);
 
         let Some(Tx::Coinbase(cb)) = block.txs.first() else {
@@ -931,6 +952,7 @@ impl State {
                 return Err("header commitment does not match the block".into());
             }
         }
+        s.last_header = Some(block.header);
         Ok(s)
     }
 }
@@ -960,6 +982,8 @@ pub struct DigestParts {
     pub rollups: Option<[u8; 32]>,
     /// RFC-0027: Mission Launchpads & Swarm Pools Merkle root (present only while any exist).
     pub missions: Option<[u8; 32]>,
+    /// FlyClient Header MMR root over ancestor headers `[0..height-1]` (`Params::mmr_from`).
+    pub header_mmr: Option<[u8; 32]>,
 }
 
 impl DigestParts {
@@ -989,6 +1013,9 @@ impl DigestParts {
         }
         if let Some(m) = &self.missions {
             w.raw(b"M").raw(m);
+        }
+        if let Some(f) = &self.header_mmr {
+            w.raw(b"F").raw(f);
         }
         sha256(&w.0)
     }
