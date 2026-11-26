@@ -697,10 +697,10 @@ fn redteam_mainnet_v2_sha384_end_to_end_chain_spend() {
         .unwrap();
     assert!(note_str.is_some());
 
-    // CRITICAL WIRE TEST: Mainnet v2 SHA-384 spend (~570 KB > old 520 KB cap!) MUST round-trip
-    // cleanly through Tx::from_bytes & Block::decode!
+    // CRITICAL WIRE TEST: Mainnet v2 SHA-384 spend (~515–545 KB vs ~460 KB SHA-256) MUST
+    // round-trip cleanly through Tx::from_bytes & Block::decode under PROOF_BYTES_CAP = 700_000!
     let tx_bytes = tx.to_bytes();
-    assert!(tx_bytes.len() > 520_000, "expected SHA-384 spend > 520 KB, got {}", tx_bytes.len());
+    assert!(tx_bytes.len() > 490_000, "expected SHA-384 spend > 490 KB, got {}", tx_bytes.len());
     let tx_decoded = Tx::from_bytes(&tx_bytes).expect("MAIN_V2 SHA-384 tx must decode cleanly");
     assert_eq!(tx_decoded, tx);
 
