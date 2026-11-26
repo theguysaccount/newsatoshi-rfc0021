@@ -1,44 +1,68 @@
 # newsatoshi (`v1.0.0-core`)
 
-Minimalist reference node for **Newsatoshi (`LOVE`)**: a Bitcoin-shaped, Bitcoin merge-mined (`AuxPoW`, `chainid = 20051`) Layer-1 cryptocurrency where every balance is shielded by default, every payment is verified by pure SHA-2 STARKs (zero elliptic curves, zero trusted setup, zero novel hashes), and **Priorism-FEP** (`PriorLock` + Homeostatic Fee Burn + `BatchSpend` Negentropy Prover split coinbase) encodes falsifiable truth-seeking and deflationary burn directly into L1 consensus.
+**Private, quantum-proof electronic cash secured by Bitcoin merge-mining — built strictly on SHA-2.**
 
-> **Brutally Honest Pre-Launch Status (`v1.0.0-core`):**
+Newsatoshi (`LOVE`) is designed as an **unfreezable, private settlement floor** for humans and autonomous AI agents. Stablecoins like USDC are freezable and 100% public (leaking every agent's suppliers, margins, and treasury on-chain); Bitcoin is unfreezable and credibly neutral, but transparent and not post-quantum. Newsatoshi combines **default shielded privacy**, **pure SHA-2 cryptography** (zero elliptic curves, zero trusted setup, zero novel ZK-hashes), and **Bitcoin SHA-256 merge-mining (`AuxPoW`, `chainid = 20051`)**.
+
+> **Honest Pre-Launch Status (`v1.0.0-core`):**
 > - **External Security Audits:** **`0 / 2` completed** (hard blocker before mainnet genesis; scope packet in [`docs/AUDIT_SCOPE_V2.md`](docs/AUDIT_SCOPE_V2.md)).
 > - **Independent Bitcoin AuxPoW Pools (`chainid = 20051`):** **`0 / 3` at Bitcoin-grade difficulty** (hard blocker before mainnet genesis).
-> - **One Canonical Genesis:** The Nov 10 `v0.1.0` chain is explicitly retired as a pre-launch rehearsal/canary network. Production Mainnet will launch **once** via a single fresh Bitcoin-block-anchored `newsatoshi genesis-v2` ceremony (zero premine, Day-1 ASERT anti-instamine ramp) only after both external audits and >= 3 independent pools are verified. Live status: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
+> - **One Canonical Genesis:** The Nov 10 `v0.1.0` chain is retired as a pre-launch rehearsal/canary network. Production Mainnet will launch **once** via a single fresh Bitcoin-block-anchored `newsatoshi genesis-v2` ceremony (zero premine, Day-1 ASERT anti-instamine ramp) only after both external audits and >= 3 independent pools are verified. Live status: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
 
 ---
 
-## Core Architecture (Minimalist Consensus Surface)
+## The Hourglass Architecture (Strict Layer Separation)
 
-Everything in L1 consensus rests on **FIPS 180-4 SHA-2 (`SHA-256` / `SHA-384`)** and **FIPS 205 (`SLH-DSA-SHA2-128s`)**. No elliptic curves, no pairings, no bonding-curve launchpads, no unconstrained rollup vaults, and no toy VMs in L1 consensus.
+Base layers become Schelling points by staying **radically small, neutral, and ossified** — like IP or Bitcoin — while richer protocols innovate freely on top.
 
-1. **Ordering (Bitcoin-Compatible AuxPoW + Day-1 ASERT):**
-   - 80-byte SHA-256d headers in Bitcoin's layout + Namecoin-compatible AuxPoW (`chainid = 20051 = 0x4e53`), borrowing Bitcoin's SHA-256 hardware security budget.
-   - Continuous two-stage `aserti3-launch` (`node/src/pow.rs`): 1-hour half-life for the first 2,016 blocks (prevents Day-1 instamine under 1,000,000x hashrate spikes), transitioning continuously to 48-hour steady-state ASERT.
+| Layer | Repository / Ecosystem | What Lives Here | Explicitly Excluded |
+| :--- | :--- | :--- | :--- |
+| **Layer 2 & Applications** *(Above the Waist)* | [`newsatoshi-commons`](https://github.com/theguysaccount/newsatoshi-commons), `x402`, `ERC-8004`, agent escrow protocols (e.g. Psilo), liquidity bridges | 30-tool MCP gateway, Web4 charters, mission launchpads, zkTLS P2P market-maker desks, multi-chain BTC/Lightning/Solana/Base HTLC bridges, `x402` USDC on-ramps, opt-in agent arbitration/juries | Never requires L1 hard forks to iterate |
+| **Layer 1 Settlement Floor** *(The Narrow Waist — This Repo)* | [`newsatoshi-rfc0021`](https://github.com/theguysaccount/newsatoshi-rfc0021) (`v1.0.0-core`) | Default shielded transfers (`BatchSpend` compression), pure SHA-2 STARKs + SLH-DSA, Bitcoin AuxPoW (`chainid = 20051`) + ASERT ramp, FlyClient MMR light proofs, 50% fee burn, SHA-256 HTLCs, PayWord channels, and one minimal `PriorLock` collateral primitive | **No** L1 bonding-curve launchpads, **no** L1 subjective juries, **no** L1 rollup vaults or toy VMs |
+
+---
+
+## What Is Inside the Narrow Waist (`v1.0.0-core`)
+
+Everything in L1 consensus rests solely on **FIPS 180-4 SHA-2 (`SHA-256` / `SHA-384`)** and **FIPS 205 (`SLH-DSA-SHA2-128s`)**.
+
+1. **Bitcoin-Compatible Ordering (`pow.rs`, `auxpow.rs`):**
+   - 80-byte SHA-256d headers in Bitcoin's format + Namecoin-compatible AuxPoW (`chainid = 20051 = 0x4e53`), allowing existing Bitcoin SHA-256 mining hardware to secure the chain with zero extra electricity.
+   - Continuous two-stage `aserti3-launch` difficulty ramp (1-hour half-life for the first 2,016 blocks -> 48-hour steady-state ASERT) to prevent Day-1 instamine under large hashrate spikes.
 2. **Default Shielded Privacy & `BatchSpend` Compression (`spend.rs`, `batch_spend.rs`):**
    - Single 2-in/2-out shielded spend: `8,192` rows x `247` columns, `249` Goldilocks AIR constraints, Haböck–Al Kindi (ePrint 2024/1037) masked quotient segments, SHA-384 FRI commitments on Mainnet v2 (`MAIN_V2`).
-   - **Multi-Spend `BatchSpend` STARK Compression (`K ∈ 2..=16`):** Tiles `K` independent 2-in/2-out spends vertically in ONE Winterfell STARK reusing `spend::eval_constraints` verbatim (zero new circuit constraints). Because FRI proof size scales logarithmically (`O(log ROWS)`), `K = 8` compresses 8 shielded spends into **641 KB total (~80 KB/spend = 6.49× compression)** — lifting 8 MB block capacity from ~15 to **~96–170+ shielded payments per 10-minute block** on CPU in ~3.3 s!
-   - **Split Coinbase (AuxPoW Orderer + Negentropy Prover):** When a block includes valid `Tx::BatchSpend` proofs compressing `K >= 2` spends (each paying `>= MIN_BATCH_SPEND_FEE`, 50% burned so self-spamming costs real LOVE), the block's coinbase MUST pay `min(30%, 5% * K)` of the block subsidy to the prover's Fiat–Shamir-bound `prover_a_pk` address, while the Bitcoin AuxPoW miner receives the remaining `70%–100%` + unburned fees. When no `BatchSpend` is present, AuxPoW miners receive 100% (zero liveness stall risk).
-   - **Honest privacy boundary:** Self-batching (exchanges, wallets, treasuries, agent swarms) has zero privacy loss; delegated multi-user batching shares spend witnesses with the batch prover until future STARK-in-STARK aggregation removes witness visibility.
-3. **Priorism-FEP Monetary & Truth Mechanism (`prior.rs`, `params.rs`, `state.rs`):**
-   - **Homeostatic Supply Thermostat:** Bitcoin's halving schedule down to a perpetual `0.1953125 LOVE/block` security floor, paired with consensus burn: **50% of every shielded spend / batch-spend fee is permanently burned into `state.burned`** (`50%` to block producers), directly offsetting tail issuance under real economic usage without demurrage or Ponzi yield.
-   - **ONE Unified FEP Consensus Primitive (`PriorLock`):** Any human or AI agent locks `stake >= 0.01 LOVE` behind a falsifiable `spec_hash`, `deadline`, `challenge_window`, optional objective SHA-256 `falsifier_hash`, and optional `M-of-N` independent `SLH-DSA` arbiters (enforcing SCGS Invariant I-3: every arbiter key is distinct and strictly `arbiter_vk != owner_vk`).
-     - On valid disconfirmation (objective SHA-256 preimage, owner signed equivocation, OR independent `M-of-N` arbiter quorum): `miner_fee <= 10%`, and the remaining collateral splits **50% → Disconfirmer (Surprise Bounty)** and **50% → Permanently Burned** (`bounty + burned + miner_fee == stake`).
-     - On zero disconfirmation past `deadline + challenge_window`: collateral unlocks cleanly back to `owner_addr`.
-     - Bounded `O(open)` L1 state committed via `MerkleMap` in `DigestParts::priors`.
-4. **Native-LOVE Agent Micropayments (`channel.rs`):**
-   - Unilateral partial-claim PayWord hash-chain channels (pure SHA-256 + FIPS-205 `SLH-DSA`), enabling sub-millisecond off-chain agent billing that settles directly in native `LOVE`.
-5. **Work-Proportional FlyClient, Utreexo 1 KB Frontier, Disk KV & Opportunistic PQ P2P (`light.rs`, `utreexo.rs`, `pruned_store.rs`, `pq_transport.rs`):**
-   - **Work-Proportional FlyClient (`light.rs`):** Deterministic integer `U512` work-offset sampling over `[0, ancestor_work)` (catching sibling-work inflation with overwhelming probability), bound directly to the tip's 80-byte PoW header via `DigestParts::header_mmr` (Genesis #0 on Mainnet v2) and rightmost ancestor leaf proof.
-   - **Opportunistic `NSPQ1` ML-KEM-768 P2P (`pq_transport.rs`, wired live into `node.rs`):** Protects against passive Harvest-Now-Decrypt-Later (HNDL) traffic capture and in-session frame tampering/replay. Like Bitcoin BIP-324, the ephemeral handshake is unauthenticated and does not by itself stop active MITM without out-of-band peer identity pinning.
-   - **Utreexo 1 KB Note Frontier & Disk KV Pruner:** Constant `<= 1,024 B` RAM accumulator (`utreexo.rs`) + WAL/SSTable disk KV store & chain pruner (`pruned_store.rs`).
+   - **Multi-Spend `BatchSpend` STARK Compression (`K ∈ 2..=16`):** Tiles `K` independent shielded spends vertically into ONE Winterfell STARK reusing `spend::eval_constraints` verbatim (`0` new circuit constraints). Because FRI proof size scales logarithmically, `K = 8` compresses 8 shielded spends into **641 KB total (~80 KB/spend = `6.49×` compression)** — lifting 8 MB block capacity from ~15 to **~96–170+ shielded payments per 10-minute block** on CPU in ~3.3 s.
+   - **Proof-Compression Split Coinbase:** When a block includes valid `Tx::BatchSpend` proofs (`K >= 2`, each paying `>= MIN_BATCH_SPEND_FEE` with 50% burned), consensus pays `min(30%, 5% * K)` of the block subsidy to the proof builder's Fiat–Shamir-bound `prover_a_pk` address and `70%–100%` + unburned fees to the Bitcoin AuxPoW miner. If no batch is present, miners receive 100% (zero liveness risk).
+   - **Honest privacy boundary:** Self-batching (exchanges, wallets, agent fleets) has zero privacy loss; delegated multi-user batching reveals spend witnesses to the batch prover until future STARK-in-STARK aggregation removes witness visibility.
+3. **50% Base-Fee Burn & Minimal Conditional Locks (`params.rs`, `prior.rs`, `channel.rs`, `lock.rs`):**
+   - **Monetary Policy & 50% Fee Burn:** Bitcoin's halving schedule down to a perpetual `0.1953125 LOVE/block` miner security floor, paired with permanent burning of **50% of every shielded spend / batch-spend fee** into `state.burned` (offsetting tail issuance under real transaction volume).
+   - **SHA-256 HTLCs & PayWord Channels (`lock.rs`, `channel.rs`):** Native `SHA-256` hash-time locks for zero-custody atomic swaps with Bitcoin, Lightning, Solana, and EVM chains, plus unilateral partial-claim PayWord channels for sub-millisecond agent micropayments.
+   - **Falsifiable Collateral Lock (`PriorLock`, `prior.rs`):** One minimal, opt-in collateral primitive (`stake >= 0.01 LOVE`) for objective slashable commitments (hash preimage, double-sign equivocation, or user-chosen independent `M-of-N` SLH-DSA arbiters enforcing `arbiter_vk != owner_vk`). Valid disconfirmation splits net collateral **50% bounty / 50% burn**; clean expiration unlocks back to the owner. *(Subjective arbitration and rich escrow workflows remain opt-in at Layer 2; L1 has no global jury or oracle.)*
+4. **Work-Proportional FlyClient Light Proofs, Utreexo 1 KB Frontier & Opportunistic PQ P2P (`light.rs`, `utreexo.rs`, `pruned_store.rs`, `pq_transport.rs`):**
+   - **Work-Proportional FlyClient (`light.rs`):** Integer-only `U512` work-offset sampling over `[0, ancestor_work)` (blocks sibling-work inflation), bound to the tip header via `DigestParts::header_mmr` and rightmost-leaf tail proofs.
+   - **Opportunistic `NSPQ1` ML-KEM-768 P2P (`pq_transport.rs`, wired into `node.rs`):** Protects against passive Harvest-Now-Decrypt-Later (HNDL) traffic capture and in-session tampering/replay. Like Bitcoin BIP-324, the unauthenticated handshake does not by itself stop active MITM without peer key pinning.
+   - **Utreexo 1 KB Note Frontier & Disk KV Pruner:** Constant `<= 1,024 B` RAM accumulator (`utreexo.rs`) + WAL/SSTable disk KV store & block pruner (`pruned_store.rs`).
+
+<details>
+<summary>Theoretical Background Note (Priorism / Free-Energy Principle motivation)</summary>
+
+The 50% fee burn and `PriorLock` 50/50 disconfirmation bounty+burn were informed by a Priorism / Free-Energy Principle (FEP) framing: treating credible commitments as falsifiable priors where surprise triggers collateral burn and accurate prediction preserves capital, while keeping the consensus code itself strictly minimal, objective, and free of any global L1 oracle or subjective referee.
+
+</details>
+
+---
+
+## Honest Positioning vs. Related Systems
+
+- **Neptune Cash (NPT):** Already runs a live PoW L1 with default privacy (Mutator Sets), hash-only post-quantum STARKs (Tip5 + Triton VM), split Composer/Guesser mining, and recursive chain proofs. Newsatoshi makes a narrower cryptographic bet: **SHA-2 only** (25 years of cryptanalysis + native Bitcoin/Lightning `OP_SHA256` swaps, at the cost of much heavier recursion) + **Bitcoin AuxPoW merge-mining** + **native AI-agent rails (`newsatoshi-commons`)**.
+- **Miden:** Mature STARK VM and client-side privacy, settling as an Ethereum L2 rather than sovereign PoW base money.
+- **Recursive Chain Proof Status:** `node/src/recursion.rs` contains R&D building blocks (`HeaderChainAir` + `FriFoldVerifyAir`), **not** a complete recursive SHA-384 STARK-in-STARK chain proof yet. Today, light clients verify headers logarithmically via **work-proportional FlyClient MMR** and blocks compress spends via **`BatchSpend` (`K = 2..=16`)**.
 
 ---
 
 ## Measured Benchmarks & Honest Security Parameters
 
-Measured locally on Apple Silicon CPU (default `cargo test`, `opt-level = 2`, deps `opt-level = 3`):
+Measured locally on Apple Silicon CPU (`cargo test`, `opt-level = 2`, deps `opt-level = 3`):
 
 | Operation / Profile | Measured Proof Size | Per-Spend Size | Prove Time | Verify Time | Notes |
 | :--- | :---: | :---: | :---: | :---: | :--- |
@@ -51,13 +75,12 @@ Measured locally on Apple Silicon CPU (default `cargo test`, `opt-level = 2`, de
 ### Honest Security & Formal Verification Boundaries
 
 - **STARK Soundness:**
-  - Winterfell `proven_security().ldr_bits()` reports `128` proven classical bits on `TEST`/`MAIN` (capped by SHA-256's 128-bit collision resistance) and `>= 140` proven classical bits on `MAIN_V2` (SHA-384 gives 192-bit classical / 128-bit BHT QROM hash collision resistance).
-  - **Quantum FRI caveat (honest bound):** Under current Goldilocks cubic-extension (`192`-bit field) and conservative Johnson-bound QROM reductions (Chiesa–Manohar–Spooner, TCC 2019), overall quantum soundness is roughly **67–80 bits** depending on query/grinding assumptions — **NOT** "192-bit quantum".
+  - Winterfell `proven_security().ldr_bits()` reports `128` proven classical bits on `TEST`/`MAIN` (SHA-256) and `>= 140` proven classical bits on `MAIN_V2` (SHA-384 gives 192-bit classical / 128-bit BHT QROM hash collision resistance).
+  - **Quantum FRI bound (honest estimate):** Under current Goldilocks cubic-extension (`192`-bit field) and conservative Johnson-bound QROM reductions (Chiesa–Manohar–Spooner, TCC 2019), overall quantum soundness is roughly **67–80 bits** depending on query/grinding assumptions — **not** "192-bit quantum".
 - **Formal Verification Scope (`node/proof/SpendBalance.lean` & `node/proof/check.py`):**
   - `extract_constraints` + `proof/check.py` (Z3): checks all `249` spend-circuit constraints (`2,950` polynomial terms) against a FIPS 180-4 spec + 5 planted-bug self-tests.
-  - `extract_lean_spend` + `proof/SpendBalance.lean` (Lean 4.36.0, **10 theorems**, `0 sorry`, zero Mathlib): proves extracted Constraints `#247` & `#248`, `< 2^60` note range, exact integer spend conservation, PayWord conservation, Homeostatic Burn block solvency, `PriorLock` 50/50 bounty/burn conservation, `BatchSpend` split-coinbase bounds, FlyClient work-interval uniqueness, and Utreexo/FRI-fold uniqueness.
-  - **What is NOT yet mechanized in Lean:** Full Lean mechanization of SHA-256 constraints `#0..#246` (comparable to Zcash Ironwood's 2,700+ theorem Lean proof) has **not** been done yet.
-- **Recursive Chain Proof Status:** `node/src/recursion.rs` implements building-block STARKs (`HeaderChainAir` + `FriFoldVerifyAir`), while full recursive STARK-in-STARK chain compression (proving a complete SHA-384 STARK verifier inside a STARK) remains future R&D. `BatchSpend` (`K = 2..=16`) provides practical `3.5×–11×` blockspace compression today.
+  - `extract_lean_spend` + `proof/SpendBalance.lean` (Lean 4.36.0, **10 theorems**, `0 sorry`, zero Mathlib): proves extracted Constraints `#247` & `#248`, `< 2^60` note range, exact integer spend conservation, PayWord conservation, fee-burn block solvency, `PriorLock` 50/50 bounty/burn conservation, `BatchSpend` split-coinbase bounds, FlyClient work-interval uniqueness, and Utreexo/FRI-fold uniqueness.
+  - **Not yet mechanized in Lean:** Full Lean mechanization of SHA-256 constraints `#0..#246` (comparable to Zcash Ironwood's 2,700+ theorem Lean proof) has **not** been done yet.
 
 ---
 
@@ -97,15 +120,15 @@ node/src/
   note.rs          addresses, commitments, nullifiers, depth-32 note tree
   spend.rs         2-in/2-out shielded spend STARK (249 constraints, Haböck–Al Kindi masking)
   batch_spend.rs   multi-spend K=2..=16 STARK compression (reuses spend::eval_constraints)
-  prior.rs         Priorism-FEP PriorLock (SCGS I-3, objective/quorum disconfirm, 50/50 bounty+burn)
+  prior.rs         minimal opt-in PriorLock collateral (objective/quorum disconfirm, 50/50 bounty+burn)
   channel.rs       unilateral partial-claim PayWord channels (pure SHA-256 + SLH-DSA)
-  params.rs        issuance floor, Homeostatic 50% fee burn, split-coinbase prover share, Mainnet v2
+  params.rs        issuance floor, 50% base-fee burn, split-coinbase prover share, Mainnet v2
   state.rs         ledger state, DigestParts, global solvency, split-coinbase validation
   light.rs         HeaderTip SPV + work-proportional FlyClient MMR light client
   pq_transport.rs  opportunistic NSPQ1 ML-KEM-768 P2P encryption (passive HNDL protection)
   utreexo.rs       1 KB compact note-tree frontier + tracked proofs
   pruned_store.rs  WAL/SSTable disk KV store & historical block pruner
-  recursion.rs     SHA-256d HeaderChainAir + algebraic FriFoldVerifyAir R&D primitives
+  recursion.rs     SHA-256d HeaderChainAir + algebraic FriFoldVerifyAir R&D building blocks
   audit.rs         spend-circuit cell-freedom soundness scan
   job.rs           verified matrix-product escrow (Freivalds + fraud proofs + SLH-DSA)
   lock.rs          SHA-256 hash- and time-locked atomic swaps
