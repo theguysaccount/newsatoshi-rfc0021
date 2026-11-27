@@ -110,6 +110,32 @@ impl CompactNoteTree {
         self.peaks.iter().filter(|p| p.is_some()).count() * 32
     }
 
+    /// Extract the exact <= 1 KB Utreexo frontier directly from a full `NoteTree` in O(log N) time.
+    pub fn from_note_tree(tree: &crate::note::NoteTree) -> Self {
+        let count = tree.len();
+        let mut peaks = [None; DEPTH];
+        for (lvl, slot) in peaks.iter_mut().enumerate() {
+            if (count >> lvl) & 1 == 1 {
+                let idx = ((count >> lvl) - 1) as usize;
+                *slot = tree.level_node(lvl, idx);
+            }
+        }
+        Self {
+            peaks,
+            empty: empty_roots(),
+            count,
+        }
+    }
+
+    /// Return all active `(level, hash)` peaks of the Utreexo frontier.
+    pub fn peaks_with_levels(&self) -> Vec<(usize, Word8)> {
+        self.peaks
+            .iter()
+            .enumerate()
+            .filter_map(|(lvl, p)| p.map(|w| (lvl, w)))
+            .collect()
+    }
+
     /// Append a note commitment in $O(\log N)$ hashes and constant 1 KB RAM.
     pub fn append(&mut self, cm: Word8) -> u32 {
         self.append_tracked(cm).new_pos
@@ -262,6 +288,11 @@ mod tests {
             assert_eq!(tp.root(), final_root, "tracked proof failed for pos {}", tp.pos);
             assert_eq!(tp.path, full.path(tp.pos), "tracked path mismatch for pos {}", tp.pos);
         }
+
+        // Verify O(log N) direct extraction from full NoteTree matches incremental compact frontier bit-for-bit!
+        let extracted = CompactNoteTree::from_note_tree(&full);
+        assert_eq!(extracted, compact);
+        assert_eq!(extracted.root(), final_root);
 
         // Verify compact wire round-trip (< 1.1 KB even for millions of notes!)
         let mut w = Writer::new();

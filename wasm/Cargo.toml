@@ -1,9 +1,9 @@
 [package]
 name = "ns-verify"
-version = "0.1.0"
+version = "1.2.1"
 edition = "2021"
 license = "MIT"
-description = "NEWSATOSHI spend-proof verifier for the browser"
+description = "NEWSATOSHI MAIN_V2 192-bit classical / 104-bit QROM Quartic SHA-384 spend-proof verifier for the browser"
 
 [lib]
 crate-type = ["cdylib"]
@@ -13,9 +13,10 @@ newsatoshi = { path = "../node", default-features = false }
 # rand is linked but never called by the verifier; give getrandom a backend that refuses
 getrandom = { version = "0.2", features = ["custom"] }
 
-# the node's patched Winterfell (zero-knowledge segments); see ../node/Cargo.toml
+# the node's patched Winterfell (zero-knowledge segments + Goldilocks f64 canonicalization fix); see ../node/Cargo.toml
 [patch.crates-io]
 winter-air = { path = "../node/vendor/winter-air" }
+winter-math = { path = "../node/vendor/winter-math" }
 winter-prover = { path = "../node/vendor/winter-prover" }
 winter-verifier = { path = "../node/vendor/winter-verifier" }
 winter-utils = { path = "../node/vendor/winter-utils" }

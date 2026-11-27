@@ -1375,7 +1375,7 @@ fn flyclient_proof_json(shared: &Shared, tail: usize, samples: usize) -> J {
             ("ok".into(), J::Bool(true)),
             ("genesis_hash".into(), J::str(hash_hex(&p.genesis_hash))),
             ("tip_height".into(), J::num(p.tip_height)),
-            ("mmr_root".into(), J::str(hash_hex(&p.mmr_root))),
+            ("mmr_root".into(), J::str(hex::encode(p.mmr_root))),
             ("ancestor_work".into(), J::str(p.ancestor_work.to_string())),
             ("total_work".into(), J::str(p.total_work.to_string())),
             ("peak_count".into(), J::num(p.peaks.len())),
@@ -1404,6 +1404,38 @@ fn flyclient_proof_json(shared: &Shared, tail: usize, samples: usize) -> J {
         ]),
         Err(e) => err_json(&e),
     }
+}
+
+fn utreexo_frontier_json(shared: &Shared) -> J {
+    let n = lock(shared);
+    let height = n.chain.height();
+    let full_root = n.chain.state.tree.root();
+    let compact = crate::utreexo::CompactNoteTree::from_note_tree(&n.chain.state.tree);
+    let compact_root = compact.root();
+    let peaks = compact.peaks_with_levels();
+    J::Obj(vec![
+        ("ok".into(), J::Bool(true)),
+        ("height".into(), J::num(height)),
+        ("note_count".into(), J::num(compact.len())),
+        ("root".into(), J::str(word8_hex(&compact_root))),
+        ("root_matches_full_tree".into(), J::Bool(compact_root == full_root)),
+        ("frontier_bytes".into(), J::num(compact.frontier_bytes())),
+        ("max_frontier_bytes".into(), J::num(1024u64)),
+        (
+            "peaks".into(),
+            J::Arr(
+                peaks
+                    .into_iter()
+                    .map(|(lvl, w)| {
+                        J::Obj(vec![
+                            ("level".into(), J::num(lvl)),
+                            ("hash".into(), J::str(word8_hex(&w))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
 }
 
 fn respond(s: &mut TcpStream, code: u16, body: &str, head_only: bool) {
@@ -1514,6 +1546,7 @@ pub fn serve_public_with(shared: Shared, bind: &str, port: u16, faucet: Option<A
                                 Err(_) => (400, err_json("from= takes a height")),
                             },
                             ("GET", "/api/state") => (200, state_commitment(&sh)),
+                            ("GET", "/api/utreexo") => (200, utreexo_frontier_json(&sh)),
                             ("GET", "/api/flyclient") => {
                                 let tail = req.param("tail").and_then(|x| x.parse::<usize>().ok()).unwrap_or(6);
                                 let samples = req.param("samples").and_then(|x| x.parse::<usize>().ok()).unwrap_or(16);

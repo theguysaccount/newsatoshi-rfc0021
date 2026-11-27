@@ -124,6 +124,11 @@ impl NoteTree {
         self.levels[0].get(pos as usize).copied()
     }
 
+    /// Read an internal node at `(level, index)` in O(log N) for compact Utreexo frontier extraction.
+    pub fn level_node(&self, level: usize, idx: usize) -> Option<Word8> {
+        self.levels.get(level)?.get(idx).copied()
+    }
+
     /// Siblings from the leaf upward.
     pub fn path(&self, pos: u32) -> [Word8; DEPTH] {
         let mut out = [[0u32; 8]; DEPTH];

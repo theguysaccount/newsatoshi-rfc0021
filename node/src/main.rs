@@ -53,6 +53,9 @@ usage: newsatoshi [--net regtest|testnet|rehearsal|mainnet|mainnet-v2] [--genesi
   conds                                         list open conditions
   priors                                        list open Priorism-FEP PriorLocks
   flyclient [--tail N] [--samples N]            generate and verify an O(log N) FlyClient PoW chain proof
+  utreexo-frontier                              compute and verify the <= 1 KB O(log N) Utreexo note frontier
+  ivc-prove                                     run real pure-SHA-2 Quartic STARK-in-STARK IVC folding (8 headers -> 1 proof)
+  sample-proof --out DIR                        generate a real MAIN_V2 (192b classical / 104b QROM) browser WASM fixture
   prune --out DIR [--keep N]                    export a pruned Utreexo 1 KB frontier + disk KV nullifier checkpoint
   genesis-v2 --btc-block-hash H --btc-height N [--time T] [--bits HEX] [--mine] [--out FILE]
                                                 generate/mine a Bitcoin-block-anchored Mainnet v2 fair-launch genesis
@@ -445,6 +448,128 @@ fn run() -> Result<(), String> {
                 proof.samples.len(),
                 work,
                 require_mmr,
+            );
+        }
+        ["utreexo-frontier"] => {
+            let c = open_chain(&o)?;
+            let full_root = c.state.tree.root();
+            let compact = newsatoshi::utreexo::CompactNoteTree::from_note_tree(&c.state.tree);
+            let compact_root = compact.root();
+            if compact_root != full_root {
+                return Err("CRITICAL: Utreexo compact frontier root diverged from full NoteTree!".into());
+            }
+            println!(
+                "{{\"ok\":true,\"height\":{},\"note_count\":{},\"root\":\"{}\",\"frontier_bytes\":{},\"max_frontier_bytes\":1024,\"peaks\":{},\"root_matches_full_tree\":true}}",
+                c.height(),
+                compact.len(),
+                hex::encode(newsatoshi::hash::words_to_bytes(&compact_root)),
+                compact.frontier_bytes(),
+                compact.peaks_with_levels().len(),
+            );
+        }
+        ["ivc-prove"] => {
+            use newsatoshi::recursion::{
+                prove_outer_header_segment, prove_recursive_chain_fold, verify_outer_header_segment,
+                verify_recursive_chain_fold,
+            };
+            use newsatoshi::tx::Header;
+            let mut seg1 = [Header { version: 1, prev: [0; 32], commit: [0; 32], time: 1_795_742_750, bits: 0x207fffff, nonce: 0 }; 4];
+            let mut seg2 = seg1.clone();
+            let mut used_live = false;
+            if let Ok(c) = open_chain(&o) {
+                if c.height() >= 7 {
+                    let start = c.height() - 7;
+                    for i in 0..4 {
+                        seg1[i] = c.block_at(start + i as u32).ok_or("missing block")?.header;
+                        seg2[i] = c.block_at(start + 4 + i as u32).ok_or("missing block")?.header;
+                    }
+                    used_live = true;
+                }
+            }
+            if !used_live {
+                let mut prev = [0x42u8; 32];
+                for i in 0..8usize {
+                    let mut h = Header {
+                        version: 1,
+                        prev,
+                        commit: [i as u8; 32],
+                        time: 1_795_742_750 + (i as u32) * 600,
+                        bits: 0x207fffff,
+                        nonce: i as u32,
+                    };
+                    if !mine(&mut h, 1_000_000) {
+                        return Err("synthetic header mining failed".into());
+                    }
+                    prev = h.hash();
+                    if i < 4 { seg1[i] = h; } else { seg2[i - 4] = h; }
+                }
+            }
+            let t0 = Instant::now();
+            let (pi1, pr1) = prove_outer_header_segment(&seg1)?;
+            let (pi2, pr2) = prove_outer_header_segment(&seg2)?;
+            verify_outer_header_segment(&pi1, &pr1)?;
+            verify_outer_header_segment(&pi2, &pr2)?;
+            let outer_ms = t0.elapsed().as_millis();
+            let t1 = Instant::now();
+            let (rec_pi, rec_pr) = prove_recursive_chain_fold((&pi1, &pr1), (&pi2, &pr2))?;
+            let fold_ms = t1.elapsed().as_millis();
+            let t2 = Instant::now();
+            let qrom_bits = verify_recursive_chain_fold(&rec_pi, &rec_pr)?;
+            let verify_ms = t2.elapsed().as_millis();
+            println!(
+                "{{\"ok\":true,\"source\":\"{}\",\"headers_folded\":{},\"outer_proofs_bytes\":[{},{}],\"recursive_proof_bytes\":{},\"inner_qrom_bits\":{},\"outer_ms\":{},\"fold_prove_ms\":{},\"verify_ms\":{}}}",
+                if used_live { "live_chain_tip" } else { "synthetic_pow_chain" },
+                rec_pi.total_headers,
+                pr1.len(),
+                pr2.len(),
+                rec_pr.len(),
+                qrom_bits,
+                outer_ms,
+                fold_ms,
+                verify_ms,
+            );
+        }
+        ["sample-proof", ..] => {
+            let out_dir = flag(&o.rest, "--out").ok_or("usage: newsatoshi sample-proof --out DIR")?;
+            let sk: newsatoshi::hash::Word8 = [0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00, 0x13579bdf, 0x2468ace0, 0x0fedcba9, 0x87654321];
+            let a_pk = newsatoshi::note::address(&sk);
+            let rho_in = [1u32, 2, 3, 4, 5];
+            let v_in = 50 * COIN;
+            let cm_in = newsatoshi::note::commit(&a_pk, v_in, &rho_in);
+            let mut tree = newsatoshi::note::NoteTree::new();
+            let pos = tree.append(cm_in);
+            let path = tree.path(pos);
+            let recip_pk = newsatoshi::note::address(&[9u32; 8]);
+            let fee = newsatoshi::params::Params::get(Net::MainV2)?.default_fee;
+            let wit = newsatoshi::spend::SpendWitness {
+                inputs: [
+                    newsatoshi::spend::InputNote { sk, v: v_in, rho: rho_in, pos, path },
+                    newsatoshi::spend::InputNote::dummy(),
+                ],
+                outputs: [
+                    newsatoshi::spend::OutputNote { a_pk: recip_pk, v: 25 * COIN, rho: [10, 11, 12, 13, 14] },
+                    newsatoshi::spend::OutputNote { a_pk, v: v_in - 25 * COIN - fee, rho: [20, 21, 22, 23, 24] },
+                ],
+                dummy: [false, true],
+            };
+            let bind: newsatoshi::hash::Word8 = [0x6e734d32, 0x00000121, 0x97773800, 0xba1cdad4, 0, 0, 0, 0];
+            let t0 = Instant::now();
+            let (pi, proof) = newsatoshi::spend::prove_for(&newsatoshi::spend::MAIN_V2, &wit, bind)?;
+            let prove_ms = t0.elapsed().as_millis();
+            let pi_bytes = pi.to_bytes();
+            let pr_bytes = proof.to_bytes();
+            let t1 = Instant::now();
+            newsatoshi::spend::verify_bytes_for(&newsatoshi::spend::MAIN_V2, &pi, &pr_bytes)?;
+            let verify_ms = t1.elapsed().as_millis();
+            std::fs::create_dir_all(&out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
+            std::fs::write(std::path::Path::new(&out_dir).join("pi.bin"), &pi_bytes).map_err(|e| e.to_string())?;
+            std::fs::write(std::path::Path::new(&out_dir).join("proof.bin"), &pr_bytes).map_err(|e| e.to_string())?;
+            println!(
+                "{{\"ok\":true,\"profile\":\"MAIN_V2\",\"pi_bytes\":{},\"proof_bytes\":{},\"prove_ms\":{},\"verify_ms\":{},\"classical_bits\":192,\"qrom_bits\":104}}",
+                pi_bytes.len(),
+                pr_bytes.len(),
+                prove_ms,
+                verify_ms,
             );
         }
         ["prune", ..] => {

@@ -25,6 +25,22 @@ export const MERGED_MINING_HEADER = Buffer.from([0xfa, 0xbe, 0x6d, 0x6d]);
 export const NOTE_DEPTH = 32;
 export const MAX_NOTE_VALUE = (1n << 60n) - 1n;
 
+/** Canonical Newsatoshi Mainnet v2 (nsM2, v1.2.0) genesis & staged ASERT parameters. */
+export const MAINNET_V2_PARAMS = {
+  network: "mainnet-v2",
+  magic: "nsM2",
+  btc_anchor_height: 977738,
+  btc_anchor_hash: "0000000000000000000163900064a4cc4807dbd8bcaf35e322e694e6c387a780",
+  genesis_hash_display: "00000000ba1cdad4aa8e82d6613b4df536394c41008fc3a0914a47a44604b9c8",
+  genesis_time: 1795742750,
+  genesis_bits: 0x1d00ffff,
+  pow_limit_bits: 0x1d00ffff,
+  spacing: 600,
+  launch_blocks: 2016,
+  launch_half_life: 3600,
+  steady_half_life: 172800,
+};
+
 // ---- SHA-256 (OpenSSL) + Raw FIPS 180-4 SHA256Compress (for NoteTree) ----------------
 
 export function sha256(buf) {
@@ -414,6 +430,278 @@ export function verifyHomeostaticBurn({ fee, burned, producer }) {
   return { ok: true };
 }
 
+// ---- Independent Namecoin/Bitcoin AuxPoW Verification (chainid = 20051) --------------
+
+function readCompact(buf, pos) {
+  const b0 = buf[pos];
+  if (b0 < 0xfd) return [b0, pos + 1];
+  if (b0 === 0xfd) return [buf.readUInt16LE(pos + 1), pos + 3];
+  if (b0 === 0xfe) return [buf.readUInt32LE(pos + 1), pos + 5];
+  return [Number(buf.readBigUInt64LE(pos + 1)), pos + 9];
+}
+
+function parseBtcTx(buf) {
+  let p = 0;
+  const parts = [];
+  parts.push(buf.subarray(p, p + 4)); p += 4;
+  const segwit = buf[p] === 0 && buf[p + 1] === 1;
+  if (segwit) p += 2;
+  const bodyStart = p;
+  let nIn; [nIn, p] = readCompact(buf, p);
+  if (nIn === 0) throw new Error("auxpow coinbase has no inputs");
+  let script0 = Buffer.alloc(0);
+  for (let i = 0; i < nIn; i++) {
+    p += 36;
+    let sLen; [sLen, p] = readCompact(buf, p);
+    if (i === 0) script0 = buf.subarray(p, p + sLen);
+    p += sLen + 4;
+  }
+  let nOut; [nOut, p] = readCompact(buf, p);
+  for (let i = 0; i < nOut; i++) {
+    p += 8;
+    let sLen; [sLen, p] = readCompact(buf, p);
+    p += sLen;
+  }
+  parts.push(buf.subarray(bodyStart, p));
+  if (segwit) {
+    for (let i = 0; i < nIn; i++) {
+      let items; [items, p] = readCompact(buf, p);
+      for (let j = 0; j < items; j++) {
+        let iLen; [iLen, p] = readCompact(buf, p);
+        p += iLen;
+      }
+    }
+  }
+  parts.push(buf.subarray(p, p + 4)); p += 4;
+  return { txid: sha256d(Buffer.concat(parts)), script0, len: p };
+}
+
+function merkleBranch(hash32, branch, index) {
+  let h = Buffer.from(hash32);
+  let i = index;
+  for (const sib of branch) {
+    h = (i & 1) !== 0
+      ? sha256d(Buffer.concat([sib, h]))
+      : sha256d(Buffer.concat([h, sib]));
+    i >>= 1;
+  }
+  return h;
+}
+
+export function expectedAuxIndex(nonce, chainId, h) {
+  let r = (Math.imul(nonce >>> 0, 1103515245) + 12345) >>> 0;
+  r = (r + (chainId >>> 0)) >>> 0;
+  r = (Math.imul(r, 1103515245) + 12345) >>> 0;
+  return r % (1 << h);
+}
+
+/** Independently parse & verify a Namecoin-format Bitcoin AuxPoW proof for a Newsatoshi block. */
+export function verifyAuxPow(auxHash32, headerBits, auxBuf, chainId = CHAIN_ID) {
+  const tx = parseBtcTx(auxBuf);
+  let p = tx.len;
+  p += 32; // unused block hash
+  let cbLen; [cbLen, p] = readCompact(auxBuf, p);
+  const cbBranch = [];
+  for (let i = 0; i < cbLen; i++) { cbBranch.push(auxBuf.subarray(p, p + 32)); p += 32; }
+  const cbIndex = auxBuf.readInt32LE(p); p += 4;
+  let chLen; [chLen, p] = readCompact(auxBuf, p);
+  const chBranch = [];
+  for (let i = 0; i < chLen; i++) { chBranch.push(auxBuf.subarray(p, p + 32)); p += 32; }
+  const chIndex = auxBuf.readInt32LE(p); p += 4;
+  const parent = auxBuf.subarray(p, p + 80); p += 80;
+  if (p !== auxBuf.length) throw new Error("trailing bytes in auxpow");
+  if (cbIndex !== 0) throw new Error("auxpow coinbase_index != 0");
+  const parentVer = parent.readUInt32LE(0);
+  if ((parentVer >>> 16) === chainId) throw new Error("auxpow parent has our chain ID");
+  const parentHash = sha256d(parent);
+  if (!meetsTarget(parentHash, headerBits)) throw new Error("auxpow parent PoW fails target");
+  const parentRoot = parent.subarray(36, 68);
+  if (!merkleBranch(tx.txid, cbBranch, 0).equals(parentRoot)) {
+    throw new Error("auxpow coinbase merkle branch mismatch");
+  }
+  const root = Buffer.from(merkleBranch(auxHash32, chBranch, chIndex)).reverse();
+  const script = tx.script0;
+  const pc = script.indexOf(root);
+  if (pc < 0) throw new Error("auxpow chain root missing in coinbase script");
+  const head = script.indexOf(MERGED_MINING_HEADER);
+  if (head >= 0) {
+    if (script.indexOf(MERGED_MINING_HEADER, head + 1) >= 0) throw new Error("duplicate merged mining header");
+    if (head + 4 !== pc) throw new Error("chain root does not immediately follow 0xfabe6d6d");
+  } else if (pc > 20) {
+    throw new Error("chain root too deep without merged mining header");
+  }
+  const after = pc + 32;
+  if (script.length < after + 8) throw new Error("auxpow coinbase missing size/nonce");
+  const treeSize = script.readUInt32LE(after);
+  const mergeNonce = script.readUInt32LE(after + 4);
+  if (treeSize !== (1 << chBranch.length)) throw new Error("auxpow tree size mismatch");
+  if (chIndex !== expectedAuxIndex(mergeNonce, chainId, chBranch.length)) {
+    throw new Error("auxpow chain_index != expected_index");
+  }
+  return {
+    parent_hash_display: Buffer.from(parentHash).reverse().toString("hex"),
+    coinbase_tag_ascii: script.toString("latin1").replace(/[^\x20-\x7e]/g, ""),
+  };
+}
+
+/** Decode a `/api/headers` HeaderBlock hex entry (80-byte header + optional length-prefixed AuxPoW). */
+export function decodeHeaderBlock(hexStr) {
+  const buf = Buffer.from(hexStr, "hex");
+  if (buf.length < 84) throw new Error("truncated header block");
+  const headerBuf = buf.subarray(0, 80);
+  const hd = parseHeader(headerBuf);
+  let p = 80;
+  let auxpow = null;
+  if ((hd.version & VERSION_AUXPOW) !== 0) {
+    const auxLen = buf.readUInt32LE(p); p += 4;
+    auxpow = buf.subarray(p, p + auxLen); p += auxLen;
+  }
+  return { headerBuf, hd, auxpow };
+}
+
+/** Independently download & verify the live Newsatoshi Mainnet v2 (nsM2) chain end-to-end. */
+export async function verifyLiveMainnetV2(baseUrl = "https://newsatoshi.org/mainnet") {
+  const base = baseUrl.replace(/\/+$/, "");
+  const getJson = async (path) => {
+    const r = await fetch(base + path, { headers: { Accept: "application/json" } });
+    if (!r.ok) throw new Error(`HTTP ${r.status} on ${base + path}`);
+    return r.json();
+  };
+  const status = await getJson("/status");
+  if (status.network !== "mainnet-v2") {
+    throw new Error(`expected network=mainnet-v2, got ${status.network}`);
+  }
+  if (status.genesis !== MAINNET_V2_PARAMS.genesis_hash_display) {
+    throw new Error(`genesis mismatch: got ${status.genesis}`);
+  }
+  const allHeaders = [];
+  let next = 1;
+  while (next <= status.height) {
+    const page = await getJson(`/api/headers?from=${next}`);
+    if (!page.ok || !Array.isArray(page.headers) || page.headers.length === 0) break;
+    for (const hHex of page.headers) allHeaders.push(hHex);
+    next = page.next;
+  }
+  const state = await getJson("/api/state");
+  const fly = await getJson("/api/flyclient");
+
+  // Reconstruct canonical Genesis #0 internal hash from display hex
+  const genInternal = Buffer.from(MAINNET_V2_PARAMS.genesis_hash_display, "hex").reverse();
+  let prevHash = genInternal;
+  let parentTime = MAINNET_V2_PARAMS.genesis_time;
+  let steadyAnchor = null;
+  let auxpowCount = 0;
+  let totalWork = workFromBits(MAINNET_V2_PARAMS.genesis_bits);
+  const mmrLevels = [[{
+    hash: mmrLeafHash(0, genInternal, totalWork),
+    work: totalWork,
+    height: 0,
+  }]];
+
+  const pushMmr = (height, blockHashBuf, w) => {
+    const leaf = { hash: mmrLeafHash(height, blockHashBuf, w), work: w, height: 0 };
+    mmrLevels[0].push(leaf);
+    let lvl = 0;
+    while (mmrLevels[lvl].length >= 2 && mmrLevels[lvl].length % 2 === 0) {
+      const len = mmrLevels[lvl].length;
+      const parent = mmrParentHash(mmrLevels[lvl][len - 2], mmrLevels[lvl][len - 1]);
+      if (mmrLevels.length <= lvl + 1) mmrLevels.push([]);
+      mmrLevels[lvl + 1].push(parent);
+      lvl++;
+    }
+  };
+  const bagMmr = () => {
+    const peaks = [];
+    for (let lvl = mmrLevels.length - 1; lvl >= 0; lvl--) {
+      if (mmrLevels[lvl].length % 2 === 1) peaks.push(mmrLevels[lvl][mmrLevels[lvl].length - 1]);
+    }
+    let accHash = peaks[peaks.length - 1].hash;
+    let accWork = peaks[peaks.length - 1].work;
+    for (let i = peaks.length - 2; i >= 0; i--) {
+      accWork += peaks[i].work;
+      accHash = sha256(Buffer.concat([Buffer.from("nsMMRBAG"), peaks[i].hash, accHash, u256BeBuf(accWork)]));
+    }
+    return { root: accHash.toString("hex"), totalWork: accWork };
+  };
+
+  let tipHeader = null;
+  let tipAncestorMmr = null;
+  const maxHeight = Math.min(allHeaders.length, state.height);
+  for (let i = 0; i < maxHeight; i++) {
+    const h = i + 1;
+    const { hd, auxpow } = decodeHeaderBlock(allHeaders[i]);
+    if (!hd.prev.equals(prevHash)) {
+      throw new Error(`height ${h}: prev hash link broken`);
+    }
+    const expectedBits = asertBitsStaged(
+      MAINNET_V2_PARAMS.genesis_bits,
+      MAINNET_V2_PARAMS.genesis_time - MAINNET_V2_PARAMS.spacing,
+      MAINNET_V2_PARAMS.launch_blocks,
+      MAINNET_V2_PARAMS.launch_half_life,
+      steadyAnchor,
+      h - 1,
+      parentTime,
+      MAINNET_V2_PARAMS.steady_half_life,
+      MAINNET_V2_PARAMS.pow_limit_bits,
+      MAINNET_V2_PARAMS.spacing,
+    );
+    if (hd.bits !== expectedBits) {
+      throw new Error(`height ${h}: ASERT bits mismatch (got 0x${hd.bits.toString(16)}, expected 0x${expectedBits.toString(16)})`);
+    }
+    if ((hd.version & VERSION_AUXPOW) !== 0) {
+      if (!auxpow) throw new Error(`height ${h}: missing auxpow payload`);
+      if ((hd.version >>> 16) !== CHAIN_ID) throw new Error(`height ${h}: wrong auxpow chain ID`);
+      verifyAuxPow(hd.hash, hd.bits, auxpow, CHAIN_ID);
+      auxpowCount++;
+    } else if (!meetsTarget(hd.hash, hd.bits)) {
+      throw new Error(`height ${h}: native PoW fails target`);
+    }
+    if (h === MAINNET_V2_PARAMS.launch_blocks) {
+      steadyAnchor = { bits: hd.bits, time: hd.time };
+    }
+    if (h === maxHeight) {
+      // State at height `h` commits to ancestor header MMR `[0..h-1]`!
+      tipAncestorMmr = bagMmr();
+      tipHeader = hd;
+    }
+    const w = workFromBits(hd.bits);
+    totalWork += w;
+    pushMmr(h, hd.hash, w);
+    prevHash = hd.hash;
+    parentTime = hd.time;
+  }
+
+  // Independently verify `nsSTATE` digest + `header_commit("nsBLOCK")` against live tip header!
+  let stateCommitVerified = false;
+  if (state.ok && tipHeader && state.height === maxHeight) {
+    const dig = computeStateDigest(state.parts);
+    const expectedCommit = headerCommit(Buffer.from(state.tx_root, "hex"), Buffer.from(dig, "hex"));
+    if (!expectedCommit.equals(tipHeader.commit)) {
+      throw new Error("live tip header_commit(tx_root, nsSTATE) mismatch!");
+    }
+    if (tipAncestorMmr && state.parts.header_mmr !== tipAncestorMmr.root) {
+      throw new Error(`live header_mmr mismatch: got ${state.parts.header_mmr}, computed ${tipAncestorMmr.root}`);
+    }
+    stateCommitVerified = true;
+  }
+
+  return {
+    ok: true,
+    verifier: "newsatoshi-independent-js-openssl-v1.2.1",
+    endpoint: base,
+    network: status.network,
+    genesis_verified: MAINNET_V2_PARAMS.genesis_hash_display,
+    verified_height: maxHeight,
+    tip_hash: Buffer.from(prevHash).reverse().toString("hex"),
+    auxpow_blocks_verified: auxpowCount,
+    asert_staged_verified_all_blocks: true,
+    ancestor_mmr_root_verified: tipAncestorMmr ? tipAncestorMmr.root : null,
+    total_chainwork: totalWork.toString(),
+    state_commitment_verified: stateCommitVerified,
+    flyclient_api_header_mmr_bound: Boolean(fly.ok && fly.header_mmr_bound),
+  };
+}
+
 // ---- CLI Differential Vector Runner --------------------------------------------------
 
 export function verifyVectorBundle(vec) {
@@ -524,8 +812,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       process.exit(1);
     }
     console.log(JSON.stringify({ ok: true, verifier: "newsatoshi-independent-js-openssl", empty_note_root: emptyRoot, asert_neutral_bits: "0x" + bits.toString(16) }));
+  } else if (cmd === "--live") {
+    const url = process.argv[3] || "https://newsatoshi.org/mainnet";
+    verifyLiveMainnetV2(url)
+      .then((res) => {
+        console.log(JSON.stringify(res, null, 2));
+        process.exit(0);
+      })
+      .catch((err) => {
+        console.error(JSON.stringify({ ok: false, error: err.message }));
+        process.exit(1);
+      });
   } else {
-    console.error("usage: newsatoshi_verifier.mjs verify-vector [file.json] | --self-test");
+    console.error("usage: newsatoshi_verifier.mjs verify-vector [file.json] | --self-test | --live [https://newsatoshi.org/mainnet]");
     process.exit(2);
   }
 }
