@@ -9,7 +9,7 @@
 //!     cargo run --release --example extract_lean_circuit -- proof/SpendCircuitFull.lean
 //!     lean proof/SpendCircuitFull.lean
 
-use newsatoshi::{hash, note, spend::{self, BLK, N_CONSTRAINTS, ROWS, WIDTH}};
+use newsatoshi::{batch_spend, hash, note, spend::{self, BLK, N_CONSTRAINTS, ROWS, WIDTH}};
 use rand::Rng;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -569,6 +569,67 @@ fn main() {
     let extracted_assert_ft = extract_assertions_for(false, true);
     let extracted_assert_tf = extract_assertions_for(true, false);
     let extracted_assert_tt = extract_assertions_for(true, true);
+
+    // 4e. Cross-check live Rust `batch_spend::{batch_rows, periodic_table_batch, assertion_cells_batch}`
+    // across EVERY batch size K ∈ 2..=16 against the exact Lean 4 Section 11 tiling specification!
+    for k in batch_spend::MIN_BATCH_SPENDS..=batch_spend::MAX_BATCH_SPENDS {
+        let lean_rows = if k <= 3 {
+            16_384
+        } else if k <= 7 {
+            32_768
+        } else if k <= 14 {
+            65_536
+        } else {
+            131_072
+        };
+        assert_eq!(
+            batch_spend::batch_rows(k),
+            lean_rows,
+            "batch_rows({k}) disagreed with Lean batchRows({k})"
+        );
+        let bper = batch_spend::periodic_table_batch(k);
+        assert_eq!(bper.len(), lean_rows);
+        for r in 0..(k * 4672) {
+            assert_eq!(
+                bper[r],
+                periodic[r % 4672],
+                "BatchSpend(k={k}) periodic row {r} diverged from single-spend row {}",
+                r % 4672
+            );
+        }
+        for r in (k * 4672)..lean_rows {
+            assert_eq!(bper[r][0], periodic[r % 64][0]);
+            for s in 1..np {
+                assert_eq!(
+                    bper[r][s],
+                    Felt::ZERO,
+                    "BatchSpend(k={k}) trailing row {r} selector {s} must be zero"
+                );
+            }
+        }
+        let spends_k: Vec<spend::SpendPublic> = (0..k)
+            .map(|s| make_probe(0x3000_0000 + (s as u32) * 0x0010_0000, (s as i64) * 100 - 250, (s & 1) == 1, ((s >> 1) & 1) == 1))
+            .collect();
+        let bpi = batch_spend::BatchSpendPublic {
+            spends: spends_k.clone(),
+            prover_a_pk: [0x42; 8],
+            prover_fee: 10_000,
+        };
+        let got_batch_asserts = batch_spend::assertion_cells_batch(&bpi);
+        let mut expected_batch_asserts = Vec::new();
+        for (s, sp) in spends_k.iter().enumerate() {
+            for (c, r, v) in spend::assertion_cells(sp) {
+                expected_batch_asserts.push((c, s * 4672 + r, v));
+            }
+        }
+        assert_eq!(
+            got_batch_asserts, expected_batch_asserts,
+            "BatchSpend(k={k}) assertion_cells_batch diverged from shifted single-spend assertions"
+        );
+    }
+    // Also verify live Rust `batch_spend::build_batch_trace` accepts K=2 concreteWitness!
+    let _k2_trace = batch_spend::build_batch_trace(&[concrete_wit.clone(), concrete_wit.clone()], &[])
+        .expect("live Rust build_batch_trace K=2 must succeed on concreteWitness");
 
     // Also emit per-constraint equality proofs grouped cleanly so Lean's pure kernel checks
     // EVERY SINGLE ONE of the 249 constraints (`#0..#248`) with ZERO `native_decide` and ZERO `sorry`!
@@ -8444,9 +8505,59 @@ theorem evalPoly_congr {{env1 env2 : Nat → Int}} :
                  evalMonomial_congr ms (h (ms, c) (List.mem_cons_self ..)),
                  evalPoly_congr tl (fun m hm => h m (List.mem_cons_of_mem _ hm))]
 
-theorem all_rustCon_vars_in_range :
-    (List.range 249).all (fun i =>
-      (rustCon i).all (fun m => m.1.all (fun v => decide (v < 2 * W_COLS + 14)))) = true := by decide
+def isActiveSelB (v : Nat) : Bool := Nat.ble 495 v && Nat.blt v 508
+def isEndZeroSelB (v : Nat) : Bool := Nat.ble 495 v && Nat.blt v 508 && (v != 496) && (v != 504)
+def isNextRowB (v : Nat) : Bool := Nat.ble 247 v && Nat.blt v 494
+
+def polyOk (p : Poly) : Bool :=
+  p.all (fun m =>
+    m.1.all (fun v => Nat.blt v 508) &&
+    m.1.any isActiveSelB &&
+    (!(m.1.any isNextRowB) || m.1.any isEndZeroSelB))
+
+def rustConOk (i : Nat) : Bool := polyOk (rustCon i)
+
+theorem rustConOk_b0  : (List.range 16).all (fun j => polyOk (rustConBucket0  j)) = true := by decide
+theorem rustConOk_b1  : (List.range 16).all (fun j => polyOk (rustConBucket1  j)) = true := by decide
+theorem rustConOk_b2  : (List.range 16).all (fun j => polyOk (rustConBucket2  j)) = true := by decide
+theorem rustConOk_b3  : (List.range 16).all (fun j => polyOk (rustConBucket3  j)) = true := by decide
+theorem rustConOk_b4  : (List.range 16).all (fun j => polyOk (rustConBucket4  j)) = true := by decide
+theorem rustConOk_b5  : (List.range 16).all (fun j => polyOk (rustConBucket5  j)) = true := by decide
+theorem rustConOk_b6  : (List.range 16).all (fun j => polyOk (rustConBucket6  j)) = true := by decide
+theorem rustConOk_b7  : (List.range 16).all (fun j => polyOk (rustConBucket7  j)) = true := by decide
+theorem rustConOk_b8  : (List.range 16).all (fun j => polyOk (rustConBucket8  j)) = true := by decide
+theorem rustConOk_b9  : (List.range 16).all (fun j => polyOk (rustConBucket9  j)) = true := by decide
+theorem rustConOk_b10 : (List.range 16).all (fun j => polyOk (rustConBucket10 j)) = true := by decide
+theorem rustConOk_b11 : (List.range 16).all (fun j => polyOk (rustConBucket11 j)) = true := by decide
+theorem rustConOk_b12 : (List.range 16).all (fun j => polyOk (rustConBucket12 j)) = true := by decide
+theorem rustConOk_b13 : (List.range 16).all (fun j => polyOk (rustConBucket13 j)) = true := by decide
+theorem rustConOk_b14 : (List.range 16).all (fun j => polyOk (rustConBucket14 j)) = true := by decide
+theorem rustConOk_b15 : (List.range 9).all  (fun j => polyOk (rustConBucket15 j)) = true := by decide
+
+theorem rustConOk_of_lt {{i : Nat}} (hi : i < 249) : rustConOk i = true := by
+  unfold rustConOk rustCon
+  have hr : i % 16 < 16 := Nat.mod_lt i (by decide)
+  have hcases : i / 16 = 0 ∨ i / 16 = 1 ∨ i / 16 = 2 ∨ i / 16 = 3 ∨
+                i / 16 = 4 ∨ i / 16 = 5 ∨ i / 16 = 6 ∨ i / 16 = 7 ∨
+                i / 16 = 8 ∨ i / 16 = 9 ∨ i / 16 = 10 ∨ i / 16 = 11 ∨
+                i / 16 = 12 ∨ i / 16 = 13 ∨ i / 16 = 14 ∨ i / 16 = 15 := by omega
+  rcases hcases with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h <;> rw [h]
+  · exact List.all_eq_true.mp rustConOk_b0  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b1  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b2  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b3  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b4  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b5  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b6  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b7  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b8  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b9  (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b10 (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b11 (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b12 (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b13 (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b14 (i % 16) (List.mem_range.mpr hr)
+  · exact List.all_eq_true.mp rustConOk_b15 (i % 16) (List.mem_range.mpr (by omega))
 
 theorem extracted_air_iff_raw_air (T : RawFieldTrace) :
     ExtractedAirTransitionsHold T ↔ RawAirTransitionsHold T := by
@@ -8455,9 +8566,12 @@ theorem extracted_air_iff_raw_air (T : RawFieldTrace) :
     intro r hr i hi
     apply evalPoly_congr
     intro m hm v hv
-    have hvars := List.all_eq_true.mp all_rustCon_vars_in_range i (List.mem_range.mpr hi)
-    have hmon := List.all_eq_true.mp hvars m hm
-    have hvlt : v < 2 * W_COLS + 14 := of_decide_eq_true (List.all_eq_true.mp hmon v hv)
+    have hmon := List.all_eq_true.mp (rustConOk_of_lt hi) m hm
+    simp only [Bool.and_eq_true] at hmon
+    have hvlt : v < 2 * W_COLS + 14 := by
+      have hb := List.all_eq_true.mp hmon.1.1 v hv
+      have h508 : v < 508 := Nat.blt_eq.mp hb
+      simp [W_COLS]; omega
     unfold extractedRowEnv rowEnv
     split
     · rfl
@@ -8654,6 +8768,340 @@ theorem extracted_rust_air_non_vacuous :
     ∃ T : RawFieldTrace, ExtractedAirTransitionsHold T ∧ ExtractedBoundaryAssertions concretePi T :=
   (extracted_rust_air_iff_valid_spend_witness concretePi).mpr ⟨concreteWitness⟩
 
+-- ============================================================================
+-- SECTION 11: MULTI-SPEND `BatchSpend` (K ∈ 2..=16) VERTICAL TILING SOUNDNESS,
+-- COMPLETENESS, INTER-SPEND ISOLATION & CONCRETE K=2 NON-VACUITY
+-- ============================================================================
+
+def batchRows (k : Nat) : Nat :=
+  if k ≤ 3 then 16384 else if k ≤ 7 then 32768 else if k ≤ 14 then 65536 else 131072
+
+theorem batchRows_ge (k : Nat) (hk2 : 2 ≤ k) (hk16 : k ≤ 16) :
+    k * 4672 + 64 ≤ batchRows k := by
+  unfold batchRows
+  split; omega; split; omega; split <;> omega
+
+structure BatchRawFieldTrace (k : Nat) where
+  cell   : Nat → Nat → Int
+  hRange : ∀ r c, r < batchRows k → c < W_COLS → 0 ≤ cell r c ∧ cell r c < P
+
+/-- Live Rust `batch_spend::periodic_table_batch(k)` row-for-row for every `k ∈ 2..=16`
+    (cross-checked across all 15 batch sizes `k = 2..16` before emission). -/
+def batchPeriodicVal (k r s : Nat) : Int :=
+  if r < k * 4672 then extractedPeriodicVal (r % 4672) s
+  else if s = 0 then extractedPerK[r % 64]!
+  else 0
+
+def batchRowEnv (k : Nat) (T : BatchRawFieldTrace k) (r v : Nat) : Int :=
+  if v < W_COLS then T.cell r v
+  else if v < 2 * W_COLS then T.cell (r + 1) (v - W_COLS)
+  else batchPeriodicVal k r (v - 2 * W_COLS)
+
+/-- ALL 249 live Rust `spend::eval_constraints` polynomials (reused verbatim by `BatchSpendAir`)
+    vanish modulo Goldilocks `P` on every adjacent row pair `(r, r + 1)` of the tiled trace. -/
+def BatchAirTransitionsHold (k : Nat) (T : BatchRawFieldTrace k) : Prop :=
+  ∀ r, r < batchRows k - 1 → ∀ i, i < 249 → evalPoly (batchRowEnv k T r) (rustCon i) % P = 0
+
+/-- Exact shifted boundary assertions of `batch_spend::assertion_cells_batch(&pi)` across all `k`
+    sub-spends (each sub-spend `s` occupies rows `[s * 4672 .. s * 4672 + 4672)`). -/
+def BatchBoundaryAssertions (k : Nat) (pis : Fin k → SpendPublicStmt) (T : BatchRawFieldTrace k) : Prop :=
+  ∀ s : Fin k, ∀ a ∈ extractedAssertions (pis s).dummy0 (pis s).dummy1,
+    T.cell (s.val * 4672 + a.2.1) a.1 = evalAssertExpr (pis s) a.2.2
+
+theorem all_extractedAssertions_row_lt_4672 :
+    ∀ d0 d1 : Bool, (extractedAssertions d0 d1).all (fun a => Nat.blt a.2.1 4672) = true := by decide
+
+theorem evalMonomial_zero_of_mem_zero {{env : Nat → Int}} :
+    ∀ (vs : List Nat), (∃ v ∈ vs, env v = 0) → evalMonomial env vs = 0
+  | [], ⟨_, h, _⟩ => by cases h
+  | v :: vs, ⟨u, hu, hz⟩ => by
+      simp only [List.mem_cons] at hu
+      rcases hu with rfl | htail
+      · simp [evalMonomial, hz]
+      · simp [evalMonomial, evalMonomial_zero_of_mem_zero vs ⟨u, htail, hz⟩]
+
+theorem evalPoly_zero_of_all_zero {{env : Nat → Int}} :
+    ∀ (p : Poly), (∀ m ∈ p, evalMonomial env m.1 = 0) → evalPoly env p = 0
+  | [], _ => rfl
+  | (ms, c) :: tl, h => by
+      simp only [evalPoly, h (ms, c) (List.mem_cons_self ..), Int.mul_zero, Int.zero_add]
+      exact evalPoly_zero_of_all_zero tl (fun m hm => h m (List.mem_cons_of_mem _ hm))
+
+theorem evalPoly_congr_or_zero {{env1 env2 : Nat → Int}} :
+    ∀ (p : Poly),
+      (∀ m ∈ p, (∀ v ∈ m.1, env1 v = env2 v) ∨ (evalMonomial env1 m.1 = 0 ∧ evalMonomial env2 m.1 = 0)) →
+      evalPoly env1 p = evalPoly env2 p
+  | [], _ => rfl
+  | (ms, c) :: tl, h => by
+      have hhd : evalMonomial env1 ms = evalMonomial env2 ms := by
+        rcases h (ms, c) (List.mem_cons_self ..) with hEq | ⟨h1, h2⟩
+        · exact evalMonomial_congr ms hEq
+        · rw [h1, h2]
+      simp only [evalPoly, hhd, evalPoly_congr_or_zero tl (fun m hm => h m (List.mem_cons_of_mem _ hm))]
+
+theorem evalPoly_rustCon_zero_of_inactive {{env : Nat → Int}} {{i : Nat}} (hi : i < 249)
+    (hz : ∀ sel, 1 ≤ sel → sel < 14 → env (2 * W_COLS + sel) = 0) :
+    evalPoly env (rustCon i) = 0 := by
+  apply evalPoly_zero_of_all_zero
+  intro m hm
+  have hmon := List.all_eq_true.mp (rustConOk_of_lt hi) m hm
+  simp only [Bool.and_eq_true] at hmon
+  rcases List.any_eq_true.mp hmon.1.2 with ⟨v, hvMem, hvAct⟩
+  simp only [isActiveSelB, Bool.and_eq_true] at hvAct
+  have hge : 495 ≤ v := Nat.le_of_ble_eq_true hvAct.1
+  have hlt : v < 508 := Nat.blt_eq.mp hvAct.2
+  refine evalMonomial_zero_of_mem_zero m.1 ⟨v, hvMem, ?_⟩
+  have hsub : v = 2 * W_COLS + (v - 2 * W_COLS) := by simp [W_COLS]; omega
+  rw [hsub]
+  exact hz (v - 2 * W_COLS) (by simp [W_COLS]; omega) (by simp [W_COLS]; omega)
+
+theorem extractedPeriodicVal_4671_end_zero (sel : Nat) (h1 : 1 ≤ sel) (h14 : sel < 14)
+    (h2 : sel ≠ 2) (h10 : sel ≠ 10) : extractedPeriodicVal 4671 sel = 0 := by
+  rw [← periodicVal_eq_extracted_all_114688 4671 sel (by decide) h14]
+  have hcases : sel = 1 ∨ sel = 3 ∨ sel = 4 ∨ sel = 5 ∨ sel = 6 ∨ sel = 7 ∨
+                sel = 8 ∨ sel = 9 ∨ sel = 11 ∨ sel = 12 ∨ sel = 13 := by omega
+  rcases hcases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+
+theorem extractedPeriodicVal_ge_4672_zero (r sel : Nat) (hr1 : 4672 ≤ r) (hr2 : r < 8192)
+    (hs1 : 1 ≤ sel) (hs14 : sel < 14) : extractedPeriodicVal r sel = 0 := by
+  rw [← periodicVal_eq_extracted_all_114688 r sel hr2 hs14]
+  have hb : 73 ≤ r / 64 := by omega
+  have hnot : ¬(64 ≤ r ∧ r < 4671) := by omega
+  have hcases : sel = 1 ∨ sel = 2 ∨ sel = 3 ∨ sel = 4 ∨ sel = 5 ∨ sel = 6 ∨ sel = 7 ∨
+                sel = 8 ∨ sel = 9 ∨ sel = 10 ∨ sel = 11 ∨ sel = 12 ∨ sel = 13 := by omega
+  rcases hcases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    (simp [periodicVal, hnot]; try omega)
+
+/-- Inter-spend boundary isolation theorem: at local row `4671` (the final row of `Kind::CmOut(1)`
+    before the `Kind::Rand` separator block), EVERY one of the 249 live Rust constraints depends
+    strictly on the current row and periodic selectors — never on the next row! -/
+theorem evalPoly_rustCon_indep_of_next_at_4671 {{env1 env2 : Nat → Int}} {{i : Nat}} (hi : i < 249)
+    (hCur : ∀ v, v < W_COLS → env1 v = env2 v)
+    (hPer : ∀ sel, sel < 14 → env1 (2 * W_COLS + sel) = extractedPeriodicVal 4671 sel ∧
+                               env2 (2 * W_COLS + sel) = extractedPeriodicVal 4671 sel) :
+    evalPoly env1 (rustCon i) = evalPoly env2 (rustCon i) := by
+  apply evalPoly_congr_or_zero
+  intro m hm
+  have hmon := List.all_eq_true.mp (rustConOk_of_lt hi) m hm
+  simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true'] at hmon
+  rcases hmon.2 with hNoNext | hHasEndZero
+  · left
+    intro v hvMem
+    have hv508 : v < 508 := Nat.blt_eq.mp (List.all_eq_true.mp hmon.1.1 v hvMem)
+    have hvlt : v < 2 * W_COLS + 14 := by simp [W_COLS]; omega
+    by_cases hltW : v < W_COLS
+    · exact hCur v hltW
+    · by_cases hlt2W : v < 2 * W_COLS
+      · have htrue : isNextRowB v = true := by
+          simp only [isNextRowB, Bool.and_eq_true]
+          exact ⟨Nat.ble_eq.mpr (by simp [W_COLS] at hltW; omega), Nat.blt_eq.mpr (by simp [W_COLS] at hlt2W; omega)⟩
+        have hany : m.1.any isNextRowB = true := List.any_eq_true.mpr ⟨v, hvMem, htrue⟩
+        rw [hany] at hNoNext; cases hNoNext
+      · have hsub : v = 2 * W_COLS + (v - 2 * W_COLS) := by omega
+        rw [hsub]
+        have hp := hPer (v - 2 * W_COLS) (by omega)
+        rw [hp.1, hp.2]
+  · right
+    rcases List.any_eq_true.mp hHasEndZero with ⟨v, hvMem, hvEnd⟩
+    simp only [isEndZeroSelB, Bool.and_eq_true, bne_iff_ne] at hvEnd
+    have hge : 495 ≤ v := Nat.le_of_ble_eq_true hvEnd.1.1.1
+    have hlt : v < 508 := Nat.blt_eq.mp hvEnd.1.1.2
+    have hne496 : v ≠ 496 := hvEnd.1.2
+    have hne504 : v ≠ 504 := hvEnd.2
+    have hsub : v = 2 * W_COLS + (v - 2 * W_COLS) := by simp [W_COLS]; omega
+    have hp := hPer (v - 2 * W_COLS) (by simp [W_COLS]; omega)
+    have hz : extractedPeriodicVal 4671 (v - 2 * W_COLS) = 0 :=
+      extractedPeriodicVal_4671_end_zero (v - 2 * W_COLS)
+        (by simp [W_COLS]; omega) (by simp [W_COLS]; omega)
+        (by simp [W_COLS]; omega) (by simp [W_COLS]; omega)
+    constructor
+    · refine evalMonomial_zero_of_mem_zero m.1 ⟨v, hvMem, ?_⟩
+      rw [hsub, hp.1, hz]
+    · refine evalMonomial_zero_of_mem_zero m.1 ⟨v, hvMem, ?_⟩
+      rw [hsub, hp.2, hz]
+
+def sliceSubSpend (k : Nat) (hk2 : 2 ≤ k) (hk16 : k ≤ 16) (T : BatchRawFieldTrace k) (s : Fin k) :
+    RawFieldTrace where
+  cell r c := if r < 4672 then T.cell (s.val * 4672 + r) c else 0
+  hRange r c _ hc := by
+    split
+    · have hge := batchRows_ge k hk2 hk16
+      have hlt : s.val * 4672 + r < batchRows k := by
+        have hs : s.val + 1 ≤ k := s.isLt
+        have hmul : (s.val + 1) * 4672 ≤ k * 4672 := Nat.mul_le_mul_right 4672 hs
+        omega
+      exact T.hRange (s.val * 4672 + r) c hlt hc
+    · exact ⟨by decide, by decide⟩
+
+/-- BATCH-SPEND SOUNDNESS (ALL `K ∈ 2..=16`):
+    Any `BatchRawFieldTrace k` satisfying `BatchAirTransitionsHold` and `BatchBoundaryAssertions`
+    yields an independent valid semantic shielded-spend witness `ValidSpendWitness (pis s)` for
+    EVERY sub-spend `s : Fin k` (zero cross-spend contamination across the `Kind::Rand` separator). -/
+theorem batch_spend_air_soundness (k : Nat) (hk2 : 2 ≤ k) (hk16 : k ≤ 16)
+    (pis : Fin k → SpendPublicStmt) (T : BatchRawFieldTrace k)
+    (hT : BatchAirTransitionsHold k T) (hB : BatchBoundaryAssertions k pis T) :
+    ∀ s : Fin k, Nonempty (ValidSpendWitness (pis s)) := by
+  intro s
+  let Ts := sliceSubSpend k hk2 hk16 T s
+  have hge := batchRows_ge k hk2 hk16
+  have hsMul : (s.val + 1) * 4672 ≤ k * 4672 := Nat.mul_le_mul_right 4672 s.isLt
+  have hTrans : ExtractedAirTransitionsHold Ts := by
+    intro r hr i hi
+    by_cases hr4671 : r < 4671
+    · have hrowLt : s.val * 4672 + r < batchRows k - 1 := by omega
+      have hInK : s.val * 4672 + r < k * 4672 := by omega
+      have hMod : (s.val * 4672 + r) % 4672 = r := by
+        rw [Nat.mul_comm, Nat.mul_add_mod, Nat.mod_eq_of_lt (by omega)]
+      have hEq : evalPoly (extractedRowEnv Ts r) (rustCon i) =
+          evalPoly (batchRowEnv k T (s.val * 4672 + r)) (rustCon i) := by
+        apply evalPoly_congr
+        intro m hm v hv
+        unfold extractedRowEnv batchRowEnv
+        split
+        · simp [Ts, sliceSubSpend, show r < 4672 from by omega]
+        · split
+          · simp [Ts, sliceSubSpend, show r + 1 < 4672 from by omega, show s.val * 4672 + r + 1 = s.val * 4672 + (r + 1) from by omega]
+          · simp [batchPeriodicVal, hInK, hMod]
+      rw [hEq]
+      exact hT (s.val * 4672 + r) hrowLt i hi
+    · by_cases hrEq : r = 4671
+      · subst hrEq
+        have hrowLt : s.val * 4672 + 4671 < batchRows k - 1 := by omega
+        have hInK : s.val * 4672 + 4671 < k * 4672 := by omega
+        have hMod : (s.val * 4672 + 4671) % 4672 = 4671 := by
+          rw [Nat.mul_comm, Nat.mul_add_mod, Nat.mod_eq_of_lt (by decide)]
+        have hEq : evalPoly (extractedRowEnv Ts 4671) (rustCon i) =
+            evalPoly (batchRowEnv k T (s.val * 4672 + 4671)) (rustCon i) := by
+          apply evalPoly_rustCon_indep_of_next_at_4671 hi
+          · intro v hv
+            unfold extractedRowEnv batchRowEnv
+            simp [hv, Ts, sliceSubSpend]
+          · intro sel hsel
+            unfold extractedRowEnv batchRowEnv
+            have h1 : ¬(2 * W_COLS + sel < W_COLS) := by simp [W_COLS]; omega
+            have h2 : ¬(2 * W_COLS + sel < 2 * W_COLS) := by omega
+            simp [h1, h2, batchPeriodicVal, hInK, hMod]
+        rw [hEq]
+        exact hT (s.val * 4672 + 4671) hrowLt i hi
+      · have hZero : evalPoly (extractedRowEnv Ts r) (rustCon i) = 0 := by
+          apply evalPoly_rustCon_zero_of_inactive hi
+          intro sel hs1 hs14
+          unfold extractedRowEnv
+          have h1 : ¬(2 * W_COLS + sel < W_COLS) := by simp [W_COLS]; omega
+          have h2 : ¬(2 * W_COLS + sel < 2 * W_COLS) := by omega
+          simp only [h1, h2, ↓reduceIte, Nat.add_sub_cancel_left]
+          exact extractedPeriodicVal_ge_4672_zero r sel (by omega) (by omega) hs1 hs14
+        rw [hZero]; rfl
+  have hBound : ExtractedBoundaryAssertions (pis s) Ts := by
+    intro a ha
+    have hlt := Nat.blt_eq.mp (List.all_eq_true.mp (all_extractedAssertions_row_lt_4672 (pis s).dummy0 (pis s).dummy1) a ha)
+    simp only [Ts, sliceSubSpend, hlt, ↓reduceIte]
+    exact hB s a ha
+  exact (extracted_rust_air_iff_valid_spend_witness (pis s)).mp ⟨Ts, hTrans, hBound⟩
+
+def canonicalBatchTrace (k : Nat) (pis : Fin k → SpendPublicStmt)
+    (ws : ∀ s : Fin k, ValidSpendWitness (pis s)) : BatchRawFieldTrace k where
+  cell r c :=
+    if h : r < k * 4672 then
+      let s : Fin k := ⟨r / 4672, (Nat.div_lt_iff_lt_mul (by decide)).mpr h⟩
+      (canonicalRawTrace (pis s) (ws s)).cell (r % 4672) c
+    else 0
+  hRange r c _ hc := by
+    split
+    · exact (canonicalRawTrace _ _).hRange (r % 4672) c (by have := Nat.mod_lt r (by decide : 0 < 4672); omega) hc
+    · exact ⟨by decide, by decide⟩
+
+/-- FULL BIDIRECTIONAL `BatchSpend` CHARACTERIZATION FOR ALL `K ∈ 2..=16`:
+    A single vertically-tiled `BatchRawFieldTrace k` satisfies all 249 live Rust transition
+    constraints and all shifted boundary assertions IF AND ONLY IF every sub-spend `s : Fin k`
+    has a valid semantic shielded-spend witness `ValidSpendWitness (pis s)`. -/
+theorem batch_spend_rust_air_iff_valid_witnesses (k : Nat) (hk2 : 2 ≤ k) (hk16 : k ≤ 16)
+    (pis : Fin k → SpendPublicStmt) :
+    (∃ T : BatchRawFieldTrace k, BatchAirTransitionsHold k T ∧ BatchBoundaryAssertions k pis T) ↔
+      (∀ s : Fin k, Nonempty (ValidSpendWitness (pis s))) := by
+  constructor
+  · rintro ⟨T, hT, hB⟩
+    exact batch_spend_air_soundness k hk2 hk16 pis T hT hB
+  · intro hAll
+    let ws : ∀ s : Fin k, ValidSpendWitness (pis s) := fun s => Classical.choice (hAll s)
+    let Tb := canonicalBatchTrace k pis ws
+    refine ⟨Tb, ?_, ?_⟩
+    · intro r hr i hi
+      by_cases hInK : r < k * 4672
+      · let s : Fin k := ⟨r / 4672, (Nat.div_lt_iff_lt_mul (by decide)).mpr hInK⟩
+        let rloc := r % 4672
+        have hSingle : ExtractedAirTransitionsHold (canonicalRawTrace (pis s) (ws s)) :=
+          (extracted_air_iff_raw_air _).mpr (valid_witness_satisfies_raw_air (pis s) (ws s)).1
+        by_cases hrl : rloc < 4671
+        · have hr1InK : r + 1 < k * 4672 := by
+            have : (r / 4672 + 1) * 4672 ≤ k * 4672 := Nat.mul_le_mul_right 4672 s.isLt
+            omega
+          have hdiv1 : (r + 1) / 4672 = r / 4672 := by omega
+          have hmod1 : (r + 1) % 4672 = rloc + 1 := by omega
+          have hEq : evalPoly (batchRowEnv k Tb r) (rustCon i) =
+              evalPoly (extractedRowEnv (canonicalRawTrace (pis s) (ws s)) rloc) (rustCon i) := by
+            apply evalPoly_congr
+            intro m hm v hv
+            unfold batchRowEnv extractedRowEnv
+            split
+            · simp [Tb, canonicalBatchTrace, hInK, s, rloc]
+            · split
+              · have hsEq : (⟨(r + 1) / 4672, (Nat.div_lt_iff_lt_mul (by decide)).mpr hr1InK⟩ : Fin k) = s :=
+                  Fin.ext hdiv1
+                simp only [Tb, canonicalBatchTrace, hr1InK, ↓reduceDIte, hmod1]
+                rw [hsEq]
+              · simp [batchPeriodicVal, hInK, rloc]
+          rw [hEq]
+          exact hSingle rloc (by omega) i hi
+        · have hrlEq : r % 4672 = 4671 := by
+            have := Nat.mod_lt r (by decide : 0 < 4672); omega
+          have hEq : evalPoly (batchRowEnv k Tb r) (rustCon i) =
+              evalPoly (extractedRowEnv (canonicalRawTrace (pis s) (ws s)) 4671) (rustCon i) := by
+            apply evalPoly_rustCon_indep_of_next_at_4671 hi
+            · intro v hv
+              unfold batchRowEnv extractedRowEnv
+              simp [hv, Tb, canonicalBatchTrace, hInK, s, hrlEq]
+            · intro sel hsel
+              unfold batchRowEnv extractedRowEnv
+              have h1 : ¬(2 * W_COLS + sel < W_COLS) := by simp [W_COLS]; omega
+              have h2 : ¬(2 * W_COLS + sel < 2 * W_COLS) := by omega
+              simp [h1, h2, batchPeriodicVal, hInK, hrlEq]
+          rw [hEq]
+          exact hSingle 4671 (by decide) i hi
+      · have hZero : evalPoly (batchRowEnv k Tb r) (rustCon i) = 0 := by
+          apply evalPoly_rustCon_zero_of_inactive hi
+          intro sel hs1 hs14
+          unfold batchRowEnv
+          have h1 : ¬(2 * W_COLS + sel < W_COLS) := by simp [W_COLS]; omega
+          have h2 : ¬(2 * W_COLS + sel < 2 * W_COLS) := by omega
+          simp [h1, h2, batchPeriodicVal, hInK, show sel ≠ 0 from by omega]
+        rw [hZero]; rfl
+    · intro s a ha
+      have hlt := Nat.blt_eq.mp (List.all_eq_true.mp (all_extractedAssertions_row_lt_4672 (pis s).dummy0 (pis s).dummy1) a ha)
+      have hInK : s.val * 4672 + a.2.1 < k * 4672 := by
+        have : (s.val + 1) * 4672 ≤ k * 4672 := Nat.mul_le_mul_right 4672 s.isLt
+        omega
+      have hdiv : (s.val * 4672 + a.2.1) / 4672 = s.val := by
+        rw [Nat.mul_comm, Nat.mul_add_div (by decide), Nat.div_eq_of_lt hlt, Nat.add_zero]
+      have hmod : (s.val * 4672 + a.2.1) % 4672 = a.2.1 := by
+        rw [Nat.mul_comm, Nat.mul_add_mod, Nat.mod_eq_of_lt hlt]
+      have hsEq : (⟨(s.val * 4672 + a.2.1) / 4672, (Nat.div_lt_iff_lt_mul (by decide)).mpr hInK⟩ : Fin k) = s :=
+        Fin.ext hdiv
+      simp only [Tb, canonicalBatchTrace, hInK, ↓reduceDIte, hmod]
+      rw [hsEq]
+      have hSingleB : ExtractedBoundaryAssertions (pis s) (canonicalRawTrace (pis s) (ws s)) :=
+        (extracted_assertions_iff_raw_boundary (pis s) _).mpr (valid_witness_satisfies_raw_air (pis s) (ws s)).2
+      exact hSingleB a ha
+
+/-- CONCRETE `K = 2` `BatchSpend` NON-VACUITY CERTIFICATE:
+    Certifies a live `16,384 × 247` tiled `BatchSpend` trace for 2 real non-dummy 2-in/2-out spends. -/
+theorem batch_spend_k2_non_vacuous :
+    ∃ T : BatchRawFieldTrace 2,
+      BatchAirTransitionsHold 2 T ∧
+      BatchBoundaryAssertions 2 (fun _ => concretePi) T :=
+  (batch_spend_rust_air_iff_valid_witnesses 2 (by decide) (by decide) (fun _ => concretePi)).mpr
+    (fun _ => ⟨concreteWitness⟩)
+
 #print axioms fips180_4_sha256_empty_exact
 #print axioms fips180_4_sha256_abc_exact
 #print axioms xor3_poly_exact
@@ -8678,6 +9126,9 @@ theorem extracted_rust_air_non_vacuous :
 #print axioms extracted_assertions_iff_raw_boundary
 #print axioms extracted_rust_air_iff_valid_spend_witness
 #print axioms extracted_rust_air_non_vacuous
+#print axioms batch_spend_air_soundness
+#print axioms batch_spend_rust_air_iff_valid_witnesses
+#print axioms batch_spend_k2_non_vacuous
 
 end NewsatoshiFullCircuit
 "#,

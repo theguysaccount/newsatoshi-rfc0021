@@ -139,6 +139,26 @@ fn periodic_columns_batch(k: usize) -> Vec<Vec<Felt>> {
     cols
 }
 
+/// Row-major periodic table for a `BatchSpend` of `k` spends (`batch_rows(k) × N_PERIODIC`),
+/// exposed for live extraction & Lean 4 formal tiling verification.
+pub fn periodic_table_batch(k: usize) -> Vec<Vec<Felt>> {
+    let rows = batch_rows(k);
+    let per = periodic_columns_batch(k);
+    (0..rows)
+        .map(|r| per.iter().map(|p| p[r % p.len()]).collect())
+        .collect()
+}
+
+/// Boundary assertions as concrete `(column, row, value)` triples for `BatchSpend`.
+pub fn assertion_cells_batch(pi: &BatchSpendPublic) -> Vec<(usize, usize, Felt)> {
+    let rows = batch_rows(pi.spends.len());
+    let mut out = Vec::new();
+    for a in assertions_batch(pi) {
+        a.apply(rows, |row, value| out.push((a.column(), row, value)));
+    }
+    out
+}
+
 fn degrees_batch(rows: usize) -> Vec<TransitionConstraintDegree> {
     let d = |base: usize| TransitionConstraintDegree::with_cycles(base, vec![rows]);
     let mut v = vec![d(3), d(3), d(1), d(1)];
