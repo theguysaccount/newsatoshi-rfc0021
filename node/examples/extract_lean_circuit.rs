@@ -1111,6 +1111,513 @@ def extractedAssertDummy : List (Nat × Nat) := [{assert_dummy_str}]
 theorem boundary_assertions_counts_exact :
     extractedAssertReal.length = 51 ∧ extractedAssertDummy.length = 39 := by decide
 
+-- ============================================================================
+-- SECTION 7: END-TO-END SEMANTIC SPEND SOUNDNESS (OWNERSHIP, MERKLE
+-- MEMBERSHIP, NULLIFIER UNIQUENESS & INTEGER CONSERVATION UNDER ASSERTIONS)
+-- ============================================================================
+
+abbrev Word8 := Fin 8 → UInt32
+abbrev Rho5  := Fin 5 → UInt32
+
+def arr8ToWord8 (a : Array UInt32) : Word8 := fun i => a[i.val]!
+
+def noteAddress (sk : Word8) : Word8 :=
+  arr8ToWord8 (sha256Compress #[
+    UInt32.ofNat TAG_ADDR,
+    sk 0, sk 1, sk 2, sk 3, sk 4, sk 5, sk 6, sk 7,
+    0, 0, 0, 0, 0, 0, 0
+  ])
+
+def noteCommit (apk : Word8) (vHi vLo : UInt32) (rho : Rho5) : Word8 :=
+  arr8ToWord8 (sha256Compress #[
+    UInt32.ofNat TAG_CM,
+    apk 0, apk 1, apk 2, apk 3, apk 4, apk 5, apk 6, apk 7,
+    vHi, vLo,
+    rho 0, rho 1, rho 2, rho 3, rho 4
+  ])
+
+def noteNullifier (sk : Word8) (pos : UInt32) (rho : Rho5) : Word8 :=
+  arr8ToWord8 (sha256Compress #[
+    UInt32.ofNat TAG_NF,
+    sk 0, sk 1, sk 2, sk 3, sk 4, sk 5, sk 6, sk 7,
+    pos,
+    rho 0, rho 1, rho 2, rho 3, rho 4,
+    0
+  ])
+
+def merkleMsg (cur sib : Word8) (bit : Nat) : Array UInt32 :=
+  if bit = 0 then
+    #[cur 0, cur 1, cur 2, cur 3, cur 4, cur 5, cur 6, cur 7,
+      sib 0, sib 1, sib 2, sib 3, sib 4, sib 5, sib 6, sib 7]
+  else
+    #[sib 0, sib 1, sib 2, sib 3, sib 4, sib 5, sib 6, sib 7,
+      cur 0, cur 1, cur 2, cur 3, cur 4, cur 5, cur 6, cur 7]
+
+def merkleStep (cur sib : Word8) (bit : Nat) : Word8 :=
+  arr8ToWord8 (sha256Compress (merkleMsg cur sib bit))
+
+def merkleRoot (leaf : Word8) (bits : Nat → Nat) (sibs : Nat → Word8) : Nat → Word8
+  | 0 => leaf
+  | k + 1 => merkleStep (merkleRoot leaf bits sibs k) (sibs k) (bits k)
+
+def noteValue (vHi vLo : UInt32) : Int :=
+  TWO32 * (vHi.toNat : Int) + (vLo.toNat : Int)
+
+def signedField (vb : Int) : Int :=
+  if vb ≥ 0 then vb % P else (P - ((-vb) % P)) % P
+
+/-- Public statement verified by `SpendAir` (`spend.rs:SpendPublic`). -/
+structure SpendPublicStmt where
+  root         : Word8
+  nf0          : Word8
+  nf1          : Word8
+  cmOut0       : Word8
+  cmOut1       : Word8
+  valueBalance : Int
+  dummy0       : Bool
+  dummy1       : Bool
+  hvb          : -MAX_VB_BOUND < valueBalance ∧ valueBalance < MAX_VB_BOUND
+
+/-- Complete semantic shielded-spend witness relation: spend authorization (ownership),
+    input note commitment binding, 32-level Merkle membership (all non-dummy inputs),
+    deterministic nullifier binding, output commitment binding, `< 2^60` note range bounds,
+    dummy zero-value enforcement, and exact integer value conservation. -/
+structure ValidSpendWitness (pi : SpendPublicStmt) where
+  sk0     : Word8
+  sk1     : Word8
+  apk0    : Word8
+  apk1    : Word8
+  vHiIn0  : UInt32
+  vLoIn0  : UInt32
+  vHiIn1  : UInt32
+  vLoIn1  : UInt32
+  rho0    : Rho5
+  rho1    : Rho5
+  cmIn0   : Word8
+  cmIn1   : Word8
+  bits0   : Nat → Nat
+  bits1   : Nat → Nat
+  sibs0   : Nat → Word8
+  sibs1   : Nat → Word8
+  pos0    : UInt32
+  pos1    : UInt32
+  apkOut0 : Word8
+  apkOut1 : Word8
+  vHiOut0 : UInt32
+  vLoOut0 : UInt32
+  vHiOut1 : UInt32
+  vLoOut1 : UInt32
+  rhoOut0 : Rho5
+  rhoOut1 : Rho5
+  -- 1. Spend authorization / ownership (`a_pk = H_addr(sk)`)
+  hOwner0           : apk0 = noteAddress sk0
+  hOwner1           : apk1 = noteAddress sk1
+  -- 2. Input note commitment binding (`cm_in = H_cm(a_pk, v, rho)`)
+  hCmIn0            : cmIn0 = noteCommit apk0 vHiIn0 vLoIn0 rho0
+  hCmIn1            : cmIn1 = noteCommit apk1 vHiIn1 vLoIn1 rho1
+  -- 3. 32-level Merkle inclusion + exact bit-accumulated leaf index for non-dummy inputs
+  hBits0            : ∀ k, k < 32 → bits0 k = 0 ∨ bits0 k = 1
+  hBits1            : ∀ k, k < 32 → bits1 k = 0 ∨ bits1 k = 1
+  hPos0             : pos0.toNat = posAcc bits0 32
+  hPos1             : pos1.toNat = posAcc bits1 32
+  hMerkle0          : pi.dummy0 = false → merkleRoot cmIn0 bits0 sibs0 32 = pi.root
+  hMerkle1          : pi.dummy1 = false → merkleRoot cmIn1 bits1 sibs1 32 = pi.root
+  -- 4. Deterministic nullifier binding (`nf = H_nf(sk, pos, rho)`)
+  hNf0              : pi.nf0 = noteNullifier sk0 pos0 rho0
+  hNf1              : pi.nf1 = noteNullifier sk1 pos1 rho1
+  -- 5. Output commitment binding
+  hCmOut0           : pi.cmOut0 = noteCommit apkOut0 vHiOut0 vLoOut0 rhoOut0
+  hCmOut1           : pi.cmOut1 = noteCommit apkOut1 vHiOut1 vLoOut1 rhoOut1
+  -- 6. Strict `< 2^60` note range bounds + dummy zero-value enforcement
+  hRangeIn0         : 0 ≤ noteValue vHiIn0 vLoIn0 ∧ noteValue vHiIn0 vLoIn0 < MAX_NOTE_BOUND
+  hRangeIn1         : 0 ≤ noteValue vHiIn1 vLoIn1 ∧ noteValue vHiIn1 vLoIn1 < MAX_NOTE_BOUND
+  hRangeOut0        : 0 ≤ noteValue vHiOut0 vLoOut0 ∧ noteValue vHiOut0 vLoOut0 < MAX_NOTE_BOUND
+  hRangeOut1        : 0 ≤ noteValue vHiOut1 vLoOut1 ∧ noteValue vHiOut1 vLoOut1 < MAX_NOTE_BOUND
+  hDummy0           : pi.dummy0 = true → noteValue vHiIn0 vLoIn0 = 0
+  hDummy1           : pi.dummy1 = true → noteValue vHiIn1 vLoIn1 = 0
+  -- 7. Exact integer value conservation (zero Goldilocks modular wraparound)
+  hConservation     : noteValue vHiIn0 vLoIn0 + noteValue vHiIn1 vLoIn1
+                        - (noteValue vHiOut0 vLoOut0 + noteValue vHiOut1 vLoOut1) = pi.valueBalance
+
+/-- Block-level trace satisfying the exact 128-block layout (`layout_128_blocks_exact`),
+    all 249 transition constraints (`all_249_constraints_match_fips180_4_spec` + Section 5/6
+    no-wrap/compression soundness), and all boundary assertions (`spend.rs:521-546`). -/
+structure AcceptedSpendTrace (pi : SpendPublicStmt) where
+  blkMsg    : Nat → Array UInt32
+  blkDig    : Nat → Word8
+  skReg     : Nat → Word8
+  rhoReg    : Nat → Rho5
+  posReg    : Nat → Nat
+  bitReg    : Nat → Nat
+  sibReg    : Nat → Word8
+  balReg  : Nat → Int
+  vHiIn0  : UInt32
+  vLoIn0  : UInt32
+  vHiIn1  : UInt32
+  vLoIn1  : UInt32
+  apkOut0 : Word8
+  apkOut1 : Word8
+  vHiOut0 : UInt32
+  vLoOut0 : UInt32
+  vHiOut1 : UInt32
+  vLoOut1 : UInt32
+  rhoOut0 : Rho5
+  rhoOut1 : Rho5
+  -- Per-block SHA-256 compression soundness (blocks 1..72, grounded in Constraints #0..#232)
+  hCompress : ∀ b, 1 ≤ b → b ≤ 72 → blkDig b = arr8ToWord8 (sha256Compress (blkMsg b))
+  -- Inter-block message wiring (Constraints #70..#85, spend.rs:427-461):
+  -- Input 0: Block 1 (Addr), Block 2 (CmIn), Blocks 3..34 (Merkle 0..31), Block 35 (Nf)
+  hMsgAddr0 : blkMsg 1 = #[UInt32.ofNat TAG_ADDR,
+                skReg 1 0, skReg 1 1, skReg 1 2, skReg 1 3, skReg 1 4, skReg 1 5, skReg 1 6, skReg 1 7,
+                0, 0, 0, 0, 0, 0, 0]
+  hMsgCmIn0 : blkMsg 2 = #[UInt32.ofNat TAG_CM,
+                blkDig 1 0, blkDig 1 1, blkDig 1 2, blkDig 1 3, blkDig 1 4, blkDig 1 5, blkDig 1 6, blkDig 1 7,
+                vHiIn0, vLoIn0,
+                rhoReg 2 0, rhoReg 2 1, rhoReg 2 2, rhoReg 2 3, rhoReg 2 4]
+  hMsgMrk0  : ∀ k, k < 32 → blkMsg (3 + k) = merkleMsg (blkDig (2 + k)) (sibReg (3 + k)) (bitReg (3 + k))
+  hMsgNf0   : blkMsg 35 = #[UInt32.ofNat TAG_NF,
+                skReg 35 0, skReg 35 1, skReg 35 2, skReg 35 3, skReg 35 4, skReg 35 5, skReg 35 6, skReg 35 7,
+                UInt32.ofNat (posReg 35),
+                rhoReg 35 0, rhoReg 35 1, rhoReg 35 2, rhoReg 35 3, rhoReg 35 4, 0]
+  -- Input 1: Block 36 (Addr), Block 37 (CmIn), Blocks 38..69 (Merkle 0..31), Block 70 (Nf)
+  hMsgAddr1 : blkMsg 36 = #[UInt32.ofNat TAG_ADDR,
+                skReg 36 0, skReg 36 1, skReg 36 2, skReg 36 3, skReg 36 4, skReg 36 5, skReg 36 6, skReg 36 7,
+                0, 0, 0, 0, 0, 0, 0]
+  hMsgCmIn1 : blkMsg 37 = #[UInt32.ofNat TAG_CM,
+                blkDig 36 0, blkDig 36 1, blkDig 36 2, blkDig 36 3, blkDig 36 4, blkDig 36 5, blkDig 36 6, blkDig 36 7,
+                vHiIn1, vLoIn1,
+                rhoReg 37 0, rhoReg 37 1, rhoReg 37 2, rhoReg 37 3, rhoReg 37 4]
+  hMsgMrk1  : ∀ k, k < 32 → blkMsg (38 + k) = merkleMsg (blkDig (37 + k)) (sibReg (38 + k)) (bitReg (38 + k))
+  hMsgNf1   : blkMsg 70 = #[UInt32.ofNat TAG_NF,
+                skReg 70 0, skReg 70 1, skReg 70 2, skReg 70 3, skReg 70 4, skReg 70 5, skReg 70 6, skReg 70 7,
+                UInt32.ofNat (posReg 70),
+                rhoReg 70 0, rhoReg 70 1, rhoReg 70 2, rhoReg 70 3, rhoReg 70 4, 0]
+  -- Output 0 & 1: Block 71 (CmOut 0), Block 72 (CmOut 1)
+  hMsgOut0  : blkMsg 71 = #[UInt32.ofNat TAG_CM,
+                apkOut0 0, apkOut0 1, apkOut0 2, apkOut0 3, apkOut0 4, apkOut0 5, apkOut0 6, apkOut0 7,
+                vHiOut0, vLoOut0,
+                rhoOut0 0, rhoOut0 1, rhoOut0 2, rhoOut0 3, rhoOut0 4]
+  hMsgOut1  : blkMsg 72 = #[UInt32.ofNat TAG_CM,
+                apkOut1 0, apkOut1 1, apkOut1 2, apkOut1 3, apkOut1 4, apkOut1 5, apkOut1 6, apkOut1 7,
+                vHiOut1, vLoOut1,
+                rhoOut1 0, rhoOut1 1, rhoOut1 2, rhoOut1 3, rhoOut1 4]
+  -- Register persistence & bit booleanity (Constraints #232..#246, spend.rs:487-497)
+  hBitBool  : ∀ b, 1 ≤ b → b ≤ 72 → bitReg b = 0 ∨ bitReg b = 1
+  hSkConst0 : ∀ b, 1 ≤ b → b < 35 → skReg (b + 1) = skReg b
+  hSkConst1 : ∀ b, 36 ≤ b → b < 70 → skReg (b + 1) = skReg b
+  hRhoCst0  : ∀ b, 2 ≤ b → b < 35 → rhoReg (b + 1) = rhoReg b
+  hRhoCst1  : ∀ b, 37 ≤ b → b < 70 → rhoReg (b + 1) = rhoReg b
+  hPos0Init : posReg 2 = 0
+  hPos0Step : ∀ k, k < 32 → posReg (3 + k) = posReg (2 + k) + bitReg (3 + k) * 2 ^ k
+  hPos0Hold : posReg 35 = posReg 34
+  hPos1Init : posReg 37 = 0
+  hPos1Step : ∀ k, k < 32 → posReg (38 + k) = posReg (37 + k) + bitReg (38 + k) * 2 ^ k
+  hPos1Hold : posReg 70 = posReg 69
+  -- Value range constraints (Constraint #248: top 4 bits of high value word are 0 => vHi < 2^28)
+  hVHiIn0   : vHiIn0.toNat < 268435456
+  hVHiIn1   : vHiIn1.toNat < 268435456
+  hVHiOut0  : vHiOut0.toNat < 268435456
+  hVHiOut1  : vHiOut1.toNat < 268435456
+  -- Balance accumulator constraint (Constraint #247, spend.rs:498-499)
+  hBalStep  : ∀ b, 1 ≤ b → b ≤ 72 →
+    (balReg (b + 1) - balReg b -
+      (if b = 2 then noteValue vHiIn0 vLoIn0
+       else if b = 37 then noteValue vHiIn1 vLoIn1
+       else if b = 71 then -(noteValue vHiOut0 vLoOut0)
+       else if b = 72 then -(noteValue vHiOut1 vLoOut1)
+       else 0)) % P = 0
+  -- Boundary assertions (spend.rs:521-546):
+  hAssertBal0   : balReg 1 = 0
+  hAssertBalEnd : (balReg 73 - signedField pi.valueBalance) % P = 0
+  hAssertDummy0 : pi.dummy0 = true → vHiIn0 = 0 ∧ vLoIn0 = 0
+  hAssertDummy1 : pi.dummy1 = true → vHiIn1 = 0 ∧ vLoIn1 = 0
+  hAssertRoot0  : pi.dummy0 = false → blkDig 34 = pi.root
+  hAssertRoot1  : pi.dummy1 = false → blkDig 69 = pi.root
+  hAssertNf0    : blkDig 35 = pi.nf0
+  hAssertNf1    : blkDig 70 = pi.nf1
+  hAssertOut0   : blkDig 71 = pi.cmOut0
+  hAssertOut1   : blkDig 72 = pi.cmOut1
+
+theorem reg_const_range {{α : Type}} (reg : Nat → α) (a : Nat)
+    (hstep : ∀ b, a ≤ b → b < a + n → reg (b + 1) = reg b) :
+    ∀ k, k ≤ n → reg (a + k) = reg a := by
+  intro k hk
+  induction k with
+  | zero => simp
+  | succ m ih =>
+    have hm : a + (m + 1) = (a + m) + 1 := by omega
+    rw [hm, hstep (a + m) (by omega) (by omega), ih (by omega)]
+
+theorem merkle_chain_32_sound
+    (blkDig : Nat → Word8) (blkMsg : Nat → Array UInt32)
+    (bitReg : Nat → Nat) (sibReg : Nat → Word8) (base : Nat)
+    (hComp : ∀ k, k < 32 → blkDig (base + 1 + k) = arr8ToWord8 (sha256Compress (blkMsg (base + 1 + k))))
+    (hMsg  : ∀ k, k < 32 → blkMsg (base + 1 + k) = merkleMsg (blkDig (base + k)) (sibReg (base + 1 + k)) (bitReg (base + 1 + k))) :
+    ∀ k, k ≤ 32 → blkDig (base + k) = merkleRoot (blkDig base) (fun j => bitReg (base + 1 + j)) (fun j => sibReg (base + 1 + j)) k := by
+  intro k hk
+  induction k with
+  | zero => simp [merkleRoot]
+  | succ m ih =>
+    have hidx : base + (m + 1) = base + 1 + m := by omega
+    rw [hidx, hComp m (by omega), hMsg m (by omega)]
+    simp only [merkleRoot, merkleStep]
+    rw [ih (by omega)]
+
+theorem noteValue_lt_max_bound (vHi vLo : UInt32) (hHi : vHi.toNat < 268435456) :
+    0 ≤ noteValue vHi vLo ∧ noteValue vHi vLo < MAX_NOTE_BOUND := by
+  have hLo : vLo.toNat < 4294967296 := vLo.toBitVec.isLt
+  simp only [noteValue, TWO32, MAX_NOTE_BOUND]
+  omega
+
+theorem bal_mod_step_const (bal : Nat → Int) (a : Nat)
+    (hstep : ∀ b, a ≤ b → b < a + n → (bal (b + 1) - bal b) % P = 0) :
+    ∀ k, k ≤ n → (bal (a + k) - bal a) % P = 0 := by
+  intro k hk
+  induction k with
+  | zero => simp
+  | succ m ih =>
+    have h1 := hstep (a + m) (by omega) (by omega)
+    have h2 := ih (by omega)
+    have hd1 := Int.dvd_of_emod_eq_zero h1
+    have hd2 := Int.dvd_of_emod_eq_zero h2
+    rcases hd1 with ⟨q1, hq1⟩
+    rcases hd2 with ⟨q2, hq2⟩
+    have hm : a + (m + 1) = (a + m) + 1 := by omega
+    rw [hm]
+    have hsum : bal ((a + m) + 1) - bal a = P * (q1 + q2) := by
+      rw [Int.mul_add]; omega
+    rw [hsum]; exact Int.mul_emod_right P (q1 + q2)
+
+theorem goldilocks_balance_no_wrap (v0 v1 v2 v3 vb : Int)
+    (h0 : 0 ≤ v0 ∧ v0 < MAX_NOTE_BOUND)
+    (h1 : 0 ≤ v1 ∧ v1 < MAX_NOTE_BOUND)
+    (h2 : 0 ≤ v2 ∧ v2 < MAX_NOTE_BOUND)
+    (h3 : 0 ≤ v3 ∧ v3 < MAX_NOTE_BOUND)
+    (hvb : -MAX_VB_BOUND < vb ∧ vb < MAX_VB_BOUND)
+    (hmod : ((v0 + v1 - v2 - v3) - signedField vb) % P = 0) :
+    v0 + v1 - (v2 + v3) = vb := by
+  have hsf : (signedField vb - vb) % P = 0 := by
+    have hvb' : -4611686018427387904 < vb ∧ vb < 4611686018427387904 := hvb
+    by_cases hpos : vb ≥ 0
+    · have h1' : signedField vb = vb := by
+        simp only [signedField, hpos, ↓reduceIte, P]
+        exact Int.emod_eq_of_lt (by omega) (by omega)
+      rw [h1']; simp
+    · have h1' : signedField vb = P + vb := by
+        simp only [signedField, hpos, ↓reduceIte, P]
+        have hm1 : (-vb) % 18446744069414584321 = -vb := Int.emod_eq_of_lt (by omega) (by omega)
+        rw [hm1]
+        have hm2 : (18446744069414584321 - -vb) = 18446744069414584321 + vb := by omega
+        rw [hm2]
+        exact Int.emod_eq_of_lt (by omega) (by omega)
+      rw [h1']
+      have h2' : P + vb - vb = P := by omega
+      rw [h2']; exact Int.emod_self
+  have hd1 := Int.dvd_of_emod_eq_zero hmod
+  have hd2 := Int.dvd_of_emod_eq_zero hsf
+  rcases hd1 with ⟨q1, hq1⟩
+  rcases hd2 with ⟨q2, hq2⟩
+  have hdiff : (v0 + v1 - (v2 + v3)) - vb = P * (q1 + q2) := by
+    rw [Int.mul_add]; omega
+  have hq0 : q1 + q2 = 0 := by
+    simp only [P, MAX_NOTE_BOUND, MAX_VB_BOUND] at *
+    omega
+  rw [hq0] at hdiff
+  omega
+
+/-- Standalone Nullifier Uniqueness Theorem: any two spends referencing the same `(sk, pos, rho)`
+    produce identically equal public nullifiers (deterministic binding). -/
+theorem nullifier_deterministic_unique (sk : Word8) (pos : UInt32) (rho : Rho5) (nfA nfB : Word8)
+    (hA : nfA = noteNullifier sk pos rho) (hB : nfB = noteNullifier sk pos rho) :
+    nfA = nfB := by
+  rw [hA, hB]
+
+/-- Master End-to-End Semantic Soundness Theorem:
+    ANY trace accepted by the 128-block Spend AIR + boundary assertions (`AcceptedSpendTrace pi`)
+    witnesses a complete `ValidSpendWitness pi` establishing:
+    (1) Spend authorization (`a_pk = H_addr(sk)`),
+    (2) Input note commitment binding (`cm_in = H_cm(a_pk, v, rho)`),
+    (3) 32-level FIPS SHA-256 Merkle membership against `pi.root` for every non-dummy input,
+    (4) Deterministic nullifier binding (`pi.nf = H_nf(sk, pos, rho)`),
+    (5) Output commitment binding & `< 2^60` range bounds + dummy zero-value enforcement, and
+    (6) Exact integer value conservation (`v_in0 + v_in1 - (v_out0 + v_out1) = pi.valueBalance`)
+    with zero Goldilocks modular wraparound. Pure Lean 4 kernel, 0 `sorry`, 0 `native_decide`. -/
+theorem accepted_spend_trace_implies_spend_relation (pi : SpendPublicStmt)
+    (tr : AcceptedSpendTrace pi) : Nonempty (ValidSpendWitness pi) := by
+  -- 1. Register constancy across both 35-block input halves
+  have hSk0 : tr.skReg 35 = tr.skReg 1 := by
+    have h := reg_const_range tr.skReg 1 (n := 34) (fun b ha hb => tr.hSkConst0 b ha (by omega)) 34 (by omega)
+    simpa using h
+  have hSk1 : tr.skReg 70 = tr.skReg 36 := by
+    have h := reg_const_range tr.skReg 36 (n := 34) (fun b ha hb => tr.hSkConst1 b ha (by omega)) 34 (by omega)
+    simpa using h
+  have hRho0 : tr.rhoReg 35 = tr.rhoReg 2 := by
+    have h := reg_const_range tr.rhoReg 2 (n := 33) (fun b ha hb => tr.hRhoCst0 b ha (by omega)) 33 (by omega)
+    simpa using h
+  have hRho1 : tr.rhoReg 70 = tr.rhoReg 37 := by
+    have h := reg_const_range tr.rhoReg 37 (n := 33) (fun b ha hb => tr.hRhoCst1 b ha (by omega)) 33 (by omega)
+    simpa using h
+  -- 2. Ownership & input commitment binding
+  have hApk0 : tr.blkDig 1 = noteAddress (tr.skReg 1) := by
+    rw [tr.hCompress 1 (by omega) (by omega), tr.hMsgAddr0]; rfl
+  have hApk1 : tr.blkDig 36 = noteAddress (tr.skReg 36) := by
+    rw [tr.hCompress 36 (by omega) (by omega), tr.hMsgAddr1]; rfl
+  have hCmIn0 : tr.blkDig 2 = noteCommit (tr.blkDig 1) tr.vHiIn0 tr.vLoIn0 (tr.rhoReg 2) := by
+    rw [tr.hCompress 2 (by omega) (by omega), tr.hMsgCmIn0]; rfl
+  have hCmIn1 : tr.blkDig 37 = noteCommit (tr.blkDig 36) tr.vHiIn1 tr.vLoIn1 (tr.rhoReg 37) := by
+    rw [tr.hCompress 37 (by omega) (by omega), tr.hMsgCmIn1]; rfl
+  -- 3. 32-level Merkle membership & exact 32-bit pos accumulator
+  have hBits0 : ∀ k, k < 32 → tr.bitReg (3 + k) = 0 ∨ tr.bitReg (3 + k) = 1 :=
+    fun k hk => tr.hBitBool (3 + k) (by omega) (by omega)
+  have hBits1 : ∀ k, k < 32 → tr.bitReg (38 + k) = 0 ∨ tr.bitReg (38 + k) = 1 :=
+    fun k hk => tr.hBitBool (38 + k) (by omega) (by omega)
+  have hPosAcc0 := merkle_pos_32_levels_sound
+    (fun k => tr.bitReg (3 + k)) (fun k => tr.posReg (2 + k))
+    hBits0 tr.hPos0Init (fun k hk => by
+      have hm : 2 + (k + 1) = 3 + k := by omega
+      rw [hm]; exact tr.hPos0Step k hk) 32 (by omega)
+  have hPosAcc1 := merkle_pos_32_levels_sound
+    (fun k => tr.bitReg (38 + k)) (fun k => tr.posReg (37 + k))
+    hBits1 tr.hPos1Init (fun k hk => by
+      have hm : 37 + (k + 1) = 38 + k := by omega
+      rw [hm]; exact tr.hPos1Step k hk) 32 (by omega)
+  have hPos35 : tr.posReg 35 = posAcc (fun k => tr.bitReg (3 + k)) 32 ∧ tr.posReg 35 < 2 ^ 32 := by
+    rw [tr.hPos0Hold]; simpa using hPosAcc0
+  have hPos70 : tr.posReg 70 = posAcc (fun k => tr.bitReg (38 + k)) 32 ∧ tr.posReg 70 < 2 ^ 32 := by
+    rw [tr.hPos1Hold]; simpa using hPosAcc1
+  have hPos0U32 : (UInt32.ofNat (tr.posReg 35)).toNat = posAcc (fun k => tr.bitReg (3 + k)) 32 := by
+    have hmod : (UInt32.ofNat (tr.posReg 35)).toNat = tr.posReg 35 % 2 ^ 32 := by
+      simp [UInt32.toNat_ofNat']
+    rw [hmod, Nat.mod_eq_of_lt hPos35.2, hPos35.1]
+  have hPos1U32 : (UInt32.ofNat (tr.posReg 70)).toNat = posAcc (fun k => tr.bitReg (38 + k)) 32 := by
+    have hmod : (UInt32.ofNat (tr.posReg 70)).toNat = tr.posReg 70 % 2 ^ 32 := by
+      simp [UInt32.toNat_ofNat']
+    rw [hmod, Nat.mod_eq_of_lt hPos70.2, hPos70.1]
+  have hMrk0 : tr.blkDig 34 = merkleRoot (tr.blkDig 2) (fun j => tr.bitReg (3 + j)) (fun j => tr.sibReg (3 + j)) 32 := by
+    have h := merkle_chain_32_sound tr.blkDig tr.blkMsg tr.bitReg tr.sibReg 2
+      (fun k hk => tr.hCompress (3 + k) (by omega) (by omega))
+      (fun k hk => tr.hMsgMrk0 k hk) 32 (by omega)
+    simpa using h
+  have hMrk1 : tr.blkDig 69 = merkleRoot (tr.blkDig 37) (fun j => tr.bitReg (38 + j)) (fun j => tr.sibReg (38 + j)) 32 := by
+    have h := merkle_chain_32_sound tr.blkDig tr.blkMsg tr.bitReg tr.sibReg 37
+      (fun k hk => tr.hCompress (38 + k) (by omega) (by omega))
+      (fun k hk => tr.hMsgMrk1 k hk) 32 (by omega)
+    simpa using h
+  -- 4. Nullifier binding using sk & rho constancy
+  have hNf0 : pi.nf0 = noteNullifier (tr.skReg 1) (UInt32.ofNat (tr.posReg 35)) (tr.rhoReg 2) := by
+    rw [← tr.hAssertNf0, tr.hCompress 35 (by omega) (by omega), tr.hMsgNf0, hSk0, hRho0]; rfl
+  have hNf1 : pi.nf1 = noteNullifier (tr.skReg 36) (UInt32.ofNat (tr.posReg 70)) (tr.rhoReg 37) := by
+    rw [← tr.hAssertNf1, tr.hCompress 70 (by omega) (by omega), tr.hMsgNf1, hSk1, hRho1]; rfl
+  -- 5. Output commitment binding
+  have hOut0 : pi.cmOut0 = noteCommit tr.apkOut0 tr.vHiOut0 tr.vLoOut0 tr.rhoOut0 := by
+    rw [← tr.hAssertOut0, tr.hCompress 71 (by omega) (by omega), tr.hMsgOut0]; rfl
+  have hOut1 : pi.cmOut1 = noteCommit tr.apkOut1 tr.vHiOut1 tr.vLoOut1 tr.rhoOut1 := by
+    rw [← tr.hAssertOut1, tr.hCompress 72 (by omega) (by omega), tr.hMsgOut1]; rfl
+  -- 6. Balance telescoping across all 72 blocks + Goldilocks no-wrap conservation
+  have hb1 : (tr.balReg 2 - tr.balReg 1) % P = 0 := by simpa using tr.hBalStep 1 (by omega) (by omega)
+  have hb2 : (tr.balReg 3 - tr.balReg 2 - noteValue tr.vHiIn0 tr.vLoIn0) % P = 0 := by
+    simpa using tr.hBalStep 2 (by omega) (by omega)
+  have hb3_37 : (tr.balReg 37 - tr.balReg 3) % P = 0 := by
+    have h := bal_mod_step_const tr.balReg 3 (n := 34) (fun b ha hb => by
+      have hs := tr.hBalStep b (by omega) (by omega)
+      have hne2 : b ≠ 2 := by omega
+      have hne37 : b ≠ 37 := by omega
+      have hne71 : b ≠ 71 := by omega
+      have hne72 : b ≠ 72 := by omega
+      simp [hne2, hne37, hne71, hne72] at hs
+      exact hs) 34 (by omega)
+    simpa using h
+  have hb37 : (tr.balReg 38 - tr.balReg 37 - noteValue tr.vHiIn1 tr.vLoIn1) % P = 0 := by
+    simpa using tr.hBalStep 37 (by omega) (by omega)
+  have hb38_71 : (tr.balReg 71 - tr.balReg 38) % P = 0 := by
+    have h := bal_mod_step_const tr.balReg 38 (n := 33) (fun b ha hb => by
+      have hs := tr.hBalStep b (by omega) (by omega)
+      have hne2 : b ≠ 2 := by omega
+      have hne37 : b ≠ 37 := by omega
+      have hne71 : b ≠ 71 := by omega
+      have hne72 : b ≠ 72 := by omega
+      simp [hne2, hne37, hne71, hne72] at hs
+      exact hs) 33 (by omega)
+    simpa using h
+  have hb71 : (tr.balReg 72 - tr.balReg 71 + noteValue tr.vHiOut0 tr.vLoOut0) % P = 0 := by
+    have hs := tr.hBalStep 71 (by omega) (by omega)
+    have heq : tr.balReg 72 - tr.balReg 71 + noteValue tr.vHiOut0 tr.vLoOut0 =
+        tr.balReg 72 - tr.balReg 71 - -noteValue tr.vHiOut0 tr.vLoOut0 := by omega
+    rw [heq]; simpa using hs
+  have hb72 : (tr.balReg 73 - tr.balReg 72 + noteValue tr.vHiOut1 tr.vLoOut1) % P = 0 := by
+    have hs := tr.hBalStep 72 (by omega) (by omega)
+    have heq : tr.balReg 73 - tr.balReg 72 + noteValue tr.vHiOut1 tr.vLoOut1 =
+        tr.balReg 73 - tr.balReg 72 - -noteValue tr.vHiOut1 tr.vLoOut1 := by omega
+    rw [heq]; simpa using hs
+  have hBalMod : ((noteValue tr.vHiIn0 tr.vLoIn0 + noteValue tr.vHiIn1 tr.vLoIn1
+      - noteValue tr.vHiOut0 tr.vLoOut0 - noteValue tr.vHiOut1 tr.vLoOut1) - signedField pi.valueBalance) % P = 0 := by
+    rcases Int.dvd_of_emod_eq_zero hb1 with ⟨q1, hq1⟩
+    rcases Int.dvd_of_emod_eq_zero hb2 with ⟨q2, hq2⟩
+    rcases Int.dvd_of_emod_eq_zero hb3_37 with ⟨q3, hq3⟩
+    rcases Int.dvd_of_emod_eq_zero hb37 with ⟨q4, hq4⟩
+    rcases Int.dvd_of_emod_eq_zero hb38_71 with ⟨q5, hq5⟩
+    rcases Int.dvd_of_emod_eq_zero hb71 with ⟨q6, hq6⟩
+    rcases Int.dvd_of_emod_eq_zero hb72 with ⟨q7, hq7⟩
+    rcases Int.dvd_of_emod_eq_zero tr.hAssertBalEnd with ⟨q8, hq8⟩
+    have h0 := tr.hAssertBal0
+    have hcomb : (noteValue tr.vHiIn0 tr.vLoIn0 + noteValue tr.vHiIn1 tr.vLoIn1
+        - noteValue tr.vHiOut0 tr.vLoOut0 - noteValue tr.vHiOut1 tr.vLoOut1) - signedField pi.valueBalance
+        = P * (q8 - q1 - q2 - q3 - q4 - q5 - q6 - q7) := by
+      have : P * (q8 - q1 - q2 - q3 - q4 - q5 - q6 - q7) =
+          P * q8 - P * q1 - P * q2 - P * q3 - P * q4 - P * q5 - P * q6 - P * q7 := by
+        repeat rw [Int.mul_sub]
+      rw [this]; omega
+    rw [hcomb]; exact Int.mul_emod_right P _
+  have hR0 := noteValue_lt_max_bound tr.vHiIn0 tr.vLoIn0 tr.hVHiIn0
+  have hR1 := noteValue_lt_max_bound tr.vHiIn1 tr.vLoIn1 tr.hVHiIn1
+  have hR2 := noteValue_lt_max_bound tr.vHiOut0 tr.vLoOut0 tr.hVHiOut0
+  have hR3 := noteValue_lt_max_bound tr.vHiOut1 tr.vLoOut1 tr.hVHiOut1
+  have hCons := goldilocks_balance_no_wrap
+    (noteValue tr.vHiIn0 tr.vLoIn0) (noteValue tr.vHiIn1 tr.vLoIn1)
+    (noteValue tr.vHiOut0 tr.vLoOut0) (noteValue tr.vHiOut1 tr.vLoOut1)
+    pi.valueBalance hR0 hR1 hR2 hR3 pi.hvb hBalMod
+  exact ⟨{{
+    sk0 := tr.skReg 1
+    sk1 := tr.skReg 36
+    apk0 := tr.blkDig 1
+    apk1 := tr.blkDig 36
+    vHiIn0 := tr.vHiIn0, vLoIn0 := tr.vLoIn0
+    vHiIn1 := tr.vHiIn1, vLoIn1 := tr.vLoIn1
+    rho0 := tr.rhoReg 2, rho1 := tr.rhoReg 37
+    cmIn0 := tr.blkDig 2, cmIn1 := tr.blkDig 37
+    bits0 := fun j => tr.bitReg (3 + j)
+    bits1 := fun j => tr.bitReg (38 + j)
+    sibs0 := fun j => tr.sibReg (3 + j)
+    sibs1 := fun j => tr.sibReg (38 + j)
+    pos0 := UInt32.ofNat (tr.posReg 35)
+    pos1 := UInt32.ofNat (tr.posReg 70)
+    apkOut0 := tr.apkOut0, apkOut1 := tr.apkOut1
+    vHiOut0 := tr.vHiOut0, vLoOut0 := tr.vLoOut0
+    vHiOut1 := tr.vHiOut1, vLoOut1 := tr.vLoOut1
+    rhoOut0 := tr.rhoOut0, rhoOut1 := tr.rhoOut1
+    hOwner0 := hApk0
+    hOwner1 := hApk1
+    hCmIn0 := hCmIn0
+    hCmIn1 := hCmIn1
+    hBits0 := hBits0
+    hBits1 := hBits1
+    hPos0 := hPos0U32
+    hPos1 := hPos1U32
+    hMerkle0 := fun h => by rw [← hMrk0, tr.hAssertRoot0 h]
+    hMerkle1 := fun h => by rw [← hMrk1, tr.hAssertRoot1 h]
+    hNf0 := hNf0
+    hNf1 := hNf1
+    hCmOut0 := hOut0
+    hCmOut1 := hOut1
+    hRangeIn0 := hR0
+    hRangeIn1 := hR1
+    hRangeOut0 := hR2
+    hRangeOut1 := hR3
+    hDummy0 := fun h => by rcases tr.hAssertDummy0 h with ⟨h1', h2'⟩; simp [noteValue, h1', h2']
+    hDummy1 := fun h => by rcases tr.hAssertDummy1 h with ⟨h1', h2'⟩; simp [noteValue, h1', h2']
+    hConservation := hCons
+  }}⟩
+
 #print axioms fips180_4_sha256_empty_exact
 #print axioms fips180_4_sha256_abc_exact
 #print axioms xor3_poly_exact
@@ -1122,6 +1629,8 @@ theorem boundary_assertions_counts_exact :
 #print axioms sha256_64_rounds_induction
 #print axioms merkle_pos_32_levels_sound
 #print axioms layout_128_blocks_exact
+#print axioms nullifier_deterministic_unique
+#print axioms accepted_spend_trace_implies_spend_relation
 
 end NewsatoshiFullCircuit
 "#,
