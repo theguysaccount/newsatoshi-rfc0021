@@ -1,4 +1,4 @@
-# Newsatoshi (`LOVE`) — Mainnet v2 (`nsM2` · `v1.2.3`)
+# Newsatoshi (`LOVE`) — Mainnet v2 (`nsM2` · `v1.2.4`)
 
 [![Mainnet v2](https://img.shields.io/badge/Mainnet%20v2-LIVE%20%C2%B7%20BTC%20%23977%2C738-10b981)](https://newsatoshi.org/)
 [![Zero Premine](https://img.shields.io/badge/Fair%20Launch-0%20LOVE%20Premine-f59e0b)](node/genesis-v2.json)
@@ -28,7 +28,7 @@ Newsatoshi targets a specific, extreme point on the cryptographic design frontie
 
 ---
 
-## Live Mainnet v2 (`nsM2` · `v1.2.3`) — Join in 60 Seconds
+## Live Mainnet v2 (`nsM2` · `v1.2.4`) — Join in 60 Seconds
 
 - **Canonical Genesis Hash:** `00000000ba1cdad4aa8e82d6613b4df536394c41008fc3a0914a47a44604b9c8`
 - **Bitcoin Anchor:** Block `#977,738` (`0000000000000000000163900064a4cc4807dbd8bcaf35e322e694e6c387a780`) — [genesis-v2.json](node/genesis-v2.json)
@@ -55,7 +55,7 @@ Newsatoshi targets a specific, extreme point on the cryptographic design frontie
 
 ## Head-to-Head L1 Comparison (Honest Trade-Offs)
 
-| Property | Bitcoin | Zcash (Orchard) | Monero | Neptune Cash | **Newsatoshi L1 (`LOVE` `v1.2.3`)** |
+| Property | Bitcoin | Zcash (Orchard) | Monero | Neptune Cash | **Newsatoshi L1 (`LOVE` `v1.2.4`)** |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Default Privacy** | Transparent | Opt-in Shielded | RingCT (decoys) | Default Shielded | **Mandatory Shielded (Full Note Tree)** |
 | **Post-Quantum Coins** | No (`secp256k1`) | No (Pasta curves) | No (Ed25519) | Yes (Tip5 STARKs) | **Yes (FIPS SHA-2/384 STARKs + SLH-DSA)** |
@@ -88,11 +88,11 @@ Measured on Apple Silicon CPU (`cargo test`, `opt-level = 2`, deps `opt-level = 
 
 ## Exact Formal Verification & Audit Scope (Zero Ambiguity)
 
-1. **`node/proof/SpendCircuitFull.lean` (Lean 4.36.0 pure kernel, `8,343` lines, `0 sorry`, `0 warnings`, `0 native_decide`, `0 Mathlib`, standard core axioms `[propext, Classical.choice, Quot.sound]` only):**
-   - `extract_lean_circuit` symbolically executes live compiling Rust `spend::eval_constraints` (spot-checked at 20 random Goldilocks points), cross-checks all **`8,192 × 14 = 114,688` periodic table cells** against live `spend::periodic_table()`, and emits all **249 transition constraint polynomials (`#0..#248`, `2,950` monomials)**.
+1. **`node/proof/SpendCircuitFull.lean` (Lean 4.36.0 pure kernel, `8,959` lines, `0 sorry`, `0 warnings`, `0 native_decide`, `0 Mathlib`, standard core axioms `[propext, Classical.choice, Quot.sound]` only):**
+   - `extract_lean_circuit` symbolically executes live compiling Rust `spend::eval_constraints` (spot-checked at 20 random Goldilocks points), emits all **249 transition constraint polynomials (`#0..#248`, `2,950` monomials)**, emits the entire run-length-encoded **`8,192 × 14 = 114,688`-cell periodic selector table** from live `spend::periodic_table()`, and probes live `spend::assertion_cells` across all **4 `(dummy0, dummy1)` modes** with two independent sentinel probes.
    - **Polynomial, Primality & Arithmetic Exactness:** Independent NIST FIPS 180-4 `SHA-256` vector match (`""`, `"abc"`), self-contained zero-Mathlib Pocklington primality proof of Goldilocks `P = 2^64 - 2^32 + 1` (`goldilocks_is_prime`, `goldilocks_boolean_sound`), multilinear bit-polynomial identities (`XOR2`, `XOR3`, `Ch`, `Maj`, `< 2^32`), **`all_249_constraints_match_fips180_4_spec`** (`rustCon i = fipsCon i := by decide`), all **7 Goldilocks no-wrap / unreduced-word lemmas** (`a_64`, `e_64`, `W_0`), 64-round compression & 32-level Merkle inductions, and exact 128-block layout (`layout_128_blocks_exact`) & boundary counts (`51` real / `39` dummy).
-   - **Full Raw `8,192 × 247` Goldilocks AIR Soundness Refinement (`raw_air_trace_implies_accepted_spend_trace` + `raw_rust_air_soundness`):** Proves inside Lean 4's pure kernel that **ANY** raw `8,192 × 247` Goldilocks field trace `T : RawFieldTrace` satisfying all `249` live Rust extracted transition polynomials (`RawAirTransitionsHold T`) and all `spend::assertion_cells(&pi)` boundary assertions (`RawBoundaryAssertions pi T`) refines to `AcceptedSpendTrace pi` and witnesses a complete semantic `ValidSpendWitness pi` establishing: (1) spend authorization (`a_pk = H_addr(sk)`), (2) input commitment binding, (3) 32-level FIPS SHA-256 Merkle membership against `pi.root` for all non-dummy inputs, (4) deterministic nullifier uniqueness (`pi.nf = H_nf(sk, pos, rho)`), (5) output commitment binding & dummy zero-value enforcement, and (6) exact integer value conservation (`v_in0 + v_in1 - (v_out0 + v_out1) = pi.valueBalance`) with zero Goldilocks wraparound.
-   - **Completeness, Bidirectional Equivalence & Live Rust-Verified Concrete Non-Vacuity (`valid_witness_satisfies_raw_air`, `raw_rust_air_iff_valid_spend_witness`, `raw_rust_air_non_vacuous`):** Constructs `canonicalRawTrace`, proves the full bidirectional equivalence `(∃ T, RawAirTransitionsHold T ∧ RawBoundaryAssertions pi T) ↔ Nonempty (ValidSpendWitness pi)`, and certifies a concrete non-dummy 2-in/2-out shielded spend (`concretePi`, `concreteWitness`, independently checked live in Rust via `spend::check_trace(&spend::build_trace(&wit), &pi)`).
+   - **Kernel-Checked Periodic Table & 4-Mode Boundary Assertion Equivalence (`periodicVal_eq_extracted_all_114688`, `extracted_assertions_iff_raw_boundary`):** Proves inside Lean 4's kernel (zero `sorry`, zero `native_decide`) that every single one of the `114,688` periodic table cells and all 4 `(dummy0, dummy1)` boundary assertion lists extracted from live Rust match the mechanized specification identically.
+   - **End-to-End Extracted Rust AIR ↔ Semantic Witness Equivalence & Non-Vacuity (`extracted_rust_air_iff_valid_spend_witness`, `extracted_rust_air_non_vacuous`):** Composes `raw_air_trace_implies_accepted_spend_trace`, `raw_rust_air_soundness`, and `valid_witness_satisfies_raw_air` directly against the live Rust extracted transition polynomials (`rustCon`), extracted periodic table (`extractedPeriodicVal`), and extracted 4-mode boundary assertions (`extractedAssertions`) — proving `(∃ T, ExtractedAirTransitionsHold T ∧ ExtractedBoundaryAssertions pi T) ↔ Nonempty (ValidSpendWitness pi)` plus a concrete non-dummy 2-in/2-out shielded spend witness (`concretePi`, `concreteWitness`, independently checked live in Rust via `spend::check_trace(&spend::build_trace(&wit), &pi)`).
 2. **`node/proof/SpendBalance.lean` (Lean 4.36.0, 10 theorems, `0 sorry`, `0 Mathlib`):**
    - Proves `#247`/`#248` conservation, `< 2^60` note range, PayWord channel accounting, 50% fee-burn solvency, `PriorLock` 50/50 bounty/burn conservation, incentive-compatible `BatchSpend` `prover_fee` miner dominance (`sub + miner_fee >= sub`), and FlyClient work-interval uniqueness.
 3. **Cell-Freedom Under-Constraint Scan (`node/src/audit.rs`):** Linear-algebra nullspace scan over the live spend constraint Jacobian verifying planted constraint holes are caught.
@@ -103,8 +103,8 @@ Measured on Apple Silicon CPU (`cargo test`, `opt-level = 2`, deps `opt-level = 
 ## Layer-2 Live Rails vs. Future Roadmap (`nsUSD` & Soft-Forks)
 
 Strict separation between what is **live in L1 code today**, what is **live at Layer 2 (`newsatoshi-commons`)**, and what is **future roadmap**:
-- **Live on Layer 1 Today (`newsatoshi-rfc0021` `v1.2.3`):** Shielded `LOVE`, `BatchSpend` (`K=2..=16`), Bitcoin AuxPoW (`20051`), `aserti3-launch`, SHA-256 HTLCs, unilateral partial-claim `PayWord` channels, `PriorLock`, FlyClient MMR, `1 KB` Utreexo, `NSPQ2` (`ML-KEM-768` + `SLH-DSA`) P2P, and zero-Rust JS verifier (`verifier-ts/`).
-- **Live at Layer 2 Today (`newsatoshi-commons` `v0.28.2`):** `33` zero-auth MCP tools, **USD-denominated JIT `x402` + `O(1)` PayWords** (`GET https://commons.newsatoshi.org/api/v2/nsusd/quote?usd=0.01`), integer-exact `RFC-0028` `nsUSD` CDP/oracle stress engine + L2 Winterfell STARK rollup & unilateral Merkle escape hatch (`13`-theorem zero-sorry Lean 4 proof in `formal/NsUsdAndL2Perfection.lean`, honest `0` live debt), and zero-custody Bitcoin/Lightning/Solana/4-chain EVM SHA-256 HTLC compilers — all above ossified L1 with zero L1 consensus fork required.
+- **Live on Layer 1 Today (`newsatoshi-rfc0021` `v1.2.4`):** Shielded `LOVE`, `BatchSpend` (`K=2..=16`), Bitcoin AuxPoW (`20051`), `aserti3-launch`, SHA-256 HTLCs, unilateral partial-claim `PayWord` channels, `PriorLock`, FlyClient MMR, `1 KB` Utreexo, `NSPQ2` (`ML-KEM-768` + `SLH-DSA`) P2P, and zero-Rust JS verifier (`verifier-ts/`).
+- **Live at Layer 2 Today (`newsatoshi-commons` `v0.28.3`):** `35` zero-auth MCP tools (published on the Official MCP Registry as `org.newsatoshi.commons/newsatoshi-commons@0.28.3`), **60-second private `x402 v2` + `O(1)` SHA-256 PayWords paywall middleware generator** (Express/Next.js/FastAPI/Axum at `POST https://commons.newsatoshi.org/api/v2/x402/paywall-kit`), **live Base Mainnet USDC vault escrow verifier** (`POST https://commons.newsatoshi.org/api/v2/nsusd/verify-base-escrow`, verifying `15.382382 USDC + 0.001 ETH` in the immutable ownerless Base vault), **USD-denominated JIT `x402` + `O(1)` PayWords** (`GET https://commons.newsatoshi.org/api/v2/nsusd/quote?usd=0.01`), integer-exact `RFC-0028` `nsUSD` CDP/oracle stress engine + L2 Winterfell STARK rollup & unilateral Merkle escape hatch (`13`-theorem zero-sorry Lean 4 proof in `formal/NsUsdAndL2Perfection.lean`, honest `0` live debt), and zero-custody Bitcoin/Lightning/Solana/4-chain EVM SHA-256 HTLC compilers — all above ossified L1 with zero L1 consensus fork required.
 - **Pre-Reserved AuxPoW-Safe BIP-9 Soft-Fork Bits in `node/src/signal.rs` (Zero Genesis Restart):**
   - `BIT_FUTURE_COMPACT_PROOF = 5`: Future pure-hash WHIR / Binius compact spend proofs (`2–4×` smaller proofs)
   - `BIT_FUTURE_RECURSIVE_AGG = 6`: Future full-query GPU STARK-in-STARK spend & chain aggregation

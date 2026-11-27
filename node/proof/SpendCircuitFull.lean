@@ -8319,6 +8319,618 @@ theorem raw_rust_air_non_vacuous :
     ∃ T : RawFieldTrace, RawAirTransitionsHold T ∧ RawBoundaryAssertions concretePi T :=
   ⟨canonicalRawTrace concretePi concreteWitness, valid_witness_satisfies_raw_air concretePi concreteWitness⟩
 
+-- ============================================================================
+-- SECTION 10: KERNEL-CHECKED EQUIVALENCE AGAINST LIVE RUST EXTRACTED PERIODIC
+-- TABLE (ALL 8,192 × 14 = 114,688 CELLS) & ALL 4-MODE BOUNDARY ASSERTION LISTS
+-- ============================================================================
+
+def extractedPerK : Array Int := #[1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298, 1116352408]
+
+def extractedPerRuns1 : List (Nat × Nat × Int) := [(0, 64, 0), (64, 127, 1), (127, 128, 0), (128, 191, 1), (191, 192, 0), (192, 255, 1), (255, 256, 0), (256, 319, 1), (319, 320, 0), (320, 383, 1), (383, 384, 0), (384, 447, 1), (447, 448, 0), (448, 511, 1), (511, 512, 0), (512, 575, 1), (575, 576, 0), (576, 639, 1), (639, 640, 0), (640, 703, 1), (703, 704, 0), (704, 767, 1), (767, 768, 0), (768, 831, 1), (831, 832, 0), (832, 895, 1), (895, 896, 0), (896, 959, 1), (959, 960, 0), (960, 1023, 1), (1023, 1024, 0), (1024, 1087, 1), (1087, 1088, 0), (1088, 1151, 1), (1151, 1152, 0), (1152, 1215, 1), (1215, 1216, 0), (1216, 1279, 1), (1279, 1280, 0), (1280, 1343, 1), (1343, 1344, 0), (1344, 1407, 1), (1407, 1408, 0), (1408, 1471, 1), (1471, 1472, 0), (1472, 1535, 1), (1535, 1536, 0), (1536, 1599, 1), (1599, 1600, 0), (1600, 1663, 1), (1663, 1664, 0), (1664, 1727, 1), (1727, 1728, 0), (1728, 1791, 1), (1791, 1792, 0), (1792, 1855, 1), (1855, 1856, 0), (1856, 1919, 1), (1919, 1920, 0), (1920, 1983, 1), (1983, 1984, 0), (1984, 2047, 1), (2047, 2048, 0), (2048, 2111, 1), (2111, 2112, 0), (2112, 2175, 1), (2175, 2176, 0), (2176, 2239, 1), (2239, 2240, 0), (2240, 2303, 1), (2303, 2304, 0), (2304, 2367, 1), (2367, 2368, 0), (2368, 2431, 1), (2431, 2432, 0), (2432, 2495, 1), (2495, 2496, 0), (2496, 2559, 1), (2559, 2560, 0), (2560, 2623, 1), (2623, 2624, 0), (2624, 2687, 1), (2687, 2688, 0), (2688, 2751, 1), (2751, 2752, 0), (2752, 2815, 1), (2815, 2816, 0), (2816, 2879, 1), (2879, 2880, 0), (2880, 2943, 1), (2943, 2944, 0), (2944, 3007, 1), (3007, 3008, 0), (3008, 3071, 1), (3071, 3072, 0), (3072, 3135, 1), (3135, 3136, 0), (3136, 3199, 1), (3199, 3200, 0), (3200, 3263, 1), (3263, 3264, 0), (3264, 3327, 1), (3327, 3328, 0), (3328, 3391, 1), (3391, 3392, 0), (3392, 3455, 1), (3455, 3456, 0), (3456, 3519, 1), (3519, 3520, 0), (3520, 3583, 1), (3583, 3584, 0), (3584, 3647, 1), (3647, 3648, 0), (3648, 3711, 1), (3711, 3712, 0), (3712, 3775, 1), (3775, 3776, 0), (3776, 3839, 1), (3839, 3840, 0), (3840, 3903, 1), (3903, 3904, 0), (3904, 3967, 1), (3967, 3968, 0), (3968, 4031, 1), (4031, 4032, 0), (4032, 4095, 1), (4095, 4096, 0), (4096, 4159, 1), (4159, 4160, 0), (4160, 4223, 1), (4223, 4224, 0), (4224, 4287, 1), (4287, 4288, 0), (4288, 4351, 1), (4351, 4352, 0), (4352, 4415, 1), (4415, 4416, 0), (4416, 4479, 1), (4479, 4480, 0), (4480, 4543, 1), (4543, 4544, 0), (4544, 4607, 1), (4607, 4608, 0), (4608, 4671, 1), (4671, 8192, 0)]
+def extractedPerRuns2 : List (Nat × Nat × Int) := [(0, 127, 0), (127, 128, 1), (128, 191, 0), (191, 192, 1), (192, 255, 0), (255, 256, 1), (256, 319, 0), (319, 320, 1), (320, 383, 0), (383, 384, 1), (384, 447, 0), (447, 448, 1), (448, 511, 0), (511, 512, 1), (512, 575, 0), (575, 576, 1), (576, 639, 0), (639, 640, 1), (640, 703, 0), (703, 704, 1), (704, 767, 0), (767, 768, 1), (768, 831, 0), (831, 832, 1), (832, 895, 0), (895, 896, 1), (896, 959, 0), (959, 960, 1), (960, 1023, 0), (1023, 1024, 1), (1024, 1087, 0), (1087, 1088, 1), (1088, 1151, 0), (1151, 1152, 1), (1152, 1215, 0), (1215, 1216, 1), (1216, 1279, 0), (1279, 1280, 1), (1280, 1343, 0), (1343, 1344, 1), (1344, 1407, 0), (1407, 1408, 1), (1408, 1471, 0), (1471, 1472, 1), (1472, 1535, 0), (1535, 1536, 1), (1536, 1599, 0), (1599, 1600, 1), (1600, 1663, 0), (1663, 1664, 1), (1664, 1727, 0), (1727, 1728, 1), (1728, 1791, 0), (1791, 1792, 1), (1792, 1855, 0), (1855, 1856, 1), (1856, 1919, 0), (1919, 1920, 1), (1920, 1983, 0), (1983, 1984, 1), (1984, 2047, 0), (2047, 2048, 1), (2048, 2111, 0), (2111, 2112, 1), (2112, 2175, 0), (2175, 2176, 1), (2176, 2239, 0), (2239, 2240, 1), (2240, 2303, 0), (2303, 2304, 1), (2304, 2367, 0), (2367, 2368, 1), (2368, 2431, 0), (2431, 2432, 1), (2432, 2495, 0), (2495, 2496, 1), (2496, 2559, 0), (2559, 2560, 1), (2560, 2623, 0), (2623, 2624, 1), (2624, 2687, 0), (2687, 2688, 1), (2688, 2751, 0), (2751, 2752, 1), (2752, 2815, 0), (2815, 2816, 1), (2816, 2879, 0), (2879, 2880, 1), (2880, 2943, 0), (2943, 2944, 1), (2944, 3007, 0), (3007, 3008, 1), (3008, 3071, 0), (3071, 3072, 1), (3072, 3135, 0), (3135, 3136, 1), (3136, 3199, 0), (3199, 3200, 1), (3200, 3263, 0), (3263, 3264, 1), (3264, 3327, 0), (3327, 3328, 1), (3328, 3391, 0), (3391, 3392, 1), (3392, 3455, 0), (3455, 3456, 1), (3456, 3519, 0), (3519, 3520, 1), (3520, 3583, 0), (3583, 3584, 1), (3584, 3647, 0), (3647, 3648, 1), (3648, 3711, 0), (3711, 3712, 1), (3712, 3775, 0), (3775, 3776, 1), (3776, 3839, 0), (3839, 3840, 1), (3840, 3903, 0), (3903, 3904, 1), (3904, 3967, 0), (3967, 3968, 1), (3968, 4031, 0), (4031, 4032, 1), (4032, 4095, 0), (4095, 4096, 1), (4096, 4159, 0), (4159, 4160, 1), (4160, 4223, 0), (4223, 4224, 1), (4224, 4287, 0), (4287, 4288, 1), (4288, 4351, 0), (4351, 4352, 1), (4352, 4415, 0), (4415, 4416, 1), (4416, 4479, 0), (4479, 4480, 1), (4480, 4543, 0), (4543, 4544, 1), (4544, 4607, 0), (4607, 4608, 1), (4608, 4671, 0), (4671, 4672, 1), (4672, 8192, 0)]
+def extractedPerRuns3 : List (Nat × Nat × Int) := [(0, 63, 0), (63, 64, 1), (64, 2303, 0), (2303, 2304, 1), (2304, 8192, 0)]
+def extractedPerRuns4 : List (Nat × Nat × Int) := [(0, 127, 0), (127, 128, 1), (128, 2367, 0), (2367, 2368, 1), (2368, 8192, 0)]
+def extractedPerRuns5 : List (Nat × Nat × Int) := [(0, 191, 0), (191, 192, 1), (192, 255, 0), (255, 256, 1), (256, 319, 0), (319, 320, 1), (320, 383, 0), (383, 384, 1), (384, 447, 0), (447, 448, 1), (448, 511, 0), (511, 512, 1), (512, 575, 0), (575, 576, 1), (576, 639, 0), (639, 640, 1), (640, 703, 0), (703, 704, 1), (704, 767, 0), (767, 768, 1), (768, 831, 0), (831, 832, 1), (832, 895, 0), (895, 896, 1), (896, 959, 0), (959, 960, 1), (960, 1023, 0), (1023, 1024, 1), (1024, 1087, 0), (1087, 1088, 1), (1088, 1151, 0), (1151, 1152, 1), (1152, 1215, 0), (1215, 1216, 1), (1216, 1279, 0), (1279, 1280, 1), (1280, 1343, 0), (1343, 1344, 1), (1344, 1407, 0), (1407, 1408, 1), (1408, 1471, 0), (1471, 1472, 1), (1472, 1535, 0), (1535, 1536, 1), (1536, 1599, 0), (1599, 1600, 1), (1600, 1663, 0), (1663, 1664, 1), (1664, 1727, 0), (1727, 1728, 1), (1728, 1791, 0), (1791, 1792, 1), (1792, 1855, 0), (1855, 1856, 1), (1856, 1919, 0), (1919, 1920, 1), (1920, 1983, 0), (1983, 1984, 1), (1984, 2047, 0), (2047, 2048, 1), (2048, 2111, 0), (2111, 2112, 1), (2112, 2175, 0), (2175, 2176, 1), (2176, 2431, 0), (2431, 2432, 1), (2432, 2495, 0), (2495, 2496, 1), (2496, 2559, 0), (2559, 2560, 1), (2560, 2623, 0), (2623, 2624, 1), (2624, 2687, 0), (2687, 2688, 1), (2688, 2751, 0), (2751, 2752, 1), (2752, 2815, 0), (2815, 2816, 1), (2816, 2879, 0), (2879, 2880, 1), (2880, 2943, 0), (2943, 2944, 1), (2944, 3007, 0), (3007, 3008, 1), (3008, 3071, 0), (3071, 3072, 1), (3072, 3135, 0), (3135, 3136, 1), (3136, 3199, 0), (3199, 3200, 1), (3200, 3263, 0), (3263, 3264, 1), (3264, 3327, 0), (3327, 3328, 1), (3328, 3391, 0), (3391, 3392, 1), (3392, 3455, 0), (3455, 3456, 1), (3456, 3519, 0), (3519, 3520, 1), (3520, 3583, 0), (3583, 3584, 1), (3584, 3647, 0), (3647, 3648, 1), (3648, 3711, 0), (3711, 3712, 1), (3712, 3775, 0), (3775, 3776, 1), (3776, 3839, 0), (3839, 3840, 1), (3840, 3903, 0), (3903, 3904, 1), (3904, 3967, 0), (3967, 3968, 1), (3968, 4031, 0), (4031, 4032, 1), (4032, 4095, 0), (4095, 4096, 1), (4096, 4159, 0), (4159, 4160, 1), (4160, 4223, 0), (4223, 4224, 1), (4224, 4287, 0), (4287, 4288, 1), (4288, 4351, 0), (4351, 4352, 1), (4352, 4415, 0), (4415, 4416, 1), (4416, 8192, 0)]
+def extractedPerRuns6 : List (Nat × Nat × Int) := [(0, 2239, 0), (2239, 2240, 1), (2240, 4479, 0), (4479, 4480, 1), (4480, 8192, 0)]
+def extractedPerRuns7 : List (Nat × Nat × Int) := [(0, 4543, 0), (4543, 4544, 1), (4544, 4607, 0), (4607, 4608, 1), (4608, 8192, 0)]
+def extractedPerRuns8 : List (Nat × Nat × Int) := [(0, 191, 0), (191, 192, 1), (192, 255, 0), (255, 256, 2), (256, 319, 0), (319, 320, 4), (320, 383, 0), (383, 384, 8), (384, 447, 0), (447, 448, 16), (448, 511, 0), (511, 512, 32), (512, 575, 0), (575, 576, 64), (576, 639, 0), (639, 640, 128), (640, 703, 0), (703, 704, 256), (704, 767, 0), (767, 768, 512), (768, 831, 0), (831, 832, 1024), (832, 895, 0), (895, 896, 2048), (896, 959, 0), (959, 960, 4096), (960, 1023, 0), (1023, 1024, 8192), (1024, 1087, 0), (1087, 1088, 16384), (1088, 1151, 0), (1151, 1152, 32768), (1152, 1215, 0), (1215, 1216, 65536), (1216, 1279, 0), (1279, 1280, 131072), (1280, 1343, 0), (1343, 1344, 262144), (1344, 1407, 0), (1407, 1408, 524288), (1408, 1471, 0), (1471, 1472, 1048576), (1472, 1535, 0), (1535, 1536, 2097152), (1536, 1599, 0), (1599, 1600, 4194304), (1600, 1663, 0), (1663, 1664, 8388608), (1664, 1727, 0), (1727, 1728, 16777216), (1728, 1791, 0), (1791, 1792, 33554432), (1792, 1855, 0), (1855, 1856, 67108864), (1856, 1919, 0), (1919, 1920, 134217728), (1920, 1983, 0), (1983, 1984, 268435456), (1984, 2047, 0), (2047, 2048, 536870912), (2048, 2111, 0), (2111, 2112, 1073741824), (2112, 2175, 0), (2175, 2176, 2147483648), (2176, 2431, 0), (2431, 2432, 1), (2432, 2495, 0), (2495, 2496, 2), (2496, 2559, 0), (2559, 2560, 4), (2560, 2623, 0), (2623, 2624, 8), (2624, 2687, 0), (2687, 2688, 16), (2688, 2751, 0), (2751, 2752, 32), (2752, 2815, 0), (2815, 2816, 64), (2816, 2879, 0), (2879, 2880, 128), (2880, 2943, 0), (2943, 2944, 256), (2944, 3007, 0), (3007, 3008, 512), (3008, 3071, 0), (3071, 3072, 1024), (3072, 3135, 0), (3135, 3136, 2048), (3136, 3199, 0), (3199, 3200, 4096), (3200, 3263, 0), (3263, 3264, 8192), (3264, 3327, 0), (3327, 3328, 16384), (3328, 3391, 0), (3391, 3392, 32768), (3392, 3455, 0), (3455, 3456, 65536), (3456, 3519, 0), (3519, 3520, 131072), (3520, 3583, 0), (3583, 3584, 262144), (3584, 3647, 0), (3647, 3648, 524288), (3648, 3711, 0), (3711, 3712, 1048576), (3712, 3775, 0), (3775, 3776, 2097152), (3776, 3839, 0), (3839, 3840, 4194304), (3840, 3903, 0), (3903, 3904, 8388608), (3904, 3967, 0), (3967, 3968, 16777216), (3968, 4031, 0), (4031, 4032, 33554432), (4032, 4095, 0), (4095, 4096, 67108864), (4096, 4159, 0), (4159, 4160, 134217728), (4160, 4223, 0), (4223, 4224, 268435456), (4224, 4287, 0), (4287, 4288, 536870912), (4288, 4351, 0), (4351, 4352, 1073741824), (4352, 4415, 0), (4415, 4416, 2147483648), (4416, 8192, 0)]
+def extractedPerRuns9 : List (Nat × Nat × Int) := [(0, 136, 0), (136, 137, 1), (137, 2376, 0), (2376, 2377, 1), (2377, 4552, 0), (4552, 4553, 1), (4553, 4616, 0), (4616, 4617, 1), (4617, 8192, 0)]
+def extractedPerRuns10 : List (Nat × Nat × Int) := [(0, 64, 0), (64, 4672, 1), (4672, 8192, 0)]
+def extractedPerRuns11 : List (Nat × Nat × Int) := [(0, 64, 0), (64, 4671, 1), (4671, 8192, 0)]
+def extractedPerRuns12 : List (Nat × Nat × Int) := [(0, 64, 0), (64, 2303, 1), (2303, 2304, 0), (2304, 4671, 1), (4671, 8192, 0)]
+def extractedPerRuns13 : List (Nat × Nat × Int) := [(0, 64, 0), (64, 127, 1), (127, 128, 0), (128, 2367, 1), (2367, 2368, 0), (2368, 4671, 1), (4671, 8192, 0)]
+
+def extractedPerRuns : Nat → List (Nat × Nat × Int)
+  | 1  => extractedPerRuns1
+  | 2  => extractedPerRuns2
+  | 3  => extractedPerRuns3
+  | 4  => extractedPerRuns4
+  | 5  => extractedPerRuns5
+  | 6  => extractedPerRuns6
+  | 7  => extractedPerRuns7
+  | 8  => extractedPerRuns8
+  | 9  => extractedPerRuns9
+  | 10 => extractedPerRuns10
+  | 11 => extractedPerRuns11
+  | 12 => extractedPerRuns12
+  | 13 => extractedPerRuns13
+  | _  => []
+
+def lookupRuns : List (Nat × Nat × Int) → Nat → Int
+  | [], _ => 0
+  | (lo, hi, v) :: rest, r => if lo ≤ r ∧ r < hi then v else lookupRuns rest r
+
+/-- Live Rust-extracted periodic table value at `(row r, selector s)`. -/
+def extractedPeriodicVal (r s : Nat) : Int :=
+  if s = 0 then extractedPerK[r % 64]!
+  else lookupRuns (extractedPerRuns s) r
+
+def repT (t : Nat) : Nat :=
+  if t < 8 then 0 else if t = 8 then 8 else if t < 63 then 9 else 63
+
+theorem periodicVal_eq_repT (b t s : Nat) (ht : t < 64) (hs1 : 1 ≤ s) (hs14 : s < 14) :
+    periodicVal (b * 64 + t) s = periodicVal (b * 64 + repT t) s := by
+  have hdiv : (b * 64 + t) / 64 = b := by omega
+  have hmod : (b * 64 + t) % 64 = t := by omega
+  have hrepLt : repT t < 64 := by unfold repT; split; omega; split; omega; split <;> omega
+  have hdiv' : (b * 64 + repT t) / 64 = b := by omega
+  have hmod' : (b * 64 + repT t) % 64 = repT t := by omega
+  have ht63 : (t < 63) ↔ (repT t < 63) := by unfold repT; split; omega; split; omega; split <;> omega
+  have ht63e : (t = 63) ↔ (repT t = 63) := by unfold repT; split; omega; split; omega; split <;> omega
+  have ht8 : (t = 8) ↔ (repT t = 8) := by unfold repT; split; omega; split; omega; split <;> omega
+  have hact : (64 ≤ b * 64 + t ∧ b * 64 + t < 4671) ↔ (64 ≤ b * 64 + repT t ∧ b * 64 + repT t < 4671) := by
+    unfold repT; split; omega; split; omega; split <;> omega
+  have hsCases : s = 1 ∨ s = 2 ∨ s = 3 ∨ s = 4 ∨ s = 5 ∨ s = 6 ∨ s = 7 ∨
+                 s = 8 ∨ s = 9 ∨ s = 10 ∨ s = 11 ∨ s = 12 ∨ s = 13 := by omega
+  rcases hsCases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    simp [periodicVal, hdiv, hmod, hdiv', hmod', ht63, ht63e, ht8, hact]
+
+def checkSeg (s lo hi : Nat) (v : Int) (segLo segHi rep : Nat) : Bool :=
+  if max lo segLo < min hi segHi then periodicVal rep s == v else true
+
+def checkBlk (s lo hi : Nat) (v : Int) (blk : Nat) : Bool :=
+  let base := blk * 64
+  checkSeg s lo hi v base (base + 8) base &&
+  checkSeg s lo hi v (base + 8) (base + 9) (base + 8) &&
+  checkSeg s lo hi v (base + 9) (base + 63) (base + 9) &&
+  checkSeg s lo hi v (base + 63) (base + 64) (base + 63)
+
+def checkRun (s lo hi : Nat) (v : Int) : Bool :=
+  decide (lo < hi) && decide (hi ≤ 8192) &&
+  (List.range ((hi - 1) / 64 - lo / 64 + 1)).all (fun d => checkBlk s lo hi v (lo / 64 + d))
+
+def checkRunsCover (s cur : Nat) : List (Nat × Nat × Int) → Bool
+  | [] => cur == 8192
+  | (lo, hi, v) :: rest =>
+      (lo == cur) && checkRun s lo hi v && checkRunsCover s hi rest
+
+theorem checkSeg_sound {s lo hi segLo segHi rep : Nat} {v : Int}
+    (hc : checkSeg s lo hi v segLo segHi rep = true)
+    (h1 : max lo segLo < min hi segHi) : periodicVal rep s = v := by
+  unfold checkSeg at hc
+  simp only [h1, ↓reduceIte] at hc
+  exact beq_iff_eq.mp hc
+
+theorem checkBlk_sound {s lo hi blk r : Nat} {v : Int}
+    (hs1 : 1 ≤ s) (hs14 : s < 14)
+    (hc : checkBlk s lo hi v blk = true)
+    (hlo : lo ≤ r) (hhi : r < hi) (hblk : r / 64 = blk) :
+    periodicVal r s = v := by
+  unfold checkBlk at hc
+  simp only [Bool.and_eq_true] at hc
+  rcases hc with ⟨⟨⟨h0, h8⟩, h9⟩, h63⟩
+  let t := r % 64
+  have ht : t < 64 := Nat.mod_lt r (by decide)
+  have hr : r = blk * 64 + t := by omega
+  rw [hr, periodicVal_eq_repT blk t s ht hs1 hs14]
+  by_cases ht8l : t < 8
+  · have hrep : repT t = 0 := by unfold repT; simp [ht8l]
+    rw [hrep, Nat.add_zero]
+    exact checkSeg_sound h0 (by omega)
+  · by_cases ht8e : t = 8
+    · have hrep : repT t = 8 := by unfold repT; simp [ht8e]
+      rw [hrep]
+      exact checkSeg_sound h8 (by omega)
+    · by_cases ht63l : t < 63
+      · have hrep : repT t = 9 := by unfold repT; simp [ht8l, ht8e, ht63l]
+        rw [hrep]
+        exact checkSeg_sound h9 (by omega)
+      · have hrep : repT t = 63 := by unfold repT; simp [ht8l, ht8e, ht63l]
+        rw [hrep]
+        exact checkSeg_sound h63 (by omega)
+
+theorem checkRun_sound {s lo hi r : Nat} {v : Int}
+    (hs1 : 1 ≤ s) (hs14 : s < 14)
+    (hc : checkRun s lo hi v = true)
+    (hlo : lo ≤ r) (hhi : r < hi) :
+    periodicVal r s = v := by
+  unfold checkRun at hc
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at hc
+  rcases hc with ⟨⟨hlt, hle⟩, hall⟩
+  have hd : r / 64 - lo / 64 < (hi - 1) / 64 - lo / 64 + 1 := by omega
+  have hblk := List.all_eq_true.mp hall (r / 64 - lo / 64) (List.mem_range.mpr hd)
+  have hadd : lo / 64 + (r / 64 - lo / 64) = r / 64 := by omega
+  rw [hadd] at hblk
+  exact checkBlk_sound hs1 hs14 hblk hlo hhi rfl
+
+theorem checkRunsCover_sound {s : Nat} (hs1 : 1 ≤ s) (hs14 : s < 14) :
+    ∀ (cur : Nat) (runs : List (Nat × Nat × Int)),
+      checkRunsCover s cur runs = true →
+      ∀ r, cur ≤ r → r < 8192 → lookupRuns runs r = periodicVal r s
+  | cur, [], hc, r, hcur, hr => by
+      simp only [checkRunsCover, beq_iff_eq] at hc
+      omega
+  | cur, (lo, hi, v) :: rest, hc, r, hcur, hr => by
+      simp only [checkRunsCover, Bool.and_eq_true, beq_iff_eq] at hc
+      rcases hc with ⟨⟨rfl, hrun⟩, hrest⟩
+      by_cases hlt : r < hi
+      · simp only [lookupRuns, hcur, hlt, and_self, ↓reduceIte]
+        exact (checkRun_sound hs1 hs14 hrun hcur hlt).symm
+      · have hge : hi ≤ r := by omega
+        simp only [lookupRuns, hlt, and_false, ↓reduceIte]
+        exact checkRunsCover_sound hs1 hs14 hi rest hrest r hge hr
+
+theorem extracted_perK_valid :
+    (List.range 64).all (fun t => extractedPerK[t]! == ((K[(t + 1) % 64]!).toNat : Int)) = true := by decide
+theorem extracted_runs_valid_1  : checkRunsCover 1  0 extractedPerRuns1  = true := by decide
+theorem extracted_runs_valid_2  : checkRunsCover 2  0 extractedPerRuns2  = true := by decide
+theorem extracted_runs_valid_3  : checkRunsCover 3  0 extractedPerRuns3  = true := by decide
+theorem extracted_runs_valid_4  : checkRunsCover 4  0 extractedPerRuns4  = true := by decide
+theorem extracted_runs_valid_5  : checkRunsCover 5  0 extractedPerRuns5  = true := by decide
+theorem extracted_runs_valid_6  : checkRunsCover 6  0 extractedPerRuns6  = true := by decide
+theorem extracted_runs_valid_7  : checkRunsCover 7  0 extractedPerRuns7  = true := by decide
+theorem extracted_runs_valid_8  : checkRunsCover 8  0 extractedPerRuns8  = true := by decide
+theorem extracted_runs_valid_9  : checkRunsCover 9  0 extractedPerRuns9  = true := by decide
+theorem extracted_runs_valid_10 : checkRunsCover 10 0 extractedPerRuns10 = true := by decide
+theorem extracted_runs_valid_11 : checkRunsCover 11 0 extractedPerRuns11 = true := by decide
+theorem extracted_runs_valid_12 : checkRunsCover 12 0 extractedPerRuns12 = true := by decide
+theorem extracted_runs_valid_13 : checkRunsCover 13 0 extractedPerRuns13 = true := by decide
+
+/-- KERNEL-CHECKED PERIODIC TABLE EQUIVALENCE (ALL 8,192 × 14 = 114,688 CELLS):
+    `periodicVal r s` is proven equal inside Lean 4's kernel to the live Rust-extracted
+    `extractedPeriodicVal r s` from `spend::periodic_table()` at every single cell. -/
+theorem periodicVal_eq_extracted_all_114688 (r s : Nat) (hr : r < 8192) (hs : s < 14) :
+    periodicVal r s = extractedPeriodicVal r s := by
+  have hcases : s = 0 ∨ s = 1 ∨ s = 2 ∨ s = 3 ∨ s = 4 ∨ s = 5 ∨ s = 6 ∨
+                s = 7 ∨ s = 8 ∨ s = 9 ∨ s = 10 ∨ s = 11 ∨ s = 12 ∨ s = 13 := by omega
+  rcases hcases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · simp only [extractedPeriodicVal, ↓reduceIte, periodicVal]
+    have hm : r % 64 < 64 := Nat.mod_lt r (by decide)
+    exact (beq_iff_eq.mp (List.all_eq_true.mp extracted_perK_valid (r % 64) (List.mem_range.mpr hm))).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns1  extracted_runs_valid_1  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns2  extracted_runs_valid_2  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns3  extracted_runs_valid_3  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns4  extracted_runs_valid_4  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns5  extracted_runs_valid_5  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns6  extracted_runs_valid_6  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns7  extracted_runs_valid_7  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns8  extracted_runs_valid_8  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns9  extracted_runs_valid_9  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns10 extracted_runs_valid_10 r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns11 extracted_runs_valid_11 r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns12 extracted_runs_valid_12 r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns13 extracted_runs_valid_13 r (Nat.zero_le r) hr).symm
+
+/-- Evaluation environment using the live Rust-extracted `extractedPeriodicVal`. -/
+def extractedRowEnv (T : RawFieldTrace) (r : Nat) (v : Nat) : Int :=
+  if v < W_COLS then T.cell r v
+  else if v < 2 * W_COLS then T.cell (r + 1) (v - W_COLS)
+  else extractedPeriodicVal r (v - 2 * W_COLS)
+
+/-- ALL 249 live Rust extracted transition polynomials vanish on every `(r, r+1)` using the
+    live Rust extracted periodic selector table `extractedPeriodicVal`. -/
+def ExtractedAirTransitionsHold (T : RawFieldTrace) : Prop :=
+  ∀ r, r < 8191 → ∀ i, i < 249 → evalPoly (extractedRowEnv T r) (rustCon i) % P = 0
+
+theorem evalMonomial_congr {env1 env2 : Nat → Int} :
+    ∀ (vs : List Nat), (∀ v ∈ vs, env1 v = env2 v) → evalMonomial env1 vs = evalMonomial env2 vs
+  | [], _ => rfl
+  | v :: vs, h => by
+      simp only [evalMonomial, h v (List.mem_cons_self ..),
+                 evalMonomial_congr vs (fun x hx => h x (List.mem_cons_of_mem _ hx))]
+
+theorem evalPoly_congr {env1 env2 : Nat → Int} :
+    ∀ (p : Poly), (∀ m ∈ p, ∀ v ∈ m.1, env1 v = env2 v) → evalPoly env1 p = evalPoly env2 p
+  | [], _ => rfl
+  | (ms, c) :: tl, h => by
+      simp only [evalPoly,
+                 evalMonomial_congr ms (h (ms, c) (List.mem_cons_self ..)),
+                 evalPoly_congr tl (fun m hm => h m (List.mem_cons_of_mem _ hm))]
+
+theorem all_rustCon_vars_in_range :
+    (List.range 249).all (fun i =>
+      (rustCon i).all (fun m => m.1.all (fun v => decide (v < 2 * W_COLS + 14)))) = true := by decide
+
+theorem extracted_air_iff_raw_air (T : RawFieldTrace) :
+    ExtractedAirTransitionsHold T ↔ RawAirTransitionsHold T := by
+  have heq : ∀ r, r < 8191 → ∀ i, i < 249 →
+      evalPoly (extractedRowEnv T r) (rustCon i) = evalPoly (rowEnv T r) (rustCon i) := by
+    intro r hr i hi
+    apply evalPoly_congr
+    intro m hm v hv
+    have hvars := List.all_eq_true.mp all_rustCon_vars_in_range i (List.mem_range.mpr hi)
+    have hmon := List.all_eq_true.mp hvars m hm
+    have hvlt : v < 2 * W_COLS + 14 := of_decide_eq_true (List.all_eq_true.mp hmon v hv)
+    unfold extractedRowEnv rowEnv
+    split
+    · rfl
+    · split
+      · rfl
+      · exact (periodicVal_eq_extracted_all_114688 r (v - 2 * W_COLS) (by omega) (by omega)).symm
+  constructor
+  · intro h r hr i hi
+    rw [← heq r hr i hi]
+    exact h r hr i hi
+  · intro h r hr i hi
+    rw [heq r hr i hi]
+    exact h r hr i hi
+
+-- ---- Live Rust-Extracted 4-Mode Boundary Assertions ----
+
+inductive AssertExpr where
+  | zero
+  | root (j : Fin 8)
+  | nf0 (j : Fin 8)
+  | nf1 (j : Fin 8)
+  | cmOut0 (j : Fin 8)
+  | cmOut1 (j : Fin 8)
+  | valueBalance
+  deriving DecidableEq
+
+def evalAssertExpr (pi : SpendPublicStmt) : AssertExpr → Int
+  | .zero         => 0
+  | .root j       => ((pi.root j).toNat : Int)
+  | .nf0 j        => ((pi.nf0 j).toNat : Int)
+  | .nf1 j        => ((pi.nf1 j).toNat : Int)
+  | .cmOut0 j     => ((pi.cmOut0 j).toNat : Int)
+  | .cmOut1 j     => ((pi.cmOut1 j).toNat : Int)
+  | .valueBalance => signedField pi.valueBalance
+
+def extractedAssertionsFF : List (Nat × Nat × AssertExpr) := [
+  (243, 64, AssertExpr.zero),
+  (242, 64, AssertExpr.zero),
+  (220, 2239, AssertExpr.root ⟨0, by decide⟩),
+  (221, 2239, AssertExpr.root ⟨1, by decide⟩),
+  (222, 2239, AssertExpr.root ⟨2, by decide⟩),
+  (223, 2239, AssertExpr.root ⟨3, by decide⟩),
+  (224, 2239, AssertExpr.root ⟨4, by decide⟩),
+  (225, 2239, AssertExpr.root ⟨5, by decide⟩),
+  (226, 2239, AssertExpr.root ⟨6, by decide⟩),
+  (227, 2239, AssertExpr.root ⟨7, by decide⟩),
+  (220, 2303, AssertExpr.nf0 ⟨0, by decide⟩),
+  (221, 2303, AssertExpr.nf0 ⟨1, by decide⟩),
+  (222, 2303, AssertExpr.nf0 ⟨2, by decide⟩),
+  (223, 2303, AssertExpr.nf0 ⟨3, by decide⟩),
+  (224, 2303, AssertExpr.nf0 ⟨4, by decide⟩),
+  (225, 2303, AssertExpr.nf0 ⟨5, by decide⟩),
+  (226, 2303, AssertExpr.nf0 ⟨6, by decide⟩),
+  (227, 2303, AssertExpr.nf0 ⟨7, by decide⟩),
+  (220, 4479, AssertExpr.root ⟨0, by decide⟩),
+  (221, 4479, AssertExpr.root ⟨1, by decide⟩),
+  (222, 4479, AssertExpr.root ⟨2, by decide⟩),
+  (223, 4479, AssertExpr.root ⟨3, by decide⟩),
+  (224, 4479, AssertExpr.root ⟨4, by decide⟩),
+  (225, 4479, AssertExpr.root ⟨5, by decide⟩),
+  (226, 4479, AssertExpr.root ⟨6, by decide⟩),
+  (227, 4479, AssertExpr.root ⟨7, by decide⟩),
+  (220, 4543, AssertExpr.nf1 ⟨0, by decide⟩),
+  (221, 4543, AssertExpr.nf1 ⟨1, by decide⟩),
+  (222, 4543, AssertExpr.nf1 ⟨2, by decide⟩),
+  (223, 4543, AssertExpr.nf1 ⟨3, by decide⟩),
+  (224, 4543, AssertExpr.nf1 ⟨4, by decide⟩),
+  (225, 4543, AssertExpr.nf1 ⟨5, by decide⟩),
+  (226, 4543, AssertExpr.nf1 ⟨6, by decide⟩),
+  (227, 4543, AssertExpr.nf1 ⟨7, by decide⟩),
+  (220, 4607, AssertExpr.cmOut0 ⟨0, by decide⟩),
+  (221, 4607, AssertExpr.cmOut0 ⟨1, by decide⟩),
+  (222, 4607, AssertExpr.cmOut0 ⟨2, by decide⟩),
+  (223, 4607, AssertExpr.cmOut0 ⟨3, by decide⟩),
+  (224, 4607, AssertExpr.cmOut0 ⟨4, by decide⟩),
+  (225, 4607, AssertExpr.cmOut0 ⟨5, by decide⟩),
+  (226, 4607, AssertExpr.cmOut0 ⟨6, by decide⟩),
+  (227, 4607, AssertExpr.cmOut0 ⟨7, by decide⟩),
+  (220, 4671, AssertExpr.cmOut1 ⟨0, by decide⟩),
+  (221, 4671, AssertExpr.cmOut1 ⟨1, by decide⟩),
+  (222, 4671, AssertExpr.cmOut1 ⟨2, by decide⟩),
+  (223, 4671, AssertExpr.cmOut1 ⟨3, by decide⟩),
+  (224, 4671, AssertExpr.cmOut1 ⟨4, by decide⟩),
+  (225, 4671, AssertExpr.cmOut1 ⟨5, by decide⟩),
+  (226, 4671, AssertExpr.cmOut1 ⟨6, by decide⟩),
+  (227, 4671, AssertExpr.cmOut1 ⟨7, by decide⟩),
+  (243, 4671, AssertExpr.valueBalance)
+]
+def extractedAssertionsFT : List (Nat × Nat × AssertExpr) := [
+  (243, 64, AssertExpr.zero),
+  (242, 64, AssertExpr.zero),
+  (220, 2239, AssertExpr.root ⟨0, by decide⟩),
+  (221, 2239, AssertExpr.root ⟨1, by decide⟩),
+  (222, 2239, AssertExpr.root ⟨2, by decide⟩),
+  (223, 2239, AssertExpr.root ⟨3, by decide⟩),
+  (224, 2239, AssertExpr.root ⟨4, by decide⟩),
+  (225, 2239, AssertExpr.root ⟨5, by decide⟩),
+  (226, 2239, AssertExpr.root ⟨6, by decide⟩),
+  (227, 2239, AssertExpr.root ⟨7, by decide⟩),
+  (220, 2303, AssertExpr.nf0 ⟨0, by decide⟩),
+  (221, 2303, AssertExpr.nf0 ⟨1, by decide⟩),
+  (222, 2303, AssertExpr.nf0 ⟨2, by decide⟩),
+  (223, 2303, AssertExpr.nf0 ⟨3, by decide⟩),
+  (224, 2303, AssertExpr.nf0 ⟨4, by decide⟩),
+  (225, 2303, AssertExpr.nf0 ⟨5, by decide⟩),
+  (226, 2303, AssertExpr.nf0 ⟨6, by decide⟩),
+  (227, 2303, AssertExpr.nf0 ⟨7, by decide⟩),
+  (147, 2368, AssertExpr.zero),
+  (148, 2368, AssertExpr.zero),
+  (220, 4543, AssertExpr.nf1 ⟨0, by decide⟩),
+  (221, 4543, AssertExpr.nf1 ⟨1, by decide⟩),
+  (222, 4543, AssertExpr.nf1 ⟨2, by decide⟩),
+  (223, 4543, AssertExpr.nf1 ⟨3, by decide⟩),
+  (224, 4543, AssertExpr.nf1 ⟨4, by decide⟩),
+  (225, 4543, AssertExpr.nf1 ⟨5, by decide⟩),
+  (226, 4543, AssertExpr.nf1 ⟨6, by decide⟩),
+  (227, 4543, AssertExpr.nf1 ⟨7, by decide⟩),
+  (220, 4607, AssertExpr.cmOut0 ⟨0, by decide⟩),
+  (221, 4607, AssertExpr.cmOut0 ⟨1, by decide⟩),
+  (222, 4607, AssertExpr.cmOut0 ⟨2, by decide⟩),
+  (223, 4607, AssertExpr.cmOut0 ⟨3, by decide⟩),
+  (224, 4607, AssertExpr.cmOut0 ⟨4, by decide⟩),
+  (225, 4607, AssertExpr.cmOut0 ⟨5, by decide⟩),
+  (226, 4607, AssertExpr.cmOut0 ⟨6, by decide⟩),
+  (227, 4607, AssertExpr.cmOut0 ⟨7, by decide⟩),
+  (220, 4671, AssertExpr.cmOut1 ⟨0, by decide⟩),
+  (221, 4671, AssertExpr.cmOut1 ⟨1, by decide⟩),
+  (222, 4671, AssertExpr.cmOut1 ⟨2, by decide⟩),
+  (223, 4671, AssertExpr.cmOut1 ⟨3, by decide⟩),
+  (224, 4671, AssertExpr.cmOut1 ⟨4, by decide⟩),
+  (225, 4671, AssertExpr.cmOut1 ⟨5, by decide⟩),
+  (226, 4671, AssertExpr.cmOut1 ⟨6, by decide⟩),
+  (227, 4671, AssertExpr.cmOut1 ⟨7, by decide⟩),
+  (243, 4671, AssertExpr.valueBalance)
+]
+def extractedAssertionsTF : List (Nat × Nat × AssertExpr) := [
+  (243, 64, AssertExpr.zero),
+  (242, 64, AssertExpr.zero),
+  (147, 128, AssertExpr.zero),
+  (148, 128, AssertExpr.zero),
+  (220, 2303, AssertExpr.nf0 ⟨0, by decide⟩),
+  (221, 2303, AssertExpr.nf0 ⟨1, by decide⟩),
+  (222, 2303, AssertExpr.nf0 ⟨2, by decide⟩),
+  (223, 2303, AssertExpr.nf0 ⟨3, by decide⟩),
+  (224, 2303, AssertExpr.nf0 ⟨4, by decide⟩),
+  (225, 2303, AssertExpr.nf0 ⟨5, by decide⟩),
+  (226, 2303, AssertExpr.nf0 ⟨6, by decide⟩),
+  (227, 2303, AssertExpr.nf0 ⟨7, by decide⟩),
+  (220, 4479, AssertExpr.root ⟨0, by decide⟩),
+  (221, 4479, AssertExpr.root ⟨1, by decide⟩),
+  (222, 4479, AssertExpr.root ⟨2, by decide⟩),
+  (223, 4479, AssertExpr.root ⟨3, by decide⟩),
+  (224, 4479, AssertExpr.root ⟨4, by decide⟩),
+  (225, 4479, AssertExpr.root ⟨5, by decide⟩),
+  (226, 4479, AssertExpr.root ⟨6, by decide⟩),
+  (227, 4479, AssertExpr.root ⟨7, by decide⟩),
+  (220, 4543, AssertExpr.nf1 ⟨0, by decide⟩),
+  (221, 4543, AssertExpr.nf1 ⟨1, by decide⟩),
+  (222, 4543, AssertExpr.nf1 ⟨2, by decide⟩),
+  (223, 4543, AssertExpr.nf1 ⟨3, by decide⟩),
+  (224, 4543, AssertExpr.nf1 ⟨4, by decide⟩),
+  (225, 4543, AssertExpr.nf1 ⟨5, by decide⟩),
+  (226, 4543, AssertExpr.nf1 ⟨6, by decide⟩),
+  (227, 4543, AssertExpr.nf1 ⟨7, by decide⟩),
+  (220, 4607, AssertExpr.cmOut0 ⟨0, by decide⟩),
+  (221, 4607, AssertExpr.cmOut0 ⟨1, by decide⟩),
+  (222, 4607, AssertExpr.cmOut0 ⟨2, by decide⟩),
+  (223, 4607, AssertExpr.cmOut0 ⟨3, by decide⟩),
+  (224, 4607, AssertExpr.cmOut0 ⟨4, by decide⟩),
+  (225, 4607, AssertExpr.cmOut0 ⟨5, by decide⟩),
+  (226, 4607, AssertExpr.cmOut0 ⟨6, by decide⟩),
+  (227, 4607, AssertExpr.cmOut0 ⟨7, by decide⟩),
+  (220, 4671, AssertExpr.cmOut1 ⟨0, by decide⟩),
+  (221, 4671, AssertExpr.cmOut1 ⟨1, by decide⟩),
+  (222, 4671, AssertExpr.cmOut1 ⟨2, by decide⟩),
+  (223, 4671, AssertExpr.cmOut1 ⟨3, by decide⟩),
+  (224, 4671, AssertExpr.cmOut1 ⟨4, by decide⟩),
+  (225, 4671, AssertExpr.cmOut1 ⟨5, by decide⟩),
+  (226, 4671, AssertExpr.cmOut1 ⟨6, by decide⟩),
+  (227, 4671, AssertExpr.cmOut1 ⟨7, by decide⟩),
+  (243, 4671, AssertExpr.valueBalance)
+]
+def extractedAssertionsTT : List (Nat × Nat × AssertExpr) := [
+  (243, 64, AssertExpr.zero),
+  (242, 64, AssertExpr.zero),
+  (147, 128, AssertExpr.zero),
+  (148, 128, AssertExpr.zero),
+  (220, 2303, AssertExpr.nf0 ⟨0, by decide⟩),
+  (221, 2303, AssertExpr.nf0 ⟨1, by decide⟩),
+  (222, 2303, AssertExpr.nf0 ⟨2, by decide⟩),
+  (223, 2303, AssertExpr.nf0 ⟨3, by decide⟩),
+  (224, 2303, AssertExpr.nf0 ⟨4, by decide⟩),
+  (225, 2303, AssertExpr.nf0 ⟨5, by decide⟩),
+  (226, 2303, AssertExpr.nf0 ⟨6, by decide⟩),
+  (227, 2303, AssertExpr.nf0 ⟨7, by decide⟩),
+  (147, 2368, AssertExpr.zero),
+  (148, 2368, AssertExpr.zero),
+  (220, 4543, AssertExpr.nf1 ⟨0, by decide⟩),
+  (221, 4543, AssertExpr.nf1 ⟨1, by decide⟩),
+  (222, 4543, AssertExpr.nf1 ⟨2, by decide⟩),
+  (223, 4543, AssertExpr.nf1 ⟨3, by decide⟩),
+  (224, 4543, AssertExpr.nf1 ⟨4, by decide⟩),
+  (225, 4543, AssertExpr.nf1 ⟨5, by decide⟩),
+  (226, 4543, AssertExpr.nf1 ⟨6, by decide⟩),
+  (227, 4543, AssertExpr.nf1 ⟨7, by decide⟩),
+  (220, 4607, AssertExpr.cmOut0 ⟨0, by decide⟩),
+  (221, 4607, AssertExpr.cmOut0 ⟨1, by decide⟩),
+  (222, 4607, AssertExpr.cmOut0 ⟨2, by decide⟩),
+  (223, 4607, AssertExpr.cmOut0 ⟨3, by decide⟩),
+  (224, 4607, AssertExpr.cmOut0 ⟨4, by decide⟩),
+  (225, 4607, AssertExpr.cmOut0 ⟨5, by decide⟩),
+  (226, 4607, AssertExpr.cmOut0 ⟨6, by decide⟩),
+  (227, 4607, AssertExpr.cmOut0 ⟨7, by decide⟩),
+  (220, 4671, AssertExpr.cmOut1 ⟨0, by decide⟩),
+  (221, 4671, AssertExpr.cmOut1 ⟨1, by decide⟩),
+  (222, 4671, AssertExpr.cmOut1 ⟨2, by decide⟩),
+  (223, 4671, AssertExpr.cmOut1 ⟨3, by decide⟩),
+  (224, 4671, AssertExpr.cmOut1 ⟨4, by decide⟩),
+  (225, 4671, AssertExpr.cmOut1 ⟨5, by decide⟩),
+  (226, 4671, AssertExpr.cmOut1 ⟨6, by decide⟩),
+  (227, 4671, AssertExpr.cmOut1 ⟨7, by decide⟩),
+  (243, 4671, AssertExpr.valueBalance)
+]
+
+def extractedAssertions (d0 d1 : Bool) : List (Nat × Nat × AssertExpr) :=
+  match d0, d1 with
+  | false, false => extractedAssertionsFF
+  | false, true  => extractedAssertionsFT
+  | true,  false => extractedAssertionsTF
+  | true,  true  => extractedAssertionsTT
+
+/-- Live Rust-extracted boundary assertions from `spend::assertion_cells(&pi)` across all 4
+    `(dummy0, dummy1)` flag combinations. -/
+def ExtractedBoundaryAssertions (pi : SpendPublicStmt) (T : RawFieldTrace) : Prop :=
+  ∀ a ∈ extractedAssertions pi.dummy0 pi.dummy1, T.cell a.2.1 a.1 = evalAssertExpr pi a.2.2
+
+def isRawAssertCell (d0 d1 : Bool) : Nat × Nat × AssertExpr → Bool
+  | (c, r, .zero) =>
+      (c == COL_BAL && r == 64) ||
+      (c == COL_POS && r == 64) ||
+      (d0 && r == 2 * 64 && (c == COL_W + 9 || c == COL_W + 10)) ||
+      (d1 && r == 37 * 64 && (c == COL_W + 9 || c == COL_W + 10))
+  | (c, r, .root j) =>
+      (!d0 && c == COL_DIG + j.val && r == 34 * 64 + 63) ||
+      (!d1 && c == COL_DIG + j.val && r == 69 * 64 + 63)
+  | (c, r, .nf0 j) => c == COL_DIG + j.val && r == 35 * 64 + 63
+  | (c, r, .nf1 j) => c == COL_DIG + j.val && r == 70 * 64 + 63
+  | (c, r, .cmOut0 j) => c == COL_DIG + j.val && r == 71 * 64 + 63
+  | (c, r, .cmOut1 j) => c == COL_DIG + j.val && r == 72 * 64 + 63
+  | (c, r, .valueBalance) => c == COL_BAL && r == 72 * 64 + 63
+
+def fin8List : List (Fin 8) :=
+  [⟨0, by decide⟩, ⟨1, by decide⟩, ⟨2, by decide⟩, ⟨3, by decide⟩,
+   ⟨4, by decide⟩, ⟨5, by decide⟩, ⟨6, by decide⟩, ⟨7, by decide⟩]
+
+def rawRequiredCells (d0 d1 : Bool) : List (Nat × Nat × AssertExpr) :=
+  [(COL_BAL, 64, .zero), (COL_POS, 64, .zero)] ++
+  (if d0 then [(COL_W + 9, 2 * 64, .zero), (COL_W + 10, 2 * 64, .zero)]
+   else fin8List.map (fun j => (COL_DIG + j.val, 34 * 64 + 63, .root j))) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 35 * 64 + 63, .nf0 j)) ++
+  (if d1 then [(COL_W + 9, 37 * 64, .zero), (COL_W + 10, 37 * 64, .zero)]
+   else fin8List.map (fun j => (COL_DIG + j.val, 69 * 64 + 63, .root j))) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 70 * 64 + 63, .nf1 j)) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 71 * 64 + 63, .cmOut0 j)) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 72 * 64 + 63, .cmOut1 j)) ++
+  [(COL_BAL, 72 * 64 + 63, .valueBalance)]
+
+theorem extracted_assertions_subset_raw :
+    ∀ d0 d1 : Bool, (extractedAssertions d0 d1).all (isRawAssertCell d0 d1) = true := by decide
+
+theorem raw_required_subset_extracted :
+    ∀ d0 d1 : Bool, (rawRequiredCells d0 d1).all (fun x => (extractedAssertions d0 d1).any (fun y => decide (y = x))) = true := by decide
+
+theorem mem_fin8List (j : Fin 8) : j ∈ fin8List := by
+  rcases j with ⟨k, hk⟩
+  match k, hk with
+  | 0, _ => simp [fin8List] | 1, _ => simp [fin8List] | 2, _ => simp [fin8List] | 3, _ => simp [fin8List]
+  | 4, _ => simp [fin8List] | 5, _ => simp [fin8List] | 6, _ => simp [fin8List] | 7, _ => simp [fin8List]
+
+theorem mem_of_rawRequired {d0 d1 : Bool} {x : Nat × Nat × AssertExpr}
+    (hx : x ∈ rawRequiredCells d0 d1) : x ∈ extractedAssertions d0 d1 := by
+  have h := List.all_eq_true.mp (raw_required_subset_extracted d0 d1) x hx
+  rcases List.any_eq_true.mp h with ⟨y, hyMem, hyEq⟩
+  rw [← of_decide_eq_true hyEq]
+  exact hyMem
+
+/-- KERNEL-CHECKED 4-MODE BOUNDARY ASSERTION EQUIVALENCE:
+    `ExtractedBoundaryAssertions pi T` (probed directly from live Rust `spend::assertion_cells`)
+    is proven logically equivalent inside Lean 4's kernel to `RawBoundaryAssertions pi T`
+    across ALL 4 `(dummy0, dummy1)` boolean combinations. -/
+theorem extracted_assertions_iff_raw_boundary (pi : SpendPublicStmt) (T : RawFieldTrace) :
+    ExtractedBoundaryAssertions pi T ↔ RawBoundaryAssertions pi T := by
+  constructor
+  · intro h
+    have get : ∀ x ∈ rawRequiredCells pi.dummy0 pi.dummy1, T.cell x.2.1 x.1 = evalAssertExpr pi x.2.2 :=
+      fun x hx => h x (mem_of_rawRequired hx)
+    refine {
+      hBal0 := get (COL_BAL, 64, .zero) (by simp [rawRequiredCells])
+      hPos0 := get (COL_POS, 64, .zero) (by simp [rawRequiredCells])
+      hDummy0 := fun hd0 => ⟨
+        get (COL_W + 9, 2 * 64, .zero) (by simp [rawRequiredCells, hd0]),
+        get (COL_W + 10, 2 * 64, .zero) (by simp [rawRequiredCells, hd0])⟩
+      hRoot0 := fun hd0 j =>
+        get (COL_DIG + j.val, 34 * 64 + 63, .root j) (by simp [rawRequiredCells, hd0, mem_fin8List])
+      hNf0 := fun j =>
+        get (COL_DIG + j.val, 35 * 64 + 63, .nf0 j) (by simp [rawRequiredCells, mem_fin8List])
+      hDummy1 := fun hd1 => ⟨
+        get (COL_W + 9, 37 * 64, .zero) (by simp [rawRequiredCells, hd1]),
+        get (COL_W + 10, 37 * 64, .zero) (by simp [rawRequiredCells, hd1])⟩
+      hRoot1 := fun hd1 j =>
+        get (COL_DIG + j.val, 69 * 64 + 63, .root j) (by simp [rawRequiredCells, hd1, mem_fin8List])
+      hNf1 := fun j =>
+        get (COL_DIG + j.val, 70 * 64 + 63, .nf1 j) (by simp [rawRequiredCells, mem_fin8List])
+      hOut0 := fun j =>
+        get (COL_DIG + j.val, 71 * 64 + 63, .cmOut0 j) (by simp [rawRequiredCells, mem_fin8List])
+      hOut1 := fun j =>
+        get (COL_DIG + j.val, 72 * 64 + 63, .cmOut1 j) (by simp [rawRequiredCells, mem_fin8List])
+      hBalEnd := get (COL_BAL, 72 * 64 + 63, .valueBalance) (by simp [rawRequiredCells])
+    }
+  · intro hB a ha
+    have hok := List.all_eq_true.mp (extracted_assertions_subset_raw pi.dummy0 pi.dummy1) a ha
+    rcases a with ⟨c, r, expr⟩
+    cases expr with
+    | zero =>
+        simp only [isRawAssertCell, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with (((⟨rfl, rfl⟩ | ⟨rfl, rfl⟩) | ⟨⟨hd0, rfl⟩, rfl | rfl⟩) | ⟨⟨hd1, rfl⟩, rfl | rfl⟩)
+        · exact hB.hBal0
+        · exact hB.hPos0
+        · exact (hB.hDummy0 hd0).1
+        · exact (hB.hDummy0 hd0).2
+        · exact (hB.hDummy1 hd1).1
+        · exact (hB.hDummy1 hd1).2
+    | root j =>
+        simp only [isRawAssertCell, Bool.or_eq_true, Bool.and_eq_true, Bool.not_eq_true', beq_iff_eq] at hok
+        rcases hok with ⟨⟨hd0, rfl⟩, rfl⟩ | ⟨⟨hd1, rfl⟩, rfl⟩
+        · exact hB.hRoot0 hd0 j
+        · exact hB.hRoot1 hd1 j
+    | nf0 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hNf0 j
+    | nf1 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hNf1 j
+    | cmOut0 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hOut0 j
+    | cmOut1 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hOut1 j
+    | valueBalance =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hBalEnd
+
+/-- TOP-LEVEL END-TO-END EXTRACTED RUST AIR ↔ SEMANTIC SPEND WITNESS EQUIVALENCE:
+    There exists a raw `8,192 × 247` Goldilocks trace satisfying ALL 249 live Rust extracted
+    transition polynomials (`rustCon`), the live Rust extracted 114,688-cell periodic selector
+    table (`extractedPeriodicVal`), AND all live Rust extracted boundary assertions
+    (`extractedAssertions`) IF AND ONLY IF there exists a valid semantic shielded-spend witness
+    `ValidSpendWitness pi`. -/
+theorem extracted_rust_air_iff_valid_spend_witness (pi : SpendPublicStmt) :
+    (∃ T : RawFieldTrace, ExtractedAirTransitionsHold T ∧ ExtractedBoundaryAssertions pi T) ↔
+      Nonempty (ValidSpendWitness pi) := by
+  constructor
+  · rintro ⟨T, hT, hB⟩
+    exact raw_rust_air_soundness pi T ((extracted_air_iff_raw_air T).mp hT)
+      ((extracted_assertions_iff_raw_boundary pi T).mp hB)
+  · rintro ⟨w⟩
+    rcases valid_witness_satisfies_raw_air pi w with ⟨hT, hB⟩
+    exact ⟨canonicalRawTrace pi w, (extracted_air_iff_raw_air _).mpr hT,
+      (extracted_assertions_iff_raw_boundary pi _).mpr hB⟩
+
+theorem extracted_rust_air_non_vacuous :
+    ∃ T : RawFieldTrace, ExtractedAirTransitionsHold T ∧ ExtractedBoundaryAssertions concretePi T :=
+  (extracted_rust_air_iff_valid_spend_witness concretePi).mpr ⟨concreteWitness⟩
+
 #print axioms fips180_4_sha256_empty_exact
 #print axioms fips180_4_sha256_abc_exact
 #print axioms xor3_poly_exact
@@ -8339,5 +8951,9 @@ theorem raw_rust_air_non_vacuous :
 #print axioms valid_witness_satisfies_raw_air
 #print axioms raw_rust_air_iff_valid_spend_witness
 #print axioms raw_rust_air_non_vacuous
+#print axioms periodicVal_eq_extracted_all_114688
+#print axioms extracted_assertions_iff_raw_boundary
+#print axioms extracted_rust_air_iff_valid_spend_witness
+#print axioms extracted_rust_air_non_vacuous
 
 end NewsatoshiFullCircuit

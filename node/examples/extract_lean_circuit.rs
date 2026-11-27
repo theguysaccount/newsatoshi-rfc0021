@@ -472,6 +472,104 @@ fn main() {
     let assert_real_str = fmt_cells(spend::assertion_cells(&pi_real));
     let assert_dummy_str = fmt_cells(spend::assertion_cells(&pi_dummy));
 
+    // 4d. Mechanically extract the ENTIRE live `spend::periodic_table()` (8,192 × 14 = 114,688 cells)
+    // into Lean 4 definitions (`extractedPerK` + run-length-encoded `extractedPerRuns1..13`),
+    // AND probe live `spend::assertion_cells` across ALL 4 `(dummy0, dummy1)` combinations with
+    // two independent unique-sentinel probes to emit `extractedAssertionsFF/FT/TF/TT`.
+    for r in 0..ROWS {
+        assert_eq!(
+            periodic[r][0], periodic[r % 64][0],
+            "periodic column 0 (P_K) must be strictly period-64 at row {r}"
+        );
+    }
+    let extracted_per_k_str = format!(
+        "#[{}]",
+        (0..64)
+            .map(|t| format!("{}", periodic[t][0].as_int()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut extracted_per_runs_defs = String::new();
+    for s in 1..np {
+        let mut runs: Vec<(usize, usize, u64)> = Vec::new();
+        let mut lo = 0usize;
+        while lo < ROWS {
+            let val = periodic[lo][s].as_int();
+            let mut hi = lo + 1;
+            while hi < ROWS && periodic[hi][s].as_int() == val {
+                hi += 1;
+            }
+            runs.push((lo, hi, val));
+            lo = hi;
+        }
+        let body = runs
+            .iter()
+            .map(|(a, b, v)| format!("({a}, {b}, {v})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        extracted_per_runs_defs.push_str(&format!(
+            "def extractedPerRuns{s} : List (Nat × Nat × Int) := [{body}]\n"
+        ));
+    }
+
+    let make_probe = |base: u32, vb: i64, d0: bool, d1: bool| -> spend::SpendPublic {
+        let mk = |off: u32| -> [u32; 8] {
+            let mut out = [0u32; 8];
+            for j in 0..8 {
+                out[j] = base + off * 16 + (j as u32) + 1;
+            }
+            out
+        };
+        spend::SpendPublic {
+            root: mk(1),
+            nf: [mk(2), mk(3)],
+            cm_out: [mk(4), mk(5)],
+            value_balance: vb,
+            dummy: [d0, d1],
+            bind: mk(6),
+        }
+    };
+    let extract_assertions_for = |d0: bool, d1: bool| -> String {
+        let p1 = make_probe(0x1100_0000, 0x1106_0001, d0, d1);
+        let p2 = make_probe(0x2200_0000, -0x2206_0001, d0, d1);
+        let c1 = spend::assertion_cells(&p1);
+        let c2 = spend::assertion_cells(&p2);
+        assert_eq!(c1.len(), c2.len(), "assertion count differed across probes");
+        let vb1 = Felt::new(p1.value_balance as u64);
+        let vb2 = Felt::ZERO - Felt::new(p2.value_balance.unsigned_abs());
+        let mut items = Vec::with_capacity(c1.len());
+        for (&(col1, row1, val1), &(col2, row2, val2)) in c1.iter().zip(c2.iter()) {
+            assert_eq!((col1, row1), (col2, row2), "assertion coordinates differed across probes");
+            let expr = if val1 == Felt::ZERO && val2 == Felt::ZERO {
+                "AssertExpr.zero".to_string()
+            } else if val1 == vb1 && val2 == vb2 {
+                "AssertExpr.valueBalance".to_string()
+            } else {
+                let mut found: Option<String> = None;
+                for j in 0..8 {
+                    if val1 == Felt::new(p1.root[j] as u64) && val2 == Felt::new(p2.root[j] as u64) {
+                        found = Some(format!("AssertExpr.root ⟨{j}, by decide⟩"));
+                    } else if val1 == Felt::new(p1.nf[0][j] as u64) && val2 == Felt::new(p2.nf[0][j] as u64) {
+                        found = Some(format!("AssertExpr.nf0 ⟨{j}, by decide⟩"));
+                    } else if val1 == Felt::new(p1.nf[1][j] as u64) && val2 == Felt::new(p2.nf[1][j] as u64) {
+                        found = Some(format!("AssertExpr.nf1 ⟨{j}, by decide⟩"));
+                    } else if val1 == Felt::new(p1.cm_out[0][j] as u64) && val2 == Felt::new(p2.cm_out[0][j] as u64) {
+                        found = Some(format!("AssertExpr.cmOut0 ⟨{j}, by decide⟩"));
+                    } else if val1 == Felt::new(p1.cm_out[1][j] as u64) && val2 == Felt::new(p2.cm_out[1][j] as u64) {
+                        found = Some(format!("AssertExpr.cmOut1 ⟨{j}, by decide⟩"));
+                    }
+                }
+                found.unwrap_or_else(|| panic!("unrecognized assertion cell ({col1}, {row1})"))
+            };
+            items.push(format!("({col1}, {row1}, {expr})"));
+        }
+        format!("[\n  {}\n]", items.join(",\n  "))
+    };
+    let extracted_assert_ff = extract_assertions_for(false, false);
+    let extracted_assert_ft = extract_assertions_for(false, true);
+    let extracted_assert_tf = extract_assertions_for(true, false);
+    let extracted_assert_tt = extract_assertions_for(true, true);
+
     // Also emit per-constraint equality proofs grouped cleanly so Lean's pure kernel checks
     // EVERY SINGLE ONE of the 249 constraints (`#0..#248`) with ZERO `native_decide` and ZERO `sorry`!
     let mut con_proofs = String::new();
@@ -8141,6 +8239,421 @@ theorem raw_rust_air_non_vacuous :
     ∃ T : RawFieldTrace, RawAirTransitionsHold T ∧ RawBoundaryAssertions concretePi T :=
   ⟨canonicalRawTrace concretePi concreteWitness, valid_witness_satisfies_raw_air concretePi concreteWitness⟩
 
+-- ============================================================================
+-- SECTION 10: KERNEL-CHECKED EQUIVALENCE AGAINST LIVE RUST EXTRACTED PERIODIC
+-- TABLE (ALL 8,192 × 14 = 114,688 CELLS) & ALL 4-MODE BOUNDARY ASSERTION LISTS
+-- ============================================================================
+
+def extractedPerK : Array Int := {ext_per_k}
+
+{ext_per_runs}
+def extractedPerRuns : Nat → List (Nat × Nat × Int)
+  | 1  => extractedPerRuns1
+  | 2  => extractedPerRuns2
+  | 3  => extractedPerRuns3
+  | 4  => extractedPerRuns4
+  | 5  => extractedPerRuns5
+  | 6  => extractedPerRuns6
+  | 7  => extractedPerRuns7
+  | 8  => extractedPerRuns8
+  | 9  => extractedPerRuns9
+  | 10 => extractedPerRuns10
+  | 11 => extractedPerRuns11
+  | 12 => extractedPerRuns12
+  | 13 => extractedPerRuns13
+  | _  => []
+
+def lookupRuns : List (Nat × Nat × Int) → Nat → Int
+  | [], _ => 0
+  | (lo, hi, v) :: rest, r => if lo ≤ r ∧ r < hi then v else lookupRuns rest r
+
+/-- Live Rust-extracted periodic table value at `(row r, selector s)`. -/
+def extractedPeriodicVal (r s : Nat) : Int :=
+  if s = 0 then extractedPerK[r % 64]!
+  else lookupRuns (extractedPerRuns s) r
+
+def repT (t : Nat) : Nat :=
+  if t < 8 then 0 else if t = 8 then 8 else if t < 63 then 9 else 63
+
+theorem periodicVal_eq_repT (b t s : Nat) (ht : t < 64) (hs1 : 1 ≤ s) (hs14 : s < 14) :
+    periodicVal (b * 64 + t) s = periodicVal (b * 64 + repT t) s := by
+  have hdiv : (b * 64 + t) / 64 = b := by omega
+  have hmod : (b * 64 + t) % 64 = t := by omega
+  have hrepLt : repT t < 64 := by unfold repT; split; omega; split; omega; split <;> omega
+  have hdiv' : (b * 64 + repT t) / 64 = b := by omega
+  have hmod' : (b * 64 + repT t) % 64 = repT t := by omega
+  have ht63 : (t < 63) ↔ (repT t < 63) := by unfold repT; split; omega; split; omega; split <;> omega
+  have ht63e : (t = 63) ↔ (repT t = 63) := by unfold repT; split; omega; split; omega; split <;> omega
+  have ht8 : (t = 8) ↔ (repT t = 8) := by unfold repT; split; omega; split; omega; split <;> omega
+  have hact : (64 ≤ b * 64 + t ∧ b * 64 + t < 4671) ↔ (64 ≤ b * 64 + repT t ∧ b * 64 + repT t < 4671) := by
+    unfold repT; split; omega; split; omega; split <;> omega
+  have hsCases : s = 1 ∨ s = 2 ∨ s = 3 ∨ s = 4 ∨ s = 5 ∨ s = 6 ∨ s = 7 ∨
+                 s = 8 ∨ s = 9 ∨ s = 10 ∨ s = 11 ∨ s = 12 ∨ s = 13 := by omega
+  rcases hsCases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    simp [periodicVal, hdiv, hmod, hdiv', hmod', ht63, ht63e, ht8, hact]
+
+def checkSeg (s lo hi : Nat) (v : Int) (segLo segHi rep : Nat) : Bool :=
+  if max lo segLo < min hi segHi then periodicVal rep s == v else true
+
+def checkBlk (s lo hi : Nat) (v : Int) (blk : Nat) : Bool :=
+  let base := blk * 64
+  checkSeg s lo hi v base (base + 8) base &&
+  checkSeg s lo hi v (base + 8) (base + 9) (base + 8) &&
+  checkSeg s lo hi v (base + 9) (base + 63) (base + 9) &&
+  checkSeg s lo hi v (base + 63) (base + 64) (base + 63)
+
+def checkRun (s lo hi : Nat) (v : Int) : Bool :=
+  decide (lo < hi) && decide (hi ≤ 8192) &&
+  (List.range ((hi - 1) / 64 - lo / 64 + 1)).all (fun d => checkBlk s lo hi v (lo / 64 + d))
+
+def checkRunsCover (s cur : Nat) : List (Nat × Nat × Int) → Bool
+  | [] => cur == 8192
+  | (lo, hi, v) :: rest =>
+      (lo == cur) && checkRun s lo hi v && checkRunsCover s hi rest
+
+theorem checkSeg_sound {{s lo hi segLo segHi rep : Nat}} {{v : Int}}
+    (hc : checkSeg s lo hi v segLo segHi rep = true)
+    (h1 : max lo segLo < min hi segHi) : periodicVal rep s = v := by
+  unfold checkSeg at hc
+  simp only [h1, ↓reduceIte] at hc
+  exact beq_iff_eq.mp hc
+
+theorem checkBlk_sound {{s lo hi blk r : Nat}} {{v : Int}}
+    (hs1 : 1 ≤ s) (hs14 : s < 14)
+    (hc : checkBlk s lo hi v blk = true)
+    (hlo : lo ≤ r) (hhi : r < hi) (hblk : r / 64 = blk) :
+    periodicVal r s = v := by
+  unfold checkBlk at hc
+  simp only [Bool.and_eq_true] at hc
+  rcases hc with ⟨⟨⟨h0, h8⟩, h9⟩, h63⟩
+  let t := r % 64
+  have ht : t < 64 := Nat.mod_lt r (by decide)
+  have hr : r = blk * 64 + t := by omega
+  rw [hr, periodicVal_eq_repT blk t s ht hs1 hs14]
+  by_cases ht8l : t < 8
+  · have hrep : repT t = 0 := by unfold repT; simp [ht8l]
+    rw [hrep, Nat.add_zero]
+    exact checkSeg_sound h0 (by omega)
+  · by_cases ht8e : t = 8
+    · have hrep : repT t = 8 := by unfold repT; simp [ht8e]
+      rw [hrep]
+      exact checkSeg_sound h8 (by omega)
+    · by_cases ht63l : t < 63
+      · have hrep : repT t = 9 := by unfold repT; simp [ht8l, ht8e, ht63l]
+        rw [hrep]
+        exact checkSeg_sound h9 (by omega)
+      · have hrep : repT t = 63 := by unfold repT; simp [ht8l, ht8e, ht63l]
+        rw [hrep]
+        exact checkSeg_sound h63 (by omega)
+
+theorem checkRun_sound {{s lo hi r : Nat}} {{v : Int}}
+    (hs1 : 1 ≤ s) (hs14 : s < 14)
+    (hc : checkRun s lo hi v = true)
+    (hlo : lo ≤ r) (hhi : r < hi) :
+    periodicVal r s = v := by
+  unfold checkRun at hc
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at hc
+  rcases hc with ⟨⟨hlt, hle⟩, hall⟩
+  have hd : r / 64 - lo / 64 < (hi - 1) / 64 - lo / 64 + 1 := by omega
+  have hblk := List.all_eq_true.mp hall (r / 64 - lo / 64) (List.mem_range.mpr hd)
+  have hadd : lo / 64 + (r / 64 - lo / 64) = r / 64 := by omega
+  rw [hadd] at hblk
+  exact checkBlk_sound hs1 hs14 hblk hlo hhi rfl
+
+theorem checkRunsCover_sound {{s : Nat}} (hs1 : 1 ≤ s) (hs14 : s < 14) :
+    ∀ (cur : Nat) (runs : List (Nat × Nat × Int)),
+      checkRunsCover s cur runs = true →
+      ∀ r, cur ≤ r → r < 8192 → lookupRuns runs r = periodicVal r s
+  | cur, [], hc, r, hcur, hr => by
+      simp only [checkRunsCover, beq_iff_eq] at hc
+      omega
+  | cur, (lo, hi, v) :: rest, hc, r, hcur, hr => by
+      simp only [checkRunsCover, Bool.and_eq_true, beq_iff_eq] at hc
+      rcases hc with ⟨⟨rfl, hrun⟩, hrest⟩
+      by_cases hlt : r < hi
+      · simp only [lookupRuns, hcur, hlt, and_self, ↓reduceIte]
+        exact (checkRun_sound hs1 hs14 hrun hcur hlt).symm
+      · have hge : hi ≤ r := by omega
+        simp only [lookupRuns, hlt, and_false, ↓reduceIte]
+        exact checkRunsCover_sound hs1 hs14 hi rest hrest r hge hr
+
+theorem extracted_perK_valid :
+    (List.range 64).all (fun t => extractedPerK[t]! == ((K[(t + 1) % 64]!).toNat : Int)) = true := by decide
+theorem extracted_runs_valid_1  : checkRunsCover 1  0 extractedPerRuns1  = true := by decide
+theorem extracted_runs_valid_2  : checkRunsCover 2  0 extractedPerRuns2  = true := by decide
+theorem extracted_runs_valid_3  : checkRunsCover 3  0 extractedPerRuns3  = true := by decide
+theorem extracted_runs_valid_4  : checkRunsCover 4  0 extractedPerRuns4  = true := by decide
+theorem extracted_runs_valid_5  : checkRunsCover 5  0 extractedPerRuns5  = true := by decide
+theorem extracted_runs_valid_6  : checkRunsCover 6  0 extractedPerRuns6  = true := by decide
+theorem extracted_runs_valid_7  : checkRunsCover 7  0 extractedPerRuns7  = true := by decide
+theorem extracted_runs_valid_8  : checkRunsCover 8  0 extractedPerRuns8  = true := by decide
+theorem extracted_runs_valid_9  : checkRunsCover 9  0 extractedPerRuns9  = true := by decide
+theorem extracted_runs_valid_10 : checkRunsCover 10 0 extractedPerRuns10 = true := by decide
+theorem extracted_runs_valid_11 : checkRunsCover 11 0 extractedPerRuns11 = true := by decide
+theorem extracted_runs_valid_12 : checkRunsCover 12 0 extractedPerRuns12 = true := by decide
+theorem extracted_runs_valid_13 : checkRunsCover 13 0 extractedPerRuns13 = true := by decide
+
+/-- KERNEL-CHECKED PERIODIC TABLE EQUIVALENCE (ALL 8,192 × 14 = 114,688 CELLS):
+    `periodicVal r s` is proven equal inside Lean 4's kernel to the live Rust-extracted
+    `extractedPeriodicVal r s` from `spend::periodic_table()` at every single cell. -/
+theorem periodicVal_eq_extracted_all_114688 (r s : Nat) (hr : r < 8192) (hs : s < 14) :
+    periodicVal r s = extractedPeriodicVal r s := by
+  have hcases : s = 0 ∨ s = 1 ∨ s = 2 ∨ s = 3 ∨ s = 4 ∨ s = 5 ∨ s = 6 ∨
+                s = 7 ∨ s = 8 ∨ s = 9 ∨ s = 10 ∨ s = 11 ∨ s = 12 ∨ s = 13 := by omega
+  rcases hcases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · simp only [extractedPeriodicVal, ↓reduceIte, periodicVal]
+    have hm : r % 64 < 64 := Nat.mod_lt r (by decide)
+    exact (beq_iff_eq.mp (List.all_eq_true.mp extracted_perK_valid (r % 64) (List.mem_range.mpr hm))).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns1  extracted_runs_valid_1  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns2  extracted_runs_valid_2  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns3  extracted_runs_valid_3  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns4  extracted_runs_valid_4  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns5  extracted_runs_valid_5  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns6  extracted_runs_valid_6  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns7  extracted_runs_valid_7  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns8  extracted_runs_valid_8  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns9  extracted_runs_valid_9  r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns10 extracted_runs_valid_10 r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns11 extracted_runs_valid_11 r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns12 extracted_runs_valid_12 r (Nat.zero_le r) hr).symm
+  · exact (checkRunsCover_sound (by decide) (by decide) 0 extractedPerRuns13 extracted_runs_valid_13 r (Nat.zero_le r) hr).symm
+
+/-- Evaluation environment using the live Rust-extracted `extractedPeriodicVal`. -/
+def extractedRowEnv (T : RawFieldTrace) (r : Nat) (v : Nat) : Int :=
+  if v < W_COLS then T.cell r v
+  else if v < 2 * W_COLS then T.cell (r + 1) (v - W_COLS)
+  else extractedPeriodicVal r (v - 2 * W_COLS)
+
+/-- ALL 249 live Rust extracted transition polynomials vanish on every `(r, r+1)` using the
+    live Rust extracted periodic selector table `extractedPeriodicVal`. -/
+def ExtractedAirTransitionsHold (T : RawFieldTrace) : Prop :=
+  ∀ r, r < 8191 → ∀ i, i < 249 → evalPoly (extractedRowEnv T r) (rustCon i) % P = 0
+
+theorem evalMonomial_congr {{env1 env2 : Nat → Int}} :
+    ∀ (vs : List Nat), (∀ v ∈ vs, env1 v = env2 v) → evalMonomial env1 vs = evalMonomial env2 vs
+  | [], _ => rfl
+  | v :: vs, h => by
+      simp only [evalMonomial, h v (List.mem_cons_self ..),
+                 evalMonomial_congr vs (fun x hx => h x (List.mem_cons_of_mem _ hx))]
+
+theorem evalPoly_congr {{env1 env2 : Nat → Int}} :
+    ∀ (p : Poly), (∀ m ∈ p, ∀ v ∈ m.1, env1 v = env2 v) → evalPoly env1 p = evalPoly env2 p
+  | [], _ => rfl
+  | (ms, c) :: tl, h => by
+      simp only [evalPoly,
+                 evalMonomial_congr ms (h (ms, c) (List.mem_cons_self ..)),
+                 evalPoly_congr tl (fun m hm => h m (List.mem_cons_of_mem _ hm))]
+
+theorem all_rustCon_vars_in_range :
+    (List.range 249).all (fun i =>
+      (rustCon i).all (fun m => m.1.all (fun v => decide (v < 2 * W_COLS + 14)))) = true := by decide
+
+theorem extracted_air_iff_raw_air (T : RawFieldTrace) :
+    ExtractedAirTransitionsHold T ↔ RawAirTransitionsHold T := by
+  have heq : ∀ r, r < 8191 → ∀ i, i < 249 →
+      evalPoly (extractedRowEnv T r) (rustCon i) = evalPoly (rowEnv T r) (rustCon i) := by
+    intro r hr i hi
+    apply evalPoly_congr
+    intro m hm v hv
+    have hvars := List.all_eq_true.mp all_rustCon_vars_in_range i (List.mem_range.mpr hi)
+    have hmon := List.all_eq_true.mp hvars m hm
+    have hvlt : v < 2 * W_COLS + 14 := of_decide_eq_true (List.all_eq_true.mp hmon v hv)
+    unfold extractedRowEnv rowEnv
+    split
+    · rfl
+    · split
+      · rfl
+      · exact (periodicVal_eq_extracted_all_114688 r (v - 2 * W_COLS) (by omega) (by omega)).symm
+  constructor
+  · intro h r hr i hi
+    rw [← heq r hr i hi]
+    exact h r hr i hi
+  · intro h r hr i hi
+    rw [heq r hr i hi]
+    exact h r hr i hi
+
+-- ---- Live Rust-Extracted 4-Mode Boundary Assertions ----
+
+inductive AssertExpr where
+  | zero
+  | root (j : Fin 8)
+  | nf0 (j : Fin 8)
+  | nf1 (j : Fin 8)
+  | cmOut0 (j : Fin 8)
+  | cmOut1 (j : Fin 8)
+  | valueBalance
+  deriving DecidableEq
+
+def evalAssertExpr (pi : SpendPublicStmt) : AssertExpr → Int
+  | .zero         => 0
+  | .root j       => ((pi.root j).toNat : Int)
+  | .nf0 j        => ((pi.nf0 j).toNat : Int)
+  | .nf1 j        => ((pi.nf1 j).toNat : Int)
+  | .cmOut0 j     => ((pi.cmOut0 j).toNat : Int)
+  | .cmOut1 j     => ((pi.cmOut1 j).toNat : Int)
+  | .valueBalance => signedField pi.valueBalance
+
+def extractedAssertionsFF : List (Nat × Nat × AssertExpr) := {ext_assert_ff}
+def extractedAssertionsFT : List (Nat × Nat × AssertExpr) := {ext_assert_ft}
+def extractedAssertionsTF : List (Nat × Nat × AssertExpr) := {ext_assert_tf}
+def extractedAssertionsTT : List (Nat × Nat × AssertExpr) := {ext_assert_tt}
+
+def extractedAssertions (d0 d1 : Bool) : List (Nat × Nat × AssertExpr) :=
+  match d0, d1 with
+  | false, false => extractedAssertionsFF
+  | false, true  => extractedAssertionsFT
+  | true,  false => extractedAssertionsTF
+  | true,  true  => extractedAssertionsTT
+
+/-- Live Rust-extracted boundary assertions from `spend::assertion_cells(&pi)` across all 4
+    `(dummy0, dummy1)` flag combinations. -/
+def ExtractedBoundaryAssertions (pi : SpendPublicStmt) (T : RawFieldTrace) : Prop :=
+  ∀ a ∈ extractedAssertions pi.dummy0 pi.dummy1, T.cell a.2.1 a.1 = evalAssertExpr pi a.2.2
+
+def isRawAssertCell (d0 d1 : Bool) : Nat × Nat × AssertExpr → Bool
+  | (c, r, .zero) =>
+      (c == COL_BAL && r == 64) ||
+      (c == COL_POS && r == 64) ||
+      (d0 && r == 2 * 64 && (c == COL_W + 9 || c == COL_W + 10)) ||
+      (d1 && r == 37 * 64 && (c == COL_W + 9 || c == COL_W + 10))
+  | (c, r, .root j) =>
+      (!d0 && c == COL_DIG + j.val && r == 34 * 64 + 63) ||
+      (!d1 && c == COL_DIG + j.val && r == 69 * 64 + 63)
+  | (c, r, .nf0 j) => c == COL_DIG + j.val && r == 35 * 64 + 63
+  | (c, r, .nf1 j) => c == COL_DIG + j.val && r == 70 * 64 + 63
+  | (c, r, .cmOut0 j) => c == COL_DIG + j.val && r == 71 * 64 + 63
+  | (c, r, .cmOut1 j) => c == COL_DIG + j.val && r == 72 * 64 + 63
+  | (c, r, .valueBalance) => c == COL_BAL && r == 72 * 64 + 63
+
+def fin8List : List (Fin 8) :=
+  [⟨0, by decide⟩, ⟨1, by decide⟩, ⟨2, by decide⟩, ⟨3, by decide⟩,
+   ⟨4, by decide⟩, ⟨5, by decide⟩, ⟨6, by decide⟩, ⟨7, by decide⟩]
+
+def rawRequiredCells (d0 d1 : Bool) : List (Nat × Nat × AssertExpr) :=
+  [(COL_BAL, 64, .zero), (COL_POS, 64, .zero)] ++
+  (if d0 then [(COL_W + 9, 2 * 64, .zero), (COL_W + 10, 2 * 64, .zero)]
+   else fin8List.map (fun j => (COL_DIG + j.val, 34 * 64 + 63, .root j))) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 35 * 64 + 63, .nf0 j)) ++
+  (if d1 then [(COL_W + 9, 37 * 64, .zero), (COL_W + 10, 37 * 64, .zero)]
+   else fin8List.map (fun j => (COL_DIG + j.val, 69 * 64 + 63, .root j))) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 70 * 64 + 63, .nf1 j)) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 71 * 64 + 63, .cmOut0 j)) ++
+  fin8List.map (fun j => (COL_DIG + j.val, 72 * 64 + 63, .cmOut1 j)) ++
+  [(COL_BAL, 72 * 64 + 63, .valueBalance)]
+
+theorem extracted_assertions_subset_raw :
+    ∀ d0 d1 : Bool, (extractedAssertions d0 d1).all (isRawAssertCell d0 d1) = true := by decide
+
+theorem raw_required_subset_extracted :
+    ∀ d0 d1 : Bool, (rawRequiredCells d0 d1).all (fun x => (extractedAssertions d0 d1).any (fun y => decide (y = x))) = true := by decide
+
+theorem mem_fin8List (j : Fin 8) : j ∈ fin8List := by
+  rcases j with ⟨k, hk⟩
+  match k, hk with
+  | 0, _ => simp [fin8List] | 1, _ => simp [fin8List] | 2, _ => simp [fin8List] | 3, _ => simp [fin8List]
+  | 4, _ => simp [fin8List] | 5, _ => simp [fin8List] | 6, _ => simp [fin8List] | 7, _ => simp [fin8List]
+
+theorem mem_of_rawRequired {{d0 d1 : Bool}} {{x : Nat × Nat × AssertExpr}}
+    (hx : x ∈ rawRequiredCells d0 d1) : x ∈ extractedAssertions d0 d1 := by
+  have h := List.all_eq_true.mp (raw_required_subset_extracted d0 d1) x hx
+  rcases List.any_eq_true.mp h with ⟨y, hyMem, hyEq⟩
+  rw [← of_decide_eq_true hyEq]
+  exact hyMem
+
+/-- KERNEL-CHECKED 4-MODE BOUNDARY ASSERTION EQUIVALENCE:
+    `ExtractedBoundaryAssertions pi T` (probed directly from live Rust `spend::assertion_cells`)
+    is proven logically equivalent inside Lean 4's kernel to `RawBoundaryAssertions pi T`
+    across ALL 4 `(dummy0, dummy1)` boolean combinations. -/
+theorem extracted_assertions_iff_raw_boundary (pi : SpendPublicStmt) (T : RawFieldTrace) :
+    ExtractedBoundaryAssertions pi T ↔ RawBoundaryAssertions pi T := by
+  constructor
+  · intro h
+    have get : ∀ x ∈ rawRequiredCells pi.dummy0 pi.dummy1, T.cell x.2.1 x.1 = evalAssertExpr pi x.2.2 :=
+      fun x hx => h x (mem_of_rawRequired hx)
+    refine {{
+      hBal0 := get (COL_BAL, 64, .zero) (by simp [rawRequiredCells])
+      hPos0 := get (COL_POS, 64, .zero) (by simp [rawRequiredCells])
+      hDummy0 := fun hd0 => ⟨
+        get (COL_W + 9, 2 * 64, .zero) (by simp [rawRequiredCells, hd0]),
+        get (COL_W + 10, 2 * 64, .zero) (by simp [rawRequiredCells, hd0])⟩
+      hRoot0 := fun hd0 j =>
+        get (COL_DIG + j.val, 34 * 64 + 63, .root j) (by simp [rawRequiredCells, hd0, mem_fin8List])
+      hNf0 := fun j =>
+        get (COL_DIG + j.val, 35 * 64 + 63, .nf0 j) (by simp [rawRequiredCells, mem_fin8List])
+      hDummy1 := fun hd1 => ⟨
+        get (COL_W + 9, 37 * 64, .zero) (by simp [rawRequiredCells, hd1]),
+        get (COL_W + 10, 37 * 64, .zero) (by simp [rawRequiredCells, hd1])⟩
+      hRoot1 := fun hd1 j =>
+        get (COL_DIG + j.val, 69 * 64 + 63, .root j) (by simp [rawRequiredCells, hd1, mem_fin8List])
+      hNf1 := fun j =>
+        get (COL_DIG + j.val, 70 * 64 + 63, .nf1 j) (by simp [rawRequiredCells, mem_fin8List])
+      hOut0 := fun j =>
+        get (COL_DIG + j.val, 71 * 64 + 63, .cmOut0 j) (by simp [rawRequiredCells, mem_fin8List])
+      hOut1 := fun j =>
+        get (COL_DIG + j.val, 72 * 64 + 63, .cmOut1 j) (by simp [rawRequiredCells, mem_fin8List])
+      hBalEnd := get (COL_BAL, 72 * 64 + 63, .valueBalance) (by simp [rawRequiredCells])
+    }}
+  · intro hB a ha
+    have hok := List.all_eq_true.mp (extracted_assertions_subset_raw pi.dummy0 pi.dummy1) a ha
+    rcases a with ⟨c, r, expr⟩
+    cases expr with
+    | zero =>
+        simp only [isRawAssertCell, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with (((⟨rfl, rfl⟩ | ⟨rfl, rfl⟩) | ⟨⟨hd0, rfl⟩, rfl | rfl⟩) | ⟨⟨hd1, rfl⟩, rfl | rfl⟩)
+        · exact hB.hBal0
+        · exact hB.hPos0
+        · exact (hB.hDummy0 hd0).1
+        · exact (hB.hDummy0 hd0).2
+        · exact (hB.hDummy1 hd1).1
+        · exact (hB.hDummy1 hd1).2
+    | root j =>
+        simp only [isRawAssertCell, Bool.or_eq_true, Bool.and_eq_true, Bool.not_eq_true', beq_iff_eq] at hok
+        rcases hok with ⟨⟨hd0, rfl⟩, rfl⟩ | ⟨⟨hd1, rfl⟩, rfl⟩
+        · exact hB.hRoot0 hd0 j
+        · exact hB.hRoot1 hd1 j
+    | nf0 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hNf0 j
+    | nf1 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hNf1 j
+    | cmOut0 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hOut0 j
+    | cmOut1 j =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hOut1 j
+    | valueBalance =>
+        simp only [isRawAssertCell, Bool.and_eq_true, beq_iff_eq] at hok
+        rcases hok with ⟨rfl, rfl⟩
+        exact hB.hBalEnd
+
+/-- TOP-LEVEL END-TO-END EXTRACTED RUST AIR ↔ SEMANTIC SPEND WITNESS EQUIVALENCE:
+    There exists a raw `8,192 × 247` Goldilocks trace satisfying ALL 249 live Rust extracted
+    transition polynomials (`rustCon`), the live Rust extracted 114,688-cell periodic selector
+    table (`extractedPeriodicVal`), AND all live Rust extracted boundary assertions
+    (`extractedAssertions`) IF AND ONLY IF there exists a valid semantic shielded-spend witness
+    `ValidSpendWitness pi`. -/
+theorem extracted_rust_air_iff_valid_spend_witness (pi : SpendPublicStmt) :
+    (∃ T : RawFieldTrace, ExtractedAirTransitionsHold T ∧ ExtractedBoundaryAssertions pi T) ↔
+      Nonempty (ValidSpendWitness pi) := by
+  constructor
+  · rintro ⟨T, hT, hB⟩
+    exact raw_rust_air_soundness pi T ((extracted_air_iff_raw_air T).mp hT)
+      ((extracted_assertions_iff_raw_boundary pi T).mp hB)
+  · rintro ⟨w⟩
+    rcases valid_witness_satisfies_raw_air pi w with ⟨hT, hB⟩
+    exact ⟨canonicalRawTrace pi w, (extracted_air_iff_raw_air _).mpr hT,
+      (extracted_assertions_iff_raw_boundary pi _).mpr hB⟩
+
+theorem extracted_rust_air_non_vacuous :
+    ∃ T : RawFieldTrace, ExtractedAirTransitionsHold T ∧ ExtractedBoundaryAssertions concretePi T :=
+  (extracted_rust_air_iff_valid_spend_witness concretePi).mpr ⟨concreteWitness⟩
+
 #print axioms fips180_4_sha256_empty_exact
 #print axioms fips180_4_sha256_abc_exact
 #print axioms xor3_poly_exact
@@ -8161,9 +8674,19 @@ theorem raw_rust_air_non_vacuous :
 #print axioms valid_witness_satisfies_raw_air
 #print axioms raw_rust_air_iff_valid_spend_witness
 #print axioms raw_rust_air_non_vacuous
+#print axioms periodicVal_eq_extracted_all_114688
+#print axioms extracted_assertions_iff_raw_boundary
+#print axioms extracted_rust_air_iff_valid_spend_witness
+#print axioms extracted_rust_air_non_vacuous
 
 end NewsatoshiFullCircuit
 "#,
+        ext_per_k = extracted_per_k_str,
+        ext_per_runs = extracted_per_runs_defs,
+        ext_assert_ff = extracted_assert_ff,
+        ext_assert_ft = extracted_assert_ft,
+        ext_assert_tf = extracted_assert_tf,
+        ext_assert_tt = extracted_assert_tt,
         c_root    = fmt_u32_arr(&concrete_pi.root),
         c_nf0     = fmt_u32_arr(&concrete_pi.nf[0]),
         c_nf1     = fmt_u32_arr(&concrete_pi.nf[1]),
