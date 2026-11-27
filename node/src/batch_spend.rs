@@ -47,7 +47,8 @@ pub const BLOCKS_PER_SPEND: usize = 73;
 pub const MAX_BATCH_PROOF_BYTES: usize = 1_250_000;
 
 /// Trace length (power of 2) for a batch of `k` spends (`2 <= k <= 16`).
-/// Guarantees >= 2,304 unconstrained random rows for zero-knowledge masking at every `k`.
+/// Guarantees >= 512 unconstrained random rows at the tightest size (`k = 7`: 8 `Kind::Rand` blocks)
+/// and >= 1,024 at `k = 14` (16 `Kind::Rand` blocks), exceeding the 152 FRI + OOD trace queries.
 pub fn batch_rows(k: usize) -> usize {
     assert!((MIN_BATCH_SPENDS..=MAX_BATCH_SPENDS).contains(&k));
     let min_blocks = k * BLOCKS_PER_SPEND + 1;
