@@ -1,9 +1,9 @@
-# Newsatoshi (`LOVE`) — Mainnet v2 (`nsM2` · `v1.2.1`)
+# Newsatoshi (`LOVE`) — Mainnet v2 (`nsM2` · `v1.2.2`)
 
 [![Mainnet v2](https://img.shields.io/badge/Mainnet%20v2-LIVE%20%C2%B7%20BTC%20%23977%2C738-10b981)](https://newsatoshi.org/)
 [![Zero Premine](https://img.shields.io/badge/Fair%20Launch-0%20LOVE%20Premine-f59e0b)](node/genesis-v2.json)
 [![Consensus Crypto](https://img.shields.io/badge/L1%20Coins-FIPS%20SHA--2%2F384%20STARKs%20%2B%20SLH--DSA-38bdf8)](docs/newsatoshi-v2.2.pdf)
-[![Lean 4](https://img.shields.io/badge/Lean%204.36-249%20AIR%20Identities%20%2B%2010%20Theorems-a855f7)](node/proof/SpendCircuitFull.lean)
+[![Lean 4](https://img.shields.io/badge/Lean%204.36-249%20AIR%20%2B%20Semantic%20Soundness-a855f7)](node/proof/SpendCircuitFull.lean)
 [![Bug Bounty](https://img.shields.io/badge/Security%20Bounty-Paid%20in%20Mined%20LOVE-ef4444)](docs/BUG_BOUNTY.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-zinc)](LICENSE)
 
@@ -28,7 +28,7 @@ Newsatoshi targets a specific, extreme point on the cryptographic design frontie
 
 ---
 
-## Live Mainnet v2 (`nsM2` · `v1.2.1`) — Join in 60 Seconds
+## Live Mainnet v2 (`nsM2` · `v1.2.2`) — Join in 60 Seconds
 
 - **Canonical Genesis Hash:** `00000000ba1cdad4aa8e82d6613b4df536394c41008fc3a0914a47a44604b9c8`
 - **Bitcoin Anchor:** Block `#977,738` (`0000000000000000000163900064a4cc4807dbd8bcaf35e322e694e6c387a780`) — [genesis-v2.json](node/genesis-v2.json)
