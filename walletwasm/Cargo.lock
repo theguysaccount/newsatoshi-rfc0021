@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "newsatoshi"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "hex",
  "imbl",
@@ -554,8 +554,6 @@ dependencies = [
 [[package]]
 name = "winter-math"
 version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7aecfb48ee6a8b4746392c8ff31e33e62df8528a3b5628c5af27b92b14aef1ea"
 dependencies = [
  "winter-utils",
 ]

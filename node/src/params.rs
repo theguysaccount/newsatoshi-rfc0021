@@ -101,7 +101,10 @@ pub fn subsidy(height: u32) -> u64 {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Net {
+    /// Legacy v0.1 pre-launch canary (`nsM0`, retired in favor of `MainV2`).
     Main,
+    /// Canonical `v1.2.0` Mainnet v2 (`nsM2`, Bitcoin-anchored fair launch, Quartic SHA-384 QROM >= 100b).
+    MainV2,
     Test,
     Reg,
     /// The rehearsal network: every rule of the main network on a chain that is thrown
@@ -178,8 +181,11 @@ pub const TESTNET_NF_TREE_FROM: u32 = 3_900;
 pub const TESTNET_GENESIS_MESSAGE: &str = include_str!("../GENESIS-TESTNET.txt");
 
 /// The v0.1 pre-launch canary genesis message (retired in favor of one canonical Mainnet v2
-/// Bitcoin-block-anchored fair-launch genesis via `newsatoshi genesis-v2`).
+/// Bitcoin-block-anchored fair-launch genesis).
 pub const MAINNET_GENESIS_MESSAGE: &str = include_str!("../GENESIS-MAINNET.txt");
+
+/// Canonical Mainnet v2 (`nsM2`) Bitcoin-block-anchored fair-launch genesis message.
+pub const MAINNET_V2_GENESIS_MESSAGE: &str = include_str!("../GENESIS-MAINNET-V2.txt");
 
 impl Params {
     pub fn get(net: Net) -> Result<Params, String> {
@@ -187,6 +193,14 @@ impl Params {
             Net::Main => match crate::params_genesis::MAIN {
                 Some((time, nonce)) if !MAINNET_GENESIS_MESSAGE.trim().is_empty() => Ok(Self::main_with(time, nonce)),
                 _ => Err("there is no main network yet: its genesis block is mined on the day it opens (LAUNCH.md, RUNBOOK.md)".into()),
+            },
+            Net::MainV2 => match crate::params_genesis::MAIN_V2 {
+                Some((time, nonce)) if !MAINNET_V2_GENESIS_MESSAGE.trim().is_empty() => {
+                    let mut p = Self::main_v2_with(time, nonce, 0x1d00_ffff);
+                    p.genesis_message = MAINNET_V2_GENESIS_MESSAGE.trim_end();
+                    Ok(p)
+                }
+                _ => Err("mainnet-v2 genesis not yet compiled in; pass --genesis-v2 FILE.json or run `newsatoshi genesis-v2`".into()),
             },
             Net::Test => Ok(Params {
                 net,
@@ -330,6 +344,7 @@ impl Params {
     ///   settlement (`batch_spend_from: Some(0)`, AuxPoW miners keep 100% of block subsidy!).
     pub fn main_v2_with(genesis_time: u32, genesis_nonce: u32, genesis_bits: u32) -> Params {
         Params {
+            net: Net::MainV2,
             name: "mainnet-v2",
             magic: *b"nsM2",
             default_port: 8_445,
@@ -347,7 +362,7 @@ impl Params {
             merkle_locks_conds_from: Some(0),
             legacy_jobs_enabled: false,
             pq_transport: true,
-            seeds: &["newsatoshi-seed.fly.dev:8445"],
+            seeds: &["newsatoshi-seed-v2.fly.dev:8445", "pool.newsatoshi.org:8445"],
             ..Self::main_with(genesis_time, genesis_nonce)
         }
     }
@@ -370,6 +385,7 @@ impl Params {
     pub fn parse(s: &str) -> Result<Net, String> {
         match s {
             "main" | "mainnet" => Ok(Net::Main),
+            "main-v2" | "mainnet-v2" => Ok(Net::MainV2),
             "test" | "testnet" => Ok(Net::Test),
             "reg" | "regtest" => Ok(Net::Reg),
             "dry" | "rehearsal" => Ok(Net::Dry),

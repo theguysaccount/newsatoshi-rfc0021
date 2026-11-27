@@ -15,6 +15,13 @@ pub const MAX_SIGNAL_BIT: u8 = 7;
 /// Mask of all 7 AuxPoW-safe signaling bits (`0b1111_1110 = 0xfe`).
 pub const SIGNAL_BITS_MASK: u32 = 0xfe;
 
+/// Reserved AuxPoW-safe BIP-9 soft-fork bit for a future compact pure-SHA-2 spend proof format
+/// (e.g., WHIR / Binius proximity testing shrinking single-spend proofs 2–4× without changing Genesis).
+pub const BIT_FUTURE_COMPACT_PROOF: u8 = 5;
+/// Reserved AuxPoW-safe BIP-9 soft-fork bit for future zero-witness-visibility recursive
+/// STARK-in-STARK spend-proof aggregation (folding independent user spends without sharing witnesses).
+pub const BIT_FUTURE_RECURSIVE_AGG: u8 = 6;
+
 /// Lifecycle state of a BIP-9 style collective deployment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalState {

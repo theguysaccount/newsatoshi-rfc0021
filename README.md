@@ -1,14 +1,14 @@
-# newsatoshi (`v1.2.0-mainnet-rc1`)
+# newsatoshi (`v1.2.0`)
 
 **Private, quantum-proof electronic cash secured by Bitcoin merge-mining — built strictly on SHA-2.**
 
 Newsatoshi (`LOVE`) is designed as an **unfreezable, private settlement floor** for humans and autonomous AI agents. Stablecoins like USDC are freezable and 100% public (leaking every agent's suppliers, margins, and treasury on-chain); Bitcoin is unfreezable and credibly neutral, but transparent and not post-quantum. Newsatoshi combines **default shielded privacy**, **pure SHA-2 cryptography** (zero elliptic curves, zero trusted setup, zero novel ZK-hashes), **>= 100-bit conservative QROM quantum FRI soundness**, **full 249-constraint Lean 4 spend-circuit mechanization**, and **Bitcoin SHA-256 merge-mining (`AuxPoW`, `chainid = 20051`)**.
 
-> **Honest Pre-Launch Status (`v1.2.0-mainnet-rc1`):**
-> - **Pure-Code / Architectural Frontier:** Release Candidate 1 — all pre-mainnet consensus, cryptographic, economic, $O(N)$ DoS, Day-14 ASERT boundary, and P2P audit findings fixed and verified (including patching upstream Winterfell 0.13.1 `f64::BaseElement::double()` & `mul_small()` non-canonicalization bugs).
-> - **External Security Audits:** **`0 / 2` completed** (hard blocker before mainnet genesis; scope packet in [`docs/AUDIT_SCOPE_V2.md`](docs/AUDIT_SCOPE_V2.md)).
-> - **Independent Bitcoin AuxPoW Pools (`chainid = 20051`):** **`0 / 3` at Bitcoin-grade difficulty** (hard blocker before mainnet genesis).
-> - **One Canonical Genesis:** The Nov 10 `v0.1.0` chain is retired as a pre-launch rehearsal/canary network. Production Mainnet will launch **once** via a single fresh Bitcoin-block-anchored `newsatoshi genesis-v2` ceremony (zero premine, Day-1 ASERT anti-instamine ramp) only after both external audits and >= 3 independent pools are verified. Live status: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
+> **Live Mainnet v2 (`nsM2`, `v1.2.0`) Genesis & Honest Status:**
+> - **Canonical Mainnet v2 Genesis Hash:** `00000000ba1cdad4aa8e82d6613b4df536394c41008fc3a0914a47a44604b9c8` (zero premine, `0x1d00ffff`, time `1795742750`, nonce `2649823154`, anchored to live Bitcoin block `#977,738` `0000000000000000000163900064a4cc4807dbd8bcaf35e322e694e6c387a780` — ceremony receipt in [`node/genesis-v2.json`](node/genesis-v2.json)).
+> - **Live Seed & Pool:** `newsatoshi --net mainnet-v2 node` (`newsatoshi-seed-v2.fly.dev:8445`, status `https://newsatoshi-seed-v2.fly.dev/status`, zero-fee AuxPoW solo pool `stratum+tcp://pool.newsatoshi.org:3333`).
+> - **Honest Risk Disclosure:** External security audits remain **`0 / 2`** (scope packet in [`docs/AUDIT_SCOPE_V2.md`](docs/AUDIT_SCOPE_V2.md)) and independent external Bitcoin AuxPoW pools are **`0 / 3`** at Bitcoin-grade difficulty — hold only what you can afford to lose until independent audits and pools join. Live status: `GET https://commons.newsatoshi.org/api/v2/cutover-readiness`.
+> - **Future Soft-Fork Roadmap (No Genesis Restart):** AuxPoW-safe BIP-9 bits `5` (`BIT_FUTURE_COMPACT_PROOF`: WHIR/Binius compact pure-SHA-2 spend proofs) and `6` (`BIT_FUTURE_RECURSIVE_AGG`: zero-witness-visibility recursive STARK-in-STARK spend aggregation) are reserved cleanly in `node/src/signal.rs`.
 
 ---
 
@@ -19,11 +19,11 @@ Base layers become Schelling points by staying **radically small, neutral, and o
 | Layer | Repository / Ecosystem | What Lives Here | Explicitly Excluded |
 | :--- | :--- | :--- | :--- |
 | **Layer 2 & Applications** *(Above the Waist)* | [`newsatoshi-commons`](https://github.com/theguysaccount/newsatoshi-commons), `x402`, `ERC-8004`, agent escrow protocols (e.g. Psilo), liquidity bridges | 30-tool MCP gateway, Web4 charters, mission launchpads, zkTLS P2P market-maker desks, multi-chain BTC/Lightning/Solana/Base HTLC bridges, `x402` USDC on-ramps, opt-in agent arbitration/juries | Never requires L1 hard forks to iterate |
-| **Layer 1 Settlement Floor** *(The Narrow Waist — This Repo)* | [`newsatoshi-rfc0021`](https://github.com/theguysaccount/newsatoshi-rfc0021) (`v1.2.0-mainnet-rc1`) | Default shielded transfers (`BatchSpend` compression with incentive-compatible `prover_fee`, Quartic $\mathbb{F}_{p^4}$ SHA-384 STARKs at `100–104` conservative QROM bits), SLH-DSA, Bitcoin AuxPoW (`chainid = 20051`) + panic-free Day-14 ASERT ramp, FlyClient MMR light proofs, strictly $O(\log N)$ Merkleized state, 50% fee burn, SHA-256 HTLCs, PayWord channels, `NSPQ1`/`NSPQ2` PQ P2P, and one minimal `PriorLock` collateral primitive | **No** L1 bonding-curve launchpads, **no** L1 subjective juries, **no** L1 rollup vaults or toy VMs, **no** legacy matrix jobs on `nsM2` |
+| **Layer 1 Settlement Floor** *(The Narrow Waist — This Repo)* | [`newsatoshi-rfc0021`](https://github.com/theguysaccount/newsatoshi-rfc0021) (`v1.2.0`) | Default shielded transfers (`BatchSpend` compression with incentive-compatible `prover_fee`, Quartic $\mathbb{F}_{p^4}$ SHA-384 STARKs at `100–104` conservative QROM bits), SLH-DSA, Bitcoin AuxPoW (`chainid = 20051`) + panic-free Day-14 ASERT ramp, FlyClient MMR light proofs, strictly $O(\log N)$ Merkleized state, 50% fee burn, SHA-256 HTLCs, PayWord channels, `NSPQ1`/`NSPQ2` PQ P2P, and one minimal `PriorLock` collateral primitive | **No** L1 bonding-curve launchpads, **no** L1 subjective juries, **no** L1 rollup vaults or toy VMs, **no** legacy matrix jobs on `nsM2` |
 
 ---
 
-## What Is Inside the Narrow Waist (`v1.2.0-mainnet-rc1`)
+## What Is Inside the Narrow Waist (`v1.2.0`)
 
 Everything in L1 consensus rests solely on **FIPS 180-4 SHA-2 (`SHA-256` / `SHA-384`)** and **FIPS 205 (`SLH-DSA-SHA2-128s`)**.
 

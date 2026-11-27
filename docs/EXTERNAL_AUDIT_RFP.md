@@ -1,4 +1,4 @@
-# External Security Audit RFP — Newsatoshi `v1.2.0-mainnet-rc1`
+# External Security Audit RFP — Newsatoshi `v1.2.0`
 
 > **Purpose:** Ready-to-send engagement brief for **two independent external security audit firms** required to clear Gates 1 & 2 prior to running the single canonical Bitcoin-block-anchored Mainnet genesis (`GET https://commons.newsatoshi.org/api/v2/cutover-readiness`).
 
@@ -6,12 +6,12 @@
 
 ## 1. Executive Summary
 
-**Newsatoshi (`LOVE`) `v1.2.0-mainnet-rc1`** is a minimalist, fair-launch, Bitcoin merge-mined (`AuxPoW`, `chainid = 20051`) Layer-1 cryptocurrency with **zero elliptic curves in consensus**:
+**Newsatoshi (`LOVE`) `v1.2.0`** is a minimalist, fair-launch, Bitcoin merge-mined (`AuxPoW`, `chainid = 20051`) Layer-1 cryptocurrency with **zero elliptic curves in consensus**:
 - **Default Shielded Spend STARK (`spend.rs`) & Multi-Spend `BatchSpend` Compression (`batch_spend.rs`):** 249 Goldilocks AIR constraints over pure SHA-256 (all 249 constraints + 7 no-wrap lemmas kernel-verified in Lean 4 `proof/SpendCircuitFull.lean`, `0 sorry`), Haböck–Al Kindi (ePrint 2024/1037) masked quotient segments, 256-bit Quartic Goldilocks $\mathbb{F}_{p^4} = \mathbb{F}_p[x]/(x^4 - 7)$ + SHA-384 FRI on Mainnet v2 (`B=8, q=152, g=20`: `192` classical LDR bits, `128`-bit BHT QROM SHA-384, **`100–104` conservative CMS19 QROM bits**), and `K = 2..=16` multi-spend compression (`6.5×` at `K=8`) with incentive-compatible STARK-bound `prover_fee` (AuxPoW miners always keep 100% of block subsidy + `miner_fee`).
 - **Priorism-FEP Consensus Primitives (`prior.rs`, `params.rs`, `state.rs`):** Homeostatic 50% shielded base-fee burn + ONE unified falsifiable `PriorLock` primitive (SCGS I-3 `arbiter_vk != owner_vk`, objective preimage/equivocation OR independent `M-of-N` SLH-DSA disconfirmation with exact 50% surprise bounty + 50% permanent burn) + unilateral PayWord channels (`channel.rs`), with strictly $O(\log N)$ Merkleized `locks` & `conds` and legacy matrix jobs disabled on `nsM2`.
 - **Work-Proportional FlyClient MMR (`light.rs`) & PQ P2P (`pq_transport.rs`):** Work-offset FlyClient proofs bound to `DigestParts::header_mmr` (Genesis #0 on Mainnet v2), Day-14 ASERT steady-anchor continuity (`2,016 → 2,017`), opportunistic `NSPQ1` + SLH-DSA peer-pinned `NSPQ2` ML-KEM-768 P2P with 64 KB chunked anti-slowloris reads, `/16` & `/32` eclipse defense, Compact Blocks, Utreexo 1 KB frontier, and disk-backed KV pruning.
 
-**Target Audit Tag:** `theguysaccount/newsatoshi-rfc0021` tag **`v1.2.0-mainnet-rc1`**  
+**Target Audit Tag:** `theguysaccount/newsatoshi-rfc0021` tag **`v1.2.0`**  
 **Exact File Inventory & SHA-256 Fingerprints:** `docs/AUDIT_SCOPE_V2.md`
 
 ---
@@ -41,7 +41,7 @@
 ## 3. One-Command Pre-Audit Reproduction
 
 ```bash
-git clone --branch v1.2.0-mainnet-rc1 https://github.com/theguysaccount/newsatoshi-rfc0021.git
+git clone --branch v1.2.0 https://github.com/theguysaccount/newsatoshi-rfc0021.git
 cd newsatoshi-rfc0021/node
 cargo test --lib
 cargo test --release --test priorism_fep_core --test mainnet_v2_readiness --test audit_redteam \
@@ -58,5 +58,5 @@ node ../verifier-ts/newsatoshi_verifier.mjs --self-test
 
 ## 4. Deliverables & Launch Sign-Off Criteria
 
-- Publicly publishable PDF audit reports pinned to `v1.2.0-mainnet-rc1` (or remediation commit).
+- Publicly publishable PDF audit reports pinned to `v1.2.0` (or remediation commit).
 - **Zero unresolved Critical or High findings** before running the single canonical Bitcoin-block-anchored `newsatoshi genesis-v2` launch ceremony.

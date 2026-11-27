@@ -1051,7 +1051,7 @@ pub fn signaling_info(shared: &Shared) -> J {
     let n = lock(shared);
     let tip = n.chain.height();
     let (window, threshold) = match n.chain.params.net {
-        crate::params::Net::Main => (2_016, 1_815),
+        crate::params::Net::Main | crate::params::Net::MainV2 => (2_016, 1_815),
         crate::params::Net::Test => (144, 130),
         crate::params::Net::Reg | crate::params::Net::Dry => (10, 9),
     };

@@ -156,7 +156,7 @@ fn mainnet_v2_merkleizes_locks_and_conds_in_o_log_n_and_disables_legacy_jobs() {
     let mut params = Params::main_v2_with(1_762_473_600, u32::MAX, 0x207fffff);
     assert!(!params.legacy_jobs_enabled);
     assert_eq!(params.merkle_locks_conds_from, Some(0));
-    assert_eq!(params.seeds, &["newsatoshi-seed.fly.dev:8445"]);
+    assert_eq!(params.seeds, &["newsatoshi-seed-v2.fly.dev:8445", "pool.newsatoshi.org:8445"]);
     params.pow_limit = 0x207fffff;
     params.coinbase_maturity = 1;
 
@@ -346,4 +346,42 @@ fn nspq2_slh_dsa_pinned_auth_blocks_active_mitm_and_chunked_read_blocks_slowlori
     cli.write_all(&[0xaa; 10]).unwrap();
     drop(cli);
     assert!(srv.join().unwrap().is_err());
+}
+
+#[test]
+fn canonical_mainnet_v2_genesis_is_bitcoin_anchored_and_meets_difficulty_one() {
+    use newsatoshi::chain::genesis_block;
+    use newsatoshi::params::Net;
+    use newsatoshi::pow;
+    use newsatoshi::signal::{BIT_FUTURE_COMPACT_PROOF, BIT_FUTURE_RECURSIVE_AGG};
+    let p = Params::get(Net::MainV2).expect("canonical Mainnet v2 genesis compiled in");
+    assert_eq!(p.name, "mainnet-v2");
+    assert_eq!(p.magic, *b"nsM2");
+    assert_eq!(p.default_port, 8_445);
+    assert_eq!(p.seeds, &["newsatoshi-seed-v2.fly.dev:8445", "pool.newsatoshi.org:8445"]);
+    assert_eq!(p.launch_blocks, 2_016);
+    assert_eq!(p.mmr_from, Some(0));
+    assert_eq!(p.merkle_locks_conds_from, Some(0));
+    assert!(!p.legacy_jobs_enabled);
+    assert!(p.pq_transport);
+    assert!(p.proof.sha384);
+    assert_eq!(
+        p.genesis_message,
+        "NEWSATOSHI-V2 BTC#977738 0000000000000000000163900064a4cc4807dbd8bcaf35e322e694e6c387a780"
+    );
+    let g = genesis_block(&p);
+    assert_eq!(g.header.time, 1_795_742_750);
+    assert_eq!(g.header.nonce, 2_649_823_154);
+    assert_eq!(g.header.bits, 0x1d00_ffff);
+    assert!(pow::meets(&g.hash(), 0x1d00_ffff));
+    assert_eq!(
+        newsatoshi::tx::hash_hex(&g.hash()),
+        "00000000ba1cdad4aa8e82d6613b4df536394c41008fc3a0914a47a44604b9c8"
+    );
+    // Verify Chain::open succeeds cleanly on canonical Net::MainV2 with 0 premine!
+    let c = Chain::open(p, None).unwrap();
+    assert_eq!(c.height(), 0);
+    assert_eq!(c.state.issued, 0);
+    // Verify reserved future BIP-9 soft-fork bits do not collide with active deployments.
+    assert_eq!((BIT_FUTURE_COMPACT_PROOF, BIT_FUTURE_RECURSIVE_AGG), (5, 6));
 }

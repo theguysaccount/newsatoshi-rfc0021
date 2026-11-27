@@ -15,7 +15,7 @@ use std::time::Instant;
 
 const USAGE: &str = "newsatoshi — proof of work orders, proof of negentropy validates
 
-usage: newsatoshi [--net regtest|testnet|rehearsal|mainnet] [--genesis-v2 FILE.json] [--datadir DIR] <command>
+usage: newsatoshi [--net regtest|testnet|rehearsal|mainnet|mainnet-v2] [--genesis-v2 FILE.json] [--datadir DIR] <command>
 
   node [--port P] [--peer HOST:PORT[@SLH_DSA_VK]]... [--mine [--interval S] [--mine-duty PCT]]
                                                 run a full node, optionally mining (append @64HEX_VK to
@@ -114,7 +114,7 @@ fn opts() -> Result<Opts, String> {
             }
             "--genesis-v2" => {
                 genesis_v2 = Some(load_genesis_v2_params(&args[i + 1])?);
-                net = Net::Main;
+                net = Net::MainV2;
                 args.drain(i..i + 2);
             }
             _ => i += 1,
@@ -128,13 +128,13 @@ fn opts() -> Result<Opts, String> {
         match Params::get(net) {
             Ok(p) => p.name,
             Err(_)
-                if net == Net::Main
+                if (net == Net::Main || net == Net::MainV2)
                     && args
                         .first()
                         .map(|a| a == "genesis" || a == "genesis-v2")
                         .unwrap_or(false) =>
             {
-                "mainnet"
+                if net == Net::MainV2 { "mainnet-v2" } else { "mainnet" }
             }
             Err(e) => return Err(e),
         }
@@ -731,14 +731,13 @@ fn run() -> Result<(), String> {
             ));
             let mined_ms = if do_mine {
                 let t = Instant::now();
-                g.header.nonce = 0;
-                mine(&mut g.header, u64::MAX);
+                mine_genesis_parallel(&mut g.header);
                 Some(t.elapsed().as_millis())
             } else {
                 None
             };
             let json_out = format!(
-                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"release\": \"v1.2.0-mainnet-rc1\",\n  \"magic\": \"nsM2\",\n  \"default_port\": {},\n  \"p2p_transport\": \"NSPQ1+NSPQ2 (ML-KEM-768 + optional SLH-DSA-SHA2-128s pinning)\",\n  \"flyclient_mmr_from\": 0,\n  \"merkle_locks_conds_from\": 0,\n  \"legacy_jobs_enabled\": false,\n  \"prior_lock_from\": 0,\n  \"homeostatic_fee_burn_bps\": {},\n  \"batch_spend_from\": 0,\n  \"batch_spend_fee_model\": \"incentive_compatible_prover_fee_100pct_miner_subsidy\",\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_hash_profile\": \"MAIN_V2_QUARTIC_SHA384_152Q_B8_G20_QROM100\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
+                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"release\": \"v1.2.0\",\n  \"magic\": \"nsM2\",\n  \"default_port\": {},\n  \"p2p_transport\": \"NSPQ1+NSPQ2 (ML-KEM-768 + optional SLH-DSA-SHA2-128s pinning)\",\n  \"flyclient_mmr_from\": 0,\n  \"merkle_locks_conds_from\": 0,\n  \"legacy_jobs_enabled\": false,\n  \"prior_lock_from\": 0,\n  \"homeostatic_fee_burn_bps\": {},\n  \"batch_spend_from\": 0,\n  \"batch_spend_fee_model\": \"incentive_compatible_prover_fee_100pct_miner_subsidy\",\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_hash_profile\": \"MAIN_V2_QUARTIC_SHA384_152Q_B8_G20_QROM100\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
                 p.default_port,
                 newsatoshi::params::BASE_FEE_BURN_BPS,
                 p.launch_blocks,
@@ -766,6 +765,62 @@ fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Multi-threaded genesis PoW miner: partitions the 32-bit nonce space across all CPU cores
+/// (advancing `header.time` only if a full 2^32 nonce sweep finds no solution).
+fn mine_genesis_parallel(header: &mut newsatoshi::tx::Header) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
+    let target = newsatoshi::pow::target_from_compact(header.bits);
+    let mut base_time = header.time;
+    loop {
+        let found = AtomicBool::new(false);
+        let winner: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+        let base_hdr = *header;
+        std::thread::scope(|s| {
+            let chunk = ((u32::MAX as u64 + 1) / threads as u64).max(1);
+            for tid in 0..threads {
+                let start = (tid as u64 * chunk) as u32;
+                let end = if tid + 1 == threads {
+                    u32::MAX
+                } else {
+                    (((tid + 1) as u64 * chunk) - 1) as u32
+                };
+                let found_ref = &found;
+                let win_ref = &winner;
+                s.spawn(move || {
+                    let mut h = base_hdr;
+                    h.time = base_time;
+                    let mut n = start;
+                    loop {
+                        if (n & 0xFFFF) == 0 && found_ref.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        h.nonce = n;
+                        let digest = h.hash();
+                        if !target.is_zero() && newsatoshi::pow::hash_value(&digest) <= target {
+                            if !found_ref.swap(true, Ordering::SeqCst) {
+                                *win_ref.lock().unwrap() = Some((h.time, n));
+                            }
+                            return;
+                        }
+                        if n == end {
+                            return;
+                        }
+                        n += 1;
+                    }
+                });
+            }
+        });
+        if let Some((t, n)) = *winner.lock().unwrap() {
+            header.time = t;
+            header.nonce = n;
+            return;
+        }
+        base_time = base_time.wrapping_add(1);
+    }
 }
 
 fn demo() -> Result<(), String> {

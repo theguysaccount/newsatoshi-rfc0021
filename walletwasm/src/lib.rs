@@ -229,15 +229,11 @@ pub extern "C" fn light_root(p: *const u8, n: usize) -> i32 {
                 Some(J::Str(s)) => Some(hex32(s)?),
                 _ => None,
             },
-            bonds: match p.get("bonds") {
+            priors: match p.get("priors") {
                 Some(J::Str(s)) => Some(hex32(s)?),
                 _ => None,
             },
-            rollups: match p.get("rollups") {
-                Some(J::Str(s)) => Some(hex32(s)?),
-                _ => None,
-            },
-            missions: match p.get("missions") {
+            header_mmr: match p.get("header_mmr") {
                 Some(J::Str(s)) => Some(hex32(s)?),
                 _ => None,
             },
@@ -250,14 +246,11 @@ pub extern "C" fn light_root(p: *const u8, n: usize) -> i32 {
         if let Some(r) = parts.channels {
             out.push(("channels".into(), J::str(hex::encode(r))));
         }
-        if let Some(r) = parts.bonds {
-            out.push(("bonds".into(), J::str(hex::encode(r))));
+        if let Some(r) = parts.priors {
+            out.push(("priors".into(), J::str(hex::encode(r))));
         }
-        if let Some(r) = parts.rollups {
-            out.push(("rollups".into(), J::str(hex::encode(r))));
-        }
-        if let Some(r) = parts.missions {
-            out.push(("missions".into(), J::str(hex::encode(r))));
+        if let Some(r) = parts.header_mmr {
+            out.push(("header_mmr".into(), J::str(hex::encode(r))));
         }
         Ok(J::Obj(out).to_json())
     })())
@@ -483,6 +476,7 @@ pub extern "C" fn prove(p: *const u8, n: usize) -> i32 {
         let profile = match r.get("net").and_then(|x| x.as_str()) {
             None | Some("test") | Some("reg") => spend::TEST,
             Some("main") => spend::MAIN,
+            Some("main-v2") | Some("mainnet-v2") => spend::MAIN_V2,
             Some("dry") => spend::DRY,
             Some(other) => return Err(format!("unknown network {other}")),
         };
