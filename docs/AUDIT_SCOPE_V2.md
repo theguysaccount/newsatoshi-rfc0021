@@ -1,8 +1,8 @@
-# Newsatoshi `v1.2.0` External Security Audit Scope & Cutover Packet
+# Newsatoshi `v1.2.3` External Security Audit Scope & Cutover Packet
 
 This document is the authoritative, zero-hype engineering scope packet for the **two independent external security audits** required before running the single canonical Bitcoin-block-anchored Mainnet genesis (`newsatoshi genesis-v2`). For direct auditor engagement terms, see [`docs/EXTERNAL_AUDIT_RFP.md`](./EXTERNAL_AUDIT_RFP.md).
 
-> **Honest Pre-Cutover Status (`v1.2.0`):**
+> **Honest Pre-Cutover Status (`v1.2.3`):**
 > - **Pure-Code / Architectural Frontier:** All 6 pre-mainnet consensus, cryptographic, economic, DoS, and P2P hardening fixes landed and verified (including patching upstream Winterfell 0.13.1 `f64::BaseElement::double()` & `mul_small()` non-canonicalization bugs).
 > - **External Security Audits:** **`0 / 2` completed** (PENDING — hard launch blocker).
 > - **Independent Bitcoin AuxPoW Pools (`chainid = 20051`):** **`0 / 3` at real difficulty** (PENDING — hard launch blocker).
@@ -30,7 +30,7 @@ This document is the authoritative, zero-hype engineering scope packet for the *
 | **Utreexo Frontier, Disk KV & STARK-in-STARK IVC** | `node/src/utreexo.rs`, `pruned_store.rs`, `recursion.rs` | `2be67b6e95728683bf1ed79512a9b43a45e3245f502767f87ec75d9ce4482585` / `971155b93502f07378e7c0ff1e576757b64fd05727fe76efb9aee59133211433` / `1adffff2fbc551c26a74b108999f9dc17cf1fc7c2cecfe1a2f0fa2ac9499cdd0` | `<= 1,024 B` RAM frontier equivalence, WAL/SSTable crash recovery + `newsatoshi prune` CLI, `HeaderChainAir` with in-circuit `HP_POW_CHK` PoW verification + real `StarkInStarkVerifierAir` (`254×16,384`, `204` SHA-256 comps + `10` Quartic FRI folds, `103` QROM bits; CPU proof checks first coin-derived query — full 152-query scaling requires multi-core/GPU prover) |
 | **Independent Second Verifier** | `verifier-ts/newsatoshi_verifier.mjs` | `a27318b1810fd7606f4ffad7f3abcf9c6f8aa80214a9f0b874ae26453063af85` | Zero-dependency Node.js/OpenSSL/BigInt second consensus implementation (incl. staged `asertBitsStaged` across height `2,016 → 2,017`) verified differentially against Rust L1 |
 | **Lean 4.36.0 Accounting Proof** | `node/proof/SpendBalance.lean` | `4159a415e914b51d32703279e80ae51035c6acb26c59c063dae000c7b27f34af` | 10 machine-checked balance/solvency/conservation theorems including Theorem 8 `batch_spend_prover_fee_conservation` (`burned + prover_fee + miner_fee = total_fee`, `sub + miner_fee >= sub`; `0 sorry`, `0 native_decide`, `0 Mathlib`) |
-| **Lean 4.36.0 Full 249-Constraint Spend AIR Proof** | `node/proof/SpendCircuitFull.lean` | `3b1e1fb5c994a927abc9c63ede38c9f67841d64557a092741d87313fbd80814a` | Pure-kernel (`0 sorry`, `0 native_decide`, `0 Mathlib`) equality of ALL **249 live Rust spend constraints (`#0..#248`, `2,950` terms)** to independent NIST FIPS 180-4 SHA-256 spec + all 7 Goldilocks no-wrap / unreduced-word lemmas (replacing Z3) + 64-round & 32-level Merkle inductions |
+| **Lean 4.36.0 Full 249-Constraint Spend AIR Proof** | `node/proof/SpendCircuitFull.lean` | `0d33809e4cc15413b215beca6253b906e81c17834e77525053676a99c6dd74e1` | Pure-kernel (`8,343` lines, `0 sorry`, `0 warnings`, `0 native_decide`, `0 Mathlib`, standard core axioms only): equality of ALL **249 live Rust spend constraints (`#0..#248`, `2,950` terms)** to independent NIST FIPS 180-4 SHA-256 spec + Pocklington Goldilocks primality (`goldilocks_is_prime`) + full raw `8,192 × 247` AIR ↔ `ValidSpendWitness` soundness, completeness (`raw_rust_air_iff_valid_spend_witness`), and live Rust-verified concrete 2-in/2-out non-vacuity (`raw_rust_air_non_vacuous`) |
 
 ---
 

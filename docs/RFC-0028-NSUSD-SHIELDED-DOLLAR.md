@@ -1,8 +1,8 @@
 # RFC-0028: `nsUSD` — Private, Post-Quantum Dollar Settlement on Newsatoshi
 
-**Status:** Canonical Specification (Tier 1 Live on L2 Commons · Tier 2 BIP-9 Soft-Fork Ready)  
-**Network:** Newsatoshi Mainnet v2 (`nsM2`, `v1.2.1`, Bitcoin Anchor `#977,738`)  
-**Genesis Restart Required:** **NO** (Zero changes to Genesis `#0`; L1 multi-asset notes activate cleanly via future BIP-9 soft fork)
+**Status:** Canonical Specification (Tier 1 & Integer Solvency Engine Live on L2 Commons `v0.28.2` · Zero L1 Fork Required)  
+**Network:** Newsatoshi Mainnet v2 (`nsM2`, `v1.2.3`, Bitcoin Anchor `#977,738`)  
+**Genesis Restart Required:** **NO** (Zero changes to Genesis `#0`; `nsUSD` runs cleanly above ossified L1 via L2 Commons & STARK Rollup)
 
 ---
 
@@ -22,7 +22,7 @@ Real businesses, SaaS APIs, and autonomous AI agents paying `$0.0002` per infere
 
 1. **No Algorithmic / Undercollateralized `LOVE` Mint-Burn Pegs:** Minting USD against thin early `LOVE` liquidity risks an irreversible death spiral. Sovereign `nsUSD` MUST remain strictly over-collateralized by deep, liquid, verifiable collateral (`BTC` first, `LOVE` second at higher collateral ratios once liquid).
 2. **Strict Separation of Risk Tiers (`asset_id` Isolation):** Any 1:1 bridged ERC-20 dollar (`nsUSD-B`) MUST carry a distinct asset identifier and explicit risk disclosure from sovereign unfreezable BTC-backed `nsUSD`. The protocol never conflates custodial bridge reserves with unfreezable sovereign collateral.
-3. **Zero L1 Bloat:** Vault accounting, oracle aggregation, liquidation auctions, and merchant invoicing execute cleanly above the waist (Layer 2 / Commons / Rollup), while Layer 1 only ever needs one tiny future soft-fork (`BIT_MULTI_ASSET_NOTES`) to tag shielded notes with a 32-bit `asset_id`.
+3. **Zero L1 Bloat:** Vault accounting, oracle aggregation, liquidation auctions, and merchant invoicing execute cleanly above the waist (Layer 2 / Commons / STARK Rollup) with zero Layer-1 consensus fork required, preserving `node/src/signal.rs` bit `7` strictly for `ossify_monetary_base`.
 
 ---
 
@@ -51,7 +51,7 @@ Sovereign `nsUSD` is an unfreezable, post-quantum shielded dollar backed by over
 | **Price Oracle** | **`PriorLock` Bonded Median Oracle (RFC-0021)** | Oracle reporters stake `LOVE` inside L1 `PriorLock` commitments behind signed BTC/USD median quotes. Falsifiable manipulation triggers automatic `50%` challenger bounty + `50%` permanent `LOVE` burn. |
 | **Hard Peg Floor** | **Liquity-Style Direct Collateral Redemption** | Any holder of `1 nsUSD` can always redeem it for `$1.00` worth of BTC collateral (minus a dynamic base redemption fee), enforcing `nsUSD ≈ $1.00` via permissionless arbitrage. |
 | **Liquidation Engine** | **Stability Pool + Permissionless Keepers** | Vaults dropping below `120%` CR are absorbed atomically by Stability Pool depositors who receive discounted BTC collateral. |
-| **L1 Shielded Notes** | **Future BIP-9 Soft-Fork (`BIT_MULTI_ASSET_NOTES = 7`)** | Extends the 249-constraint Winterfell SHA-384 Spend AIR commitment with a 32-bit `asset_id` (`0 = LOVE`, `1 = nsUSD`) and per-asset value conservation — letting `LOVE` and `nsUSD` share the **exact same shielded anonymity set** on Layer 1 with zero Genesis restart. |
+| **Shielded Notes & Settlement** | **Layer-2 STARK Rollup + Unilateral Escape Hatch (`v0.28.2`, Zero L1 Fork)** | Runs `nsUSD` (`asset_id = 1`) and `nsUSD-B` (`asset_id = 2`) natively above ossified L1 (`BIT_OSSIFY_MONETARY_BASE = 7` untouched) with Winterfell STARK rollup batching, Merkle escape-hatch exit proofs, and a 13-theorem Lean 4 solvency proof (`formal/NsUsdAndL2Perfection.lean`). Any optional future L1 multi-asset shielded note extension would use an unallocated post-compact-proof soft-fork mechanism rather than bit `7`. |
 
 ---
 

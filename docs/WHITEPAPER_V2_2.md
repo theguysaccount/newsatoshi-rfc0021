@@ -1,6 +1,6 @@
 # NEWSATOSHI/2.2: Pure SHA-2 Shielded Machine Cash
 
-**Mainnet v2 (`nsM2`, `v1.2.1`) — Post-Quantum Privacy, Bitcoin Merged Mining, Lean 4 Mechanized Validity, and Priorism–FEP Settlement**
+**Mainnet v2 (`nsM2`, `v1.2.3`) — Post-Quantum Privacy, Bitcoin Merged Mining, Lean 4 Mechanized Validity, and Priorism–FEP Settlement**
 
 *Newsatoshi Contributors · November 27, 2026 · Canonical Genesis anchored to Bitcoin Block `#977,738`*  
 *Live Terminal: https://newsatoshi.org/ · Commons & Telemetry: https://commons.newsatoshi.org/ · Reference L1: https://github.com/theguysaccount/newsatoshi-rfc0021*
@@ -15,7 +15,7 @@ The emerging economy of autonomous AI agents—software entities negotiating com
 
 All `249` active constraints of the live Rust shielded-spend AIR and `10` core conservation/solvency theorems are mechanized in zero-dependency **Lean 4** (`0 sorry`, `0 Mathlib`, `0 native_decide`). Above the narrow L1 monetary floor, `nsM2` provides four native primitives for machine commerce and epistemic alignment: (1) `BatchSpend` proof compression (`K = 2..=16`, `6.5×` byte reduction at `K = 8` with incentive-compatible miner subsidy), (2) seller-signed `RFC-0022` `O(1)` SHA-256 PayWord streaming channels, (3) `PriorLock`—a minimal **Priorism / Free Energy Principle (FEP)** commitment primitive that rewards accurate verifiable forecasts and burns `50%` of disconfirmed stake, and (4) **Homeostatic Fee Burn** (`50%` base-fee burn counterbalancing the perpetual `0.1953125 LOVE/block` tail emission).
 
-This paper documents the exact architecture live on Mainnet v2 (`v1.2.1`), its independent cross-client verification (`verifier-ts` + `<= 1 KB` Utreexo frontier + FlyClient MMR + pure-SHA-2 STARK-in-STARK IVC), its reserved BIP-9 upgrade path, and its open coin-denominated Public Security Bug Bounty (`https://newsatoshi.org/bounty/`).
+This paper documents the exact architecture live on Mainnet v2 (`v1.2.3`), its independent cross-client verification (`verifier-ts` + `<= 1 KB` Utreexo frontier + FlyClient MMR + pure-SHA-2 STARK-in-STARK IVC), its reserved BIP-9 upgrade path, and its open coin-denominated Public Security Bug Bounty (`https://newsatoshi.org/bounty/`).
 
 ---
 
@@ -81,7 +81,7 @@ Spending notes proves knowledge of `(sk, rho, pos, path)` and exact integer bala
   - **Classical Proven Security:** `192` bits (Johnson-bound LDR, capped only by SHA-384 collision bound).
   - **Conservative Post-Quantum Soundness (CMS19 QROM):** **`104` bits (`K=1`), `102` bits (`K=4`), `101` bits (`K=8`), `100` bits (`K=16`)**.
   - **Pareto Optimality:** Verified analytically against Winterfell's Johnson-bound LDR formula (`vendor/winter-air/src/proof/security.rs`) that `B=8, q=152, g=20, F=8` is the exact Pareto optimum for `>= 100` QROM bits across all `K=1..=16`.
-- **Measured Performance (`v1.2.1`):** Single `MAIN_V2` spend proof = `603,686` bytes, proved in `272 ms` native, verified in `16 ms` native and **`24.8 ms` in browser WebAssembly** (live at `https://newsatoshi.org/`).
+- **Measured Performance (`v1.2.3`):** Single `MAIN_V2` spend proof = `603,686` bytes, proved in `272 ms` native, verified in `16 ms` native and **`24.8 ms` in browser WebAssembly** (live at `https://newsatoshi.org/`).
 - **Pre-Genesis Upstream Winterfell Patch:** During pre-genesis red-team stress testing, two upstream canonicalization bugs in `winter-math 0.13.1` (`f64::BaseElement::double()` and `mul_small()` returning unreduced values `>= M` with probability $2^{-33}$ and $2^{-32}$, causing intermittent `~5–8%` Quartic OOD failures) were isolated, patched in `node/vendor/winter-math/src/field/f64/mod.rs`, and stress-tested across `25/25` consecutive `MAIN_V2` Quartic batches (`75` full proofs, `0` failures).
 
 ### 3.3 `BatchSpend` Compression (`K = 2..=16`) & Incentive-Compatible Fees
@@ -95,7 +95,7 @@ Following the June 2026 Zcash Orchard balance vulnerability, shielded monetary c
 
 1. **Automated Z3 SMT Extraction (`node/proof/check.py`):** Extracts all `249` polynomial transition constraints (`2,950` terms) directly from the live Rust AIR and checks zero unintended cell freedom across all `1,138,176` active cells.
 2. **Zero-Dependency Lean 4 Kernel (`0 sorry`, `0 Mathlib`, `0 native_decide`):**
-   - **`node/proof/SpendCircuitFull.lean`:** Mechanizes all **`249`** live Rust spend AIR constraints and `7` no-wrap lemmas directly inside Lean 4's pure kernel.
+   - **`node/proof/SpendCircuitFull.lean` (`8,343` lines):** Extracts all **`249`** live Rust spend AIR constraints (`2,950` terms) and cross-checks all `114,688` periodic table cells directly from compiling Rust, proves Pocklington primality of Goldilocks `P = 2^64 - 2^32 + 1` (`goldilocks_is_prime`), proves full bidirectional equivalence between any raw `8,192 × 247` Goldilocks trace satisfying all `249` extracted polynomials + boundary assertions and a complete semantic `ValidSpendWitness` (`raw_rust_air_soundness`, `valid_witness_satisfies_raw_air`, `raw_rust_air_iff_valid_spend_witness`), and certifies non-vacuity on a live Rust-verified 2-in/2-out shielded spend (`raw_rust_air_non_vacuous`).
    - **`node/proof/SpendBalance.lean`:** Proves **`10`** core monetary theorems: exact Constraint `#247/#248` spend balance conservation over `< 2^60` notes across all `4,607` active rows, `BatchSpend` conservation, `RFC-0022` PayWord channel deposit conservation, `PriorLock` 50/50 surprise bounty/burn conservation, Homeostatic 50/50 fee burn conservation, and global L1 solvency (`shielded_pool + locked + burned == issued`).
 
 ---
