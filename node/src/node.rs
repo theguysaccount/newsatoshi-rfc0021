@@ -1695,37 +1695,59 @@ pub fn run_miner(shared: Shared, a_pk: crate::hash::Word8, interval: Duration) {
     run_miner_duty(shared, a_pk, interval, 100)
 }
 
+/// Mine in the background across `threads` CPU workers (`>= 1`), splitting nonces across
+/// disjoint ranges and checking for new tips between batches. `duty` (`1..=100`) throttles CPU.
 pub fn run_miner_duty(shared: Shared, a_pk: crate::hash::Word8, interval: Duration, duty: u32) {
+    let default_threads = if duty >= 100 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+        1
+    };
+    run_miner_threads(shared, a_pk, interval, duty, default_threads);
+}
+
+pub fn run_miner_threads(
+    shared: Shared,
+    a_pk: crate::hash::Word8,
+    interval: Duration,
+    duty: u32,
+    threads: usize,
+) {
     let duty = duty.clamp(1, 100);
-    thread::spawn(move || loop {
-        thread::sleep(interval);
-        let (mut b, tip) = {
-            let n = lock(&shared);
-            match n.block_template(a_pk, b"newsatoshi-cpu").map(|(b, _)| b) {
-                Ok(b) => (b, n.chain.tip().hash),
-                Err(_) => {
-                    drop(n);
-                    thread::sleep(Duration::from_millis(500));
-                    continue;
+    let threads = threads.max(1);
+    for worker_id in 0..threads {
+        let shared = shared.clone();
+        thread::spawn(move || loop {
+            thread::sleep(interval);
+            let extra = format!("newsatoshi-cpu-w{worker_id}");
+            let (mut b, tip) = {
+                let n = lock(&shared);
+                match n.block_template(a_pk, extra.as_bytes()).map(|(b, _)| b) {
+                    Ok(b) => (b, n.chain.tip().hash),
+                    Err(_) => {
+                        drop(n);
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                }
+            };
+            b.header.nonce = rand::thread_rng().gen();
+            loop {
+                while MINING_PAUSED.load(Ordering::SeqCst) > 0 {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                let t = std::time::Instant::now();
+                if mine(&mut b.header, 500_000) {
+                    let _ = lock(&shared).accept_block(b, None);
+                    break;
+                }
+                if duty < 100 {
+                    thread::sleep(t.elapsed() * (100 - duty) / duty);
+                }
+                if lock(&shared).chain.tip().hash != tip {
+                    break;
                 }
             }
-        };
-        b.header.nonce = rand::thread_rng().gen();
-        loop {
-            while MINING_PAUSED.load(Ordering::SeqCst) > 0 {
-                thread::sleep(Duration::from_millis(100));
-            }
-            let t = std::time::Instant::now();
-            if mine(&mut b.header, 200_000) {
-                let _ = lock(&shared).accept_block(b, None);
-                break;
-            }
-            if duty < 100 {
-                thread::sleep(t.elapsed() * (100 - duty) / duty);
-            }
-            if lock(&shared).chain.tip().hash != tip {
-                break;
-            }
-        }
-    });
+        });
+    }
 }

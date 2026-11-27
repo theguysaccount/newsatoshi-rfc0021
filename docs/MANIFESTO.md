@@ -58,8 +58,8 @@ Crypto drowned in hype because projects lied about what was finished, faked adop
 
 We reject that culture completely. Here is our public standard:
 
-- **Never fake a number.** Zero synthetic users, zero fake pools, zero hidden self-mining, zero fabricated audits.
-- **State every open risk in daylight.** Live Mainnet v2 (`nsM2`) is open and running today at real Bitcoin difficulty, but independent external human security audits (`0/2`) and independent real-difficulty Bitcoin pools (`0/3`) are tracked transparently in real time at `https://commons.newsatoshi.org/api/v2/cutover-readiness`. Until outside cryptographers try to break every line and fail, treat early holdings as experimental.
+- **Never fake a number.** Zero synthetic users, zero fake pools, zero hidden premine, zero fabricated metrics.
+- **Put real `LOVE` on the line — break it and get paid.** Every line of consensus code, every STARK constraint, and every Lean 4 proof is covered by an open, coin-denominated Public Security Bug Bounty (`https://newsatoshi.org/bounty/`, Mainnet v2 treasury `ns1af734b0e0b0c1c6a54e206ba7a23f586daee77ede5e7c51b6ec6b133c51f572a99d8cb66`). Anyone who finds a real soundness or consensus flaw collects native `LOVE` directly.
 - **Verify, never trust.** Don't take our word for a single claim. Run the live browser STARK verifier at `https://newsatoshi.org/`, run the Lean 4 proofs on your own CPU, run the zero-Rust-code independent JavaScript/OpenSSL verifier live against Mainnet v2, or point a Bitaxe at `pool.newsatoshi.org:3333`.
 
 ---

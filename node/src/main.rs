@@ -385,10 +385,13 @@ fn run() -> Result<(), String> {
             }
             if o.rest.iter().any(|a| a == "--mine") {
                 let w = Wallet::load_or_create(&wallet_path)?;
-                println!("mining to {}", w.address());
                 let secs: u64 = flag(&o.rest, "--interval").and_then(|x| x.parse().ok()).unwrap_or(if o.net == Net::Reg { 2 } else { 0 });
                 let duty: u32 = flag(&o.rest, "--mine-duty").and_then(|x| x.parse().ok()).unwrap_or(100);
-                node::run_miner_duty(shared.clone(), w.a_pk(), std::time::Duration::from_secs(secs), duty);
+                let threads: usize = flag(&o.rest, "--threads")
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+                println!("mining to {} ({threads} threads, duty {duty}%)", w.address());
+                node::run_miner_threads(shared.clone(), w.a_pk(), std::time::Duration::from_secs(secs), duty, threads);
             }
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -588,6 +591,10 @@ fn run() -> Result<(), String> {
         }
         ["address"] => println!("{}", Wallet::load_or_create(&wallet_path)?.address()),
         ["address", "--delivery"] => println!("{}", Wallet::load_or_create(&wallet_path)?.delivery_address()),
+        ["viewing-key"] => {
+            let w = Wallet::load_or_create(&wallet_path)?;
+            println!("{}", newsatoshi::deliver::viewing_key(&w.sk));
+        }
         ["balance"] => {
             let c = open_chain(&o)?;
             let w = synced(&wallet_path, &c)?;
