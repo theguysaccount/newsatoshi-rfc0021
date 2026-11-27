@@ -121,12 +121,14 @@ impl BatchSpendItem {
 }
 
 /// Multi-spend compressed shielded transaction: `K ∈ 2..=16` spends proved in ONE pure-SHA-2
-/// Winterfell STARK, paying the Negentropy Prover (`prover_a_pk`) a consensus split of block
-/// subsidy proportional to `K` (capped at 30%).
+/// Winterfell STARK. Out of the unburned sub-spend fees, an explicit STARK-bound `prover_fee`
+/// is paid in the block coinbase to `prover_a_pk`, while the AuxPoW miner keeps 100% of block
+/// subsidy plus all remaining `miner_fee` (strictly incentive-compatible; zero censorship!).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchSpend {
     pub spends: Vec<BatchSpendItem>,
     pub prover_a_pk: Word8,
+    pub prover_fee: u64,
     pub proof: Vec<u8>,
 }
 
@@ -139,6 +141,7 @@ impl BatchSpend {
         Ok(BatchSpendPublic {
             spends,
             prover_a_pk: self.prover_a_pk,
+            prover_fee: self.prover_fee,
         })
     }
 
@@ -148,6 +151,24 @@ impl BatchSpend {
             sum = sum.checked_add(item.fee).ok_or("batch fee overflow")?;
         }
         Ok(sum)
+    }
+
+    /// Exact `(burned_fee, prover_fee, miner_fee)` conservation split across all sub-spends.
+    pub fn fee_split(&self, burn_active: bool) -> Res<(u64, u64, u64)> {
+        let mut burned: u64 = 0;
+        let mut net: u64 = 0;
+        for item in &self.spends {
+            let (b, p) = crate::params::split_spend_fee(item.fee, burn_active);
+            burned = burned.checked_add(b).ok_or("batch burn overflow")?;
+            net = net.checked_add(p).ok_or("batch net fee overflow")?;
+        }
+        if self.prover_fee > net {
+            return Err(format!(
+                "batch prover_fee {} exceeds unburned net fee {net}",
+                self.prover_fee
+            ));
+        }
+        Ok((burned, self.prover_fee, net - self.prover_fee))
     }
 }
 
@@ -185,7 +206,7 @@ impl Tx {
                 a.encode(w);
             }
             Tx::BatchSpend(bs) => {
-                w.u8(3).u8(bs.spends.len() as u8).word8(&bs.prover_a_pk);
+                w.u8(3).u8(bs.spends.len() as u8).word8(&bs.prover_a_pk).u64(bs.prover_fee);
                 for s in &bs.spends {
                     w.word8(&s.anchor).word8(&s.nf[0]).word8(&s.nf[1]);
                     w.word8(&s.cm_out[0]).word8(&s.cm_out[1]).bool(s.dummy[0]).bool(s.dummy[1]).u64(s.fee);
@@ -234,6 +255,7 @@ impl Tx {
                     return Err("batch spend count out of range".into());
                 }
                 let prover_a_pk = r.word8()?;
+                let prover_fee = r.u64()?;
                 let mut spends = Vec::with_capacity(n);
                 for _ in 0..n {
                     let anchor = r.word8()?;
@@ -249,7 +271,7 @@ impl Tx {
                     spends.push(BatchSpendItem { anchor, nf, cm_out, dummy, fee, deposit, memo });
                 }
                 let proof = r.bytes(MAX_BATCH_PROOF_BYTES)?;
-                Tx::BatchSpend(BatchSpend { spends, prover_a_pk, proof })
+                Tx::BatchSpend(BatchSpend { spends, prover_a_pk, prover_fee, proof })
             }
             _ => return Err("bad tx tag".into()),
         })

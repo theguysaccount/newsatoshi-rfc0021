@@ -41,7 +41,7 @@ kem = "=0.3.0-pre.0"
 
 
 
-# Winterfell 0.13.1 with four surgical changes. (1) For zero knowledge, the constraint
+# Winterfell 0.13.1 with five surgical changes. (1) For zero knowledge, the constraint
 # composition polynomial's segments can be masked (Haböck and Al Kindi, ePrint 2024/1037).
 # (2) For safety against hostile proofs, a count read from the bytes being parsed no longer
 # sizes an allocation (winter-utils and winter-crypto; found by examples/fuzz.rs). (3) For
@@ -51,6 +51,9 @@ kem = "=0.3.0-pre.0"
 # (4) For >= 100-bit conservative QROM (CMS19) post-quantum FRI soundness on Mainnet v2, a
 # 256-bit Quartic Goldilocks extension (`F_{p^4} = F_p[x]/(x^4 - 7)`, `FieldExtension::Quartic`)
 # and `ProvenSecurity::qrom_ldr_bits()` are added across winter-math/air/prover/verifier.
+# (5) Fix upstream `f64::BaseElement::double()` and `mul_small()` non-canonical outputs in
+# `[M, 2^64 - 1]` (probability ~2^-33 / ~2^-32 per call) that silently underflowed `M - rhs.0`
+# in `Add` under `overflow-checks = false` during large STARK traces (`BatchSpendAir`).
 # Each patched site is marked "NEWSATOSHI patch"; everything else is the published crate.
 [patch.crates-io]
 winter-air = { path = "vendor/winter-air" }

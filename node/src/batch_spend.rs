@@ -158,17 +158,21 @@ fn degrees_batch(rows: usize) -> Vec<TransitionConstraintDegree> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchSpendPublic {
     pub spends: Vec<SpendPublic>,
-    /// Prover's shielded address, bound into Fiat–Shamir to authorize the split-coinbase share.
+    /// Prover's shielded address, bound into Fiat–Shamir so no miner can divert `prover_fee`.
     pub prover_a_pk: Word8,
+    /// Explicit fee paid from the unburned batch fee budget to `prover_a_pk` (AuxPoW miners
+    /// always keep 100% of block subsidy + remaining `miner_fee`, eliminating censorship!).
+    pub prover_fee: u64,
 }
 
 impl ToElements<Felt> for BatchSpendPublic {
     fn to_elements(&self) -> Vec<Felt> {
-        let mut out = Vec::with_capacity(1 + 8 + self.spends.len() * 51);
+        let mut out = Vec::with_capacity(2 + 8 + self.spends.len() * 51);
         out.push(Felt::new(self.spends.len() as u64));
         for w in self.prover_a_pk {
             out.push(Felt::new(w as u64));
         }
+        out.push(Felt::new(self.prover_fee));
         for sp in &self.spends {
             out.extend(sp.to_elements());
         }
@@ -547,12 +551,14 @@ pub fn batch_context_prefix(profile: &Profile, pi: &BatchSpendPublic) -> Vec<u8>
     b
 }
 
-/// Prove `K ∈ 2..=16` shielded 2-in/2-out spends inside ONE pure-SHA-2 Winterfell STARK.
+/// Prove `K ∈ 2..=16` shielded 2-in/2-out spends inside ONE pure-SHA-2 Winterfell STARK,
+/// binding both `prover_a_pk` and explicit `prover_fee` into the Fiat–Shamir transcript.
 pub fn prove_batch_for(
     profile: &Profile,
     wits: &[SpendWitness],
     binds: &[Word8],
     prover_a_pk: Word8,
+    prover_fee: u64,
 ) -> Result<(BatchSpendPublic, Proof), String> {
     if wits.len() != binds.len() {
         return Err("witness and bind count mismatch".into());
@@ -563,11 +569,14 @@ pub fn prove_batch_for(
             wits.len()
         ));
     }
+    if prover_fee >= MAX_VALUE_BALANCE {
+        return Err("batch prover_fee out of range".into());
+    }
     let mut spends = Vec::with_capacity(wits.len());
     for (w, b) in wits.iter().zip(binds.iter()) {
         spends.push(w.public(*b)?);
     }
-    let pi = BatchSpendPublic { spends, prover_a_pk };
+    let pi = BatchSpendPublic { spends, prover_a_pk, prover_fee };
     let trace = build_batch_trace(wits, &batch_meta(profile))?;
     let proof = if profile.sha384 {
         BatchSpendProver384 { options: profile.options(), pi: pi.clone() }
@@ -594,6 +603,9 @@ pub fn verify_batch_bytes_for(
     }
     if proof.len() > MAX_BATCH_PROOF_BYTES {
         return Err("batch proof too large".into());
+    }
+    if pi.prover_fee >= MAX_VALUE_BALANCE {
+        return Err("batch prover_fee out of range".into());
     }
     for sp in &pi.spends {
         if sp.value_balance.unsigned_abs() >= MAX_VALUE_BALANCE {
@@ -641,12 +653,16 @@ pub fn verify_batch_bytes_cached(
     pi: &BatchSpendPublic,
     proof: &[u8],
 ) -> Result<(), String> {
-    let mut key_in = Vec::with_capacity(64 + pi.spends.len() * 210 + proof.len());
+    let mut key_in = Vec::with_capacity(72 + pi.spends.len() * 210 + proof.len());
     key_in.extend_from_slice(b"nsBATCHC");
     key_in.push(profile.queries as u8);
+    key_in.push(profile.blowup as u8);
+    key_in.push(profile.grinding as u8);
+    key_in.push(profile.extension as u8);
     key_in.push(profile.sha384 as u8);
     key_in.extend_from_slice(profile.tag);
     key_in.extend_from_slice(&hash::words_to_bytes(&pi.prover_a_pk));
+    key_in.extend_from_slice(&pi.prover_fee.to_le_bytes());
     for sp in &pi.spends {
         key_in.extend_from_slice(&sp.to_bytes());
     }
@@ -701,8 +717,9 @@ mod tests {
             binds.push(rng.gen());
         }
         let prover_a_pk: Word8 = [0x42; 8];
+        let prover_fee = 15_000u64;
         let t0 = std::time::Instant::now();
-        let (pi, proof) = prove_batch_for(&spend::TEST, &wits, &binds, prover_a_pk).unwrap();
+        let (pi, proof) = prove_batch_for(&spend::TEST, &wits, &binds, prover_a_pk, prover_fee).unwrap();
         let prove_ms = t0.elapsed().as_millis();
         let bytes = proof.to_bytes();
         let tv = std::time::Instant::now();
@@ -718,10 +735,14 @@ mod tests {
         // Logarithmic compression: 4 spends in ~290 KB vs 4 * ~249 KB (~1,000 KB)!
         assert!(bytes.len() < 400_000, "expected compressed K=4 batch < 400 KB, got {}", bytes.len());
 
-        // Miner trying to swap prover_a_pk to steal the Negentropy Prover coinbase share MUST fail!
+        // Miner trying to swap prover_a_pk or reduce prover_fee MUST fail!
         let mut stolen = pi.clone();
         stolen.prover_a_pk = [0x99; 8];
         assert!(verify_batch_bytes_for(&spend::TEST, &stolen, &bytes).is_err());
+
+        let mut shaved = pi.clone();
+        shaved.prover_fee = 0;
+        assert!(verify_batch_bytes_for(&spend::TEST, &shaved, &bytes).is_err());
 
         // Mutating any sub-spend value_balance MUST fail!
         let mut inflated = pi.clone();

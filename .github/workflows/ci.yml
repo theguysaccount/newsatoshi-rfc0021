@@ -19,7 +19,7 @@ jobs:
         run: |
           node ../verifier-ts/newsatoshi_verifier.mjs --self-test
           cargo test --lib
-          cargo test --release --test priorism_fep_core --test payword_channel --test audit_redteam --test differential_fuzz --test attacks --test discovery --test crypto_kats --test conds --test auxpow --test locks --test light --test mainnet_params --test chain
+          cargo test --release --test priorism_fep_core --test mainnet_v2_readiness --test payword_channel --test audit_redteam --test differential_fuzz --test attacks --test discovery --test crypto_kats --test conds --test auxpow --test locks --test light --test mainnet_params --test chain
           cargo build --bin newsatoshi --example channel_http_harness --example extract_lean_spend --example extract_lean_circuit
           cargo run --release --example extract_lean_spend -- /tmp/SpendBalance.lean
           diff -u proof/SpendBalance.lean /tmp/SpendBalance.lean

@@ -356,7 +356,8 @@ const HP_LINK_H1: usize = 8; // 1 on row 64 of comp 1 -> row 0 of comp 2 (digest
 const HP_LINK_PREV: usize = 9; // 1 on row 64 of comp 2 -> row 0 of next header's comp 0 (prev hash!)
 const HP_PAD_B2: usize = 10; // 1 on row 0 of comp 1 (80-byte FIPS padding)
 const HP_PAD_H2: usize = 11; // 1 on row 0 of comp 2 (32-byte FIPS padding)
-const HP_N_PER: usize = 12;
+const HP_POW_CHK: usize = 12; // 1 on row 64 of comp 2 (in-circuit PoW hash MSB bound)
+const HP_N_PER: usize = 13;
 
 /// Public inputs pinned by a pure-SHA-384 `HeaderChainAir` STARK proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -414,8 +415,11 @@ fn header_chain_periodic() -> Vec<Vec<Felt>> {
                     cols[HP_CHAIN_IV][r] = Felt::ONE;
                 } else if sub == 1 {
                     cols[HP_LINK_H1][r] = Felt::ONE;
-                } else if sub == 2 && hdr_idx + 1 < HEADERS_PER_SEGMENT {
-                    cols[HP_LINK_PREV][r] = Felt::ONE;
+                } else if sub == 2 {
+                    cols[HP_POW_CHK][r] = Felt::ONE;
+                    if hdr_idx + 1 < HEADERS_PER_SEGMENT {
+                        cols[HP_LINK_PREV][r] = Felt::ONE;
+                    }
                 }
             }
         }
@@ -562,7 +566,8 @@ const HC_N_CONSTRAINTS: usize =
     + 8 // h1 linkage comp 1 row 64 -> comp 2 row 0 W[0..8]
     + 8 // prev-hash linkage comp 2 row 64 -> next header comp 0 row 0 W[1..9]
     + 12 // FIPS 80-byte padding on comp 1 row 0
-    + 8; // FIPS 32-byte padding on comp 2 row 0
+    + 8 // FIPS 32-byte padding on comp 2 row 0
+    + 2; // In-circuit PoW check on comp 2 row 64 (unpack DIG[7] -> X14[0..32] + MSB bit 7 == 0)
 
 pub struct HeaderChainAir {
     ctx: AirContext<Felt>,
@@ -588,8 +593,8 @@ impl Air for HeaderChainAir {
         }
         // 1 W_{t+16} recurrence (xor3 => deg 3)
         degrees.push(TransitionConstraintDegree::with_cycles(3, vec![HC_ROWS]));
-        // Remaining 2 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 12 + 8 = 78 deg-1 * periodic
-        for _ in 0..78 {
+        // Remaining 2 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 12 + 8 + 2 = 80 deg-1 * periodic
+        for _ in 0..80 {
             degrees.push(TransitionConstraintDegree::with_cycles(1, vec![HC_ROWS]));
         }
         assert_eq!(degrees.len(), HC_N_CONSTRAINTS);
@@ -654,6 +659,15 @@ impl Air for HeaderChainAir {
             idx += 1;
         }
         res[idx] = is_pad_h2 * (cur[S_W + 15] - E::from(Felt::new(256)));
+        idx += 1;
+
+        // In-circuit PoW verification on comp 2 row 64:
+        // Unpack `S_DIG[7]` (containing LE hash MSB byte `hash[31]` in its low 8 bits) into
+        // boolean-constrained `S_X14[0..32]` and enforce bit 7 (`hash[31] >> 7`) == 0 (`hash < 2^255`).
+        let is_pow_chk = per[HP_POW_CHK];
+        res[idx] = is_pow_chk * (pack_bits_e(&cur[S_X14..S_X14 + 32]) - cur[S_DIG + 7]);
+        idx += 1;
+        res[idx] = is_pow_chk * cur[S_X14 + 7];
         idx += 1;
 
         debug_assert_eq!(idx, HC_N_CONSTRAINTS);
@@ -792,31 +806,7 @@ fn fill_sha256_block(trace: &mut TraceTable<Felt>, base_row: usize, block: &[u32
 }
 
 pub fn prove_header_chain_segment(headers: &[Header; HEADERS_PER_SEGMENT]) -> Result<(HeaderChainPublicInputs, Vec<u8>), String> {
-    let mut trace = TraceTable::init(vec![vec![Felt::ZERO; HC_ROWS]; S_WIDTH]);
-    let mut prev_hash = headers[0].prev;
-    let mut end_hash_words = [0u32; 8];
-
-    for (i, hd) in headers.iter().enumerate() {
-        if i > 0 && hd.prev != prev_hash {
-            return Err(format!("header {i} prev hash does not link to header {}", i - 1));
-        }
-        let raw = hd.bytes();
-        let (b0, b1, b2, s1, _h1, h2) = sha256d_header_blocks(&raw);
-        let base = i * 3 * HC_STRIDE;
-        fill_sha256_block(&mut trace, base, &b0, &IV);
-        fill_sha256_block(&mut trace, base + HC_STRIDE, &b1, &s1);
-        fill_sha256_block(&mut trace, base + 2 * HC_STRIDE, &b2, &IV);
-        let expected = sha256d(&raw);
-        debug_assert_eq!(hash::words_to_bytes(&h2), expected);
-        prev_hash = expected;
-        end_hash_words = h2;
-    }
-
-    let pi = HeaderChainPublicInputs {
-        start_prev_words: hash::bytes_to_words(&headers[0].prev),
-        end_hash_words,
-        count: HEADERS_PER_SEGMENT as u32,
-    };
+    let (trace, pi) = build_header_chain_trace(headers)?;
     let prover = HeaderChainProver {
         options: recursion_stark_options(),
         pi: pi.clone(),
@@ -959,12 +949,17 @@ fn build_header_chain_trace(
             return Err(format!("header {i} prev hash does not link to header {}", i - 1));
         }
         let raw = hd.bytes();
+        let expected = sha256d(&raw);
+        if !crate::pow::meets(&expected, hd.bits) {
+            return Err(format!("header {i} fails PoW target"));
+        }
         let (b0, b1, b2, s1, _h1, h2) = sha256d_header_blocks(&raw);
         let base = i * 3 * HC_STRIDE;
         fill_sha256_block(&mut trace, base, &b0, &IV);
         fill_sha256_block(&mut trace, base + HC_STRIDE, &b1, &s1);
         fill_sha256_block(&mut trace, base + 2 * HC_STRIDE, &b2, &IV);
-        let expected = sha256d(&raw);
+        // Unpack `h2[7]` into `S_X14[0..32]` on comp 2 row 64 for in-circuit PoW bit check!
+        write_bits(&mut trace, S_X14, base + 2 * HC_STRIDE + 64, h2[7], 32);
         debug_assert_eq!(hash::words_to_bytes(&h2), expected);
         prev_hash = expected;
         end_hash_words = h2;

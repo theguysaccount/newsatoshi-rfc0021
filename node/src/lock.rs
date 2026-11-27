@@ -82,6 +82,13 @@ impl Lock {
     pub fn decode(r: &mut Reader) -> Res<Self> {
         Ok(Lock { id: r.arr()?, post: LockPost::decode(r)?, at: r.u32()? })
     }
+    /// Canonical SHA-256 leaf digest for $O(\log N)$ `State::locks_merkle` (`Mainnet v2`).
+    pub fn value_hash(&self) -> [u8; 32] {
+        let mut w = Writer::new();
+        w.raw(b"nsLCKV1");
+        self.encode(&mut w);
+        sha256(&w.0)
+    }
 }
 
 /// A lock's identity: its terms and the first nullifier of the spend that funds it, which

@@ -112,9 +112,9 @@ pub fn asert_bits_staged(
     steady_half_life: i64,
     pow_limit_bits: u32,
     spacing: i64,
-) -> u32 {
+) -> Result<u32, String> {
     if launch_blocks == 0 {
-        return asert_bits(
+        return Ok(asert_bits(
             genesis_bits,
             genesis_parent_time,
             parent_height,
@@ -122,10 +122,10 @@ pub fn asert_bits_staged(
             steady_half_life,
             pow_limit_bits,
             spacing,
-        );
+        ));
     }
     if parent_height < launch_blocks {
-        asert_bits(
+        Ok(asert_bits(
             genesis_bits,
             genesis_parent_time,
             parent_height,
@@ -133,10 +133,12 @@ pub fn asert_bits_staged(
             launch_half_life,
             pow_limit_bits,
             spacing,
-        )
+        ))
     } else {
-        let (a_bits, a_time) = steady_anchor.expect("steady anchor required past launch_blocks");
-        asert_bits(
+        let (a_bits, a_time) = steady_anchor.ok_or_else(|| {
+            format!("missing ASERT steady anchor at height {launch_blocks} for parent_height {parent_height}")
+        })?;
+        Ok(asert_bits(
             a_bits,
             a_time - spacing,
             parent_height - launch_blocks,
@@ -144,7 +146,7 @@ pub fn asert_bits_staged(
             steady_half_life,
             pow_limit_bits,
             spacing,
-        )
+        ))
     }
 }
 
@@ -182,7 +184,8 @@ mod tests {
                     172_800,
                     genesis_bits,
                     TARGET_SPACING,
-                );
+                )
+                .unwrap();
                 let diff = (work(bits).low_u128() as f64) / diff1_work;
                 let dt = (TARGET_SPACING as f64 * diff) / surge;
                 time += dt.max(0.001);
@@ -219,8 +222,23 @@ mod tests {
             172_800,
             genesis_bits,
             TARGET_SPACING,
-        );
+        )
+        .unwrap();
         assert_eq!(next_b, anchor_bits, "launch -> steady transition must be exact and continuous");
+        // Missing steady_anchor past launch_blocks MUST return Err, never panic!
+        assert!(asert_bits_staged(
+            genesis_bits,
+            t0 - TARGET_SPACING,
+            2_016,
+            3_600,
+            None,
+            2_016,
+            anchor_time,
+            172_800,
+            genesis_bits,
+            TARGET_SPACING,
+        )
+        .is_err());
     }
 
     #[test]

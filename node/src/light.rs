@@ -29,11 +29,13 @@ use crate::tx::{header_commit, Block, Header};
 use primitive_types::{U256, U512};
 use std::collections::VecDeque;
 
-/// The last header a light client has checked, the times of the ten before it, and the work behind it.
+/// The last header a light client has checked, the times of the ten before it, the work behind it,
+/// and the optional ASERT steady-state anchor `(bits, time)` captured at `params.launch_blocks`.
 #[derive(Clone, Debug)]
 pub struct HeaderTip {
     pub tip: Entry,
     times: VecDeque<u32>,
+    pub steady_anchor: Option<(u32, i64)>,
 }
 
 impl HeaderTip {
@@ -50,6 +52,7 @@ impl HeaderTip {
         HeaderTip {
             times: VecDeque::from([tip.time]),
             tip,
+            steady_anchor: None,
         }
     }
 
@@ -57,9 +60,11 @@ impl HeaderTip {
         if hs.iter().any(|b| !b.txs.is_empty()) {
             return Err("a header with transactions".into());
         }
-        let (tip, times) = check_run(params, self.tip.clone(), self.times.clone(), hs, now)?;
+        let (tip, times, steady_anchor) =
+            check_run(params, self.tip.clone(), self.times.clone(), self.steady_anchor, hs, now)?;
         self.tip = tip;
         self.times = times;
+        self.steady_anchor = steady_anchor;
         Ok(())
     }
 
@@ -150,6 +155,9 @@ impl HeaderTip {
         for t in &self.times {
             w.u32(*t);
         }
+        if let Some((a_bits, a_time)) = self.steady_anchor {
+            w.bool(true).u32(a_bits).u64(a_time as u64);
+        }
         w.0
     }
 
@@ -168,8 +176,17 @@ impl HeaderTip {
             return Err("bad light-client state".into());
         }
         let times = (0..n).map(|_| r.u32()).collect::<Res<VecDeque<u32>>>()?;
+        let steady_anchor = if r.remaining() > 0 {
+            if r.bool()? {
+                Some((r.u32()?, r.u64()? as i64))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         r.finish()?;
-        Ok(HeaderTip { tip, times })
+        Ok(HeaderTip { tip, times, steady_anchor })
     }
 }
 

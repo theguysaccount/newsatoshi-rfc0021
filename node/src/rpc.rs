@@ -585,7 +585,11 @@ pub fn status(shared: &Shared) -> J {
         ("network".into(), J::str(c.params.name)),
         // what a wallet needs to pay on this network: which proofs it takes, and the fee
         // its wallets pay by default
-        ("proofs".into(), J::str(match c.params.net { crate::params::Net::Main => "main", crate::params::Net::Dry => "dry", _ => "test" })),
+        ("proofs".into(), J::str(if c.params.proof.sha384 {
+            "main-v2"
+        } else {
+            match c.params.net { crate::params::Net::Main => "main", crate::params::Net::Dry => "dry", _ => "test" }
+        })),
         ("fee".into(), J::num(c.params.default_fee)),
         ("version".into(), J::str(env!("CARGO_PKG_VERSION"))),
         ("genesis".into(), J::str(hash_hex(&c.genesis))),
@@ -723,7 +727,14 @@ pub fn note_info(shared: &Shared, cm: &Word8) -> J {
     ])
 }
 
-fn lock_json(l: &crate::lock::Lock, state: &str, confirmed: bool, tip: u32, end: Option<&crate::lock::LockEnd>) -> J {
+fn lock_json(
+    l: &crate::lock::Lock,
+    state: &str,
+    confirmed: bool,
+    tip: u32,
+    end: Option<&crate::lock::LockEnd>,
+    merkle_proof: Option<(&crate::merkmap::MerkleProof, [u8; 32])>,
+) -> J {
     let p = &l.post;
     let mut kv = vec![
         ("id".into(), J::str(hex::encode(l.id))),
@@ -737,6 +748,9 @@ fn lock_json(l: &crate::lock::Lock, state: &str, confirmed: bool, tip: u32, end:
         ("at".into(), J::num(l.at)),
         ("confirmations".into(), J::num(if confirmed { (tip + 1).saturating_sub(l.at) } else { 0 })),
     ];
+    if let Some((mp, root)) = merkle_proof {
+        kv.push(("merkle_proof".into(), merkle_proof_json(mp, root)));
+    }
     if let Some(e) = end {
         kv.push(("ended_at".into(), J::num(e.height)));
         kv.push(("preimage".into(), e.preimage.map(|x| J::str(hex::encode(x))).unwrap_or(J::Null)));
@@ -758,14 +772,15 @@ pub fn lock_info(shared: &Shared, id: &[u8; 32]) -> J {
         J::Obj(kv)
     };
     let body = if let Some(e) = st.lock_ends.get(id) {
-        Some(lock_json(&e.lock, if e.preimage.is_some() { "claimed" } else { "refunded" }, true, tip, Some(e)))
+        Some(lock_json(&e.lock, if e.preimage.is_some() { "claimed" } else { "refunded" }, true, tip, Some(e), None))
     } else if let Some(e) = pool.lock_ends.get(id) {
         let made = st.locks.contains_key(id);
-        Some(lock_json(&e.lock, if e.preimage.is_some() { "claimed" } else { "refunded" }, false, tip, Some(e)).with_made(made))
+        Some(lock_json(&e.lock, if e.preimage.is_some() { "claimed" } else { "refunded" }, false, tip, Some(e), None).with_made(made))
     } else if let Some(l) = st.locks.get(id) {
-        Some(lock_json(l, "open", true, tip, None))
+        let mp = st.merkle_locks_conds.then(|| st.locks_merkle.prove(id).map(|p| (p, st.locks_merkle.root()))).flatten();
+        Some(lock_json(l, "open", true, tip, None, mp.as_ref().map(|(p, r)| (p, *r))))
     } else {
-        pool.locks.get(id).map(|l| lock_json(l, "open", false, tip, None))
+        pool.locks.get(id).map(|l| lock_json(l, "open", false, tip, None, None))
     };
     match body {
         Some(J::Obj(kv)) => base(true, kv),
@@ -780,7 +795,7 @@ pub fn cond_info(shared: &Shared, id: &[u8; 32]) -> J {
     let tip = n.chain.height();
     let st = &n.chain.state;
     let pool = n.pool_state();
-    let json = |c: &crate::cond::Cond, state: &str, confirmed: bool, end: Option<&crate::cond::CondEnd>| {
+    let json = |c: &crate::cond::Cond, state: &str, confirmed: bool, end: Option<&crate::cond::CondEnd>, mp: Option<(&crate::merkmap::MerkleProof, [u8; 32])>| {
         let mut kv = vec![
             ("found".into(), J::Bool(true)),
             ("id".into(), J::str(hex::encode(c.id))),
@@ -794,6 +809,9 @@ pub fn cond_info(shared: &Shared, id: &[u8; 32]) -> J {
             ("made_at".into(), J::num(c.at)),
             ("height".into(), J::num(tip)),
         ];
+        if let Some((p, root)) = mp {
+            kv.push(("merkle_proof".into(), merkle_proof_json(p, root)));
+        }
         if let Some(e) = end {
             kv.push(("ended_at".into(), J::num(e.height)));
             if let Some((p, prog)) = &e.fulfilled {
@@ -805,13 +823,14 @@ pub fn cond_info(shared: &Shared, id: &[u8; 32]) -> J {
     };
     let end_state = |e: &crate::cond::CondEnd| if e.fulfilled.is_some() { "fulfilled" } else { "refunded" };
     if let Some(e) = st.cond_ends.get(id) {
-        json(&e.cond, end_state(e), true, Some(e))
+        json(&e.cond, end_state(e), true, Some(e), None)
     } else if let Some(e) = pool.cond_ends.get(id) {
-        json(&e.cond, end_state(e), false, Some(e))
+        json(&e.cond, end_state(e), false, Some(e), None)
     } else if let Some(c) = st.conds.get(id) {
-        json(c, "open", true, None)
+        let mp = st.merkle_locks_conds.then(|| st.conds_merkle.prove(id).map(|p| (p, st.conds_merkle.root()))).flatten();
+        json(c, "open", true, None, mp.as_ref().map(|(p, r)| (p, *r)))
     } else if let Some(c) = pool.conds.get(id) {
-        json(c, "open", false, None)
+        json(c, "open", false, None, None)
     } else {
         J::Obj(vec![("found".into(), J::Bool(false)), ("height".into(), J::num(tip))])
     }

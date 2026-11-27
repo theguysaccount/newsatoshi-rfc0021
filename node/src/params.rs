@@ -14,16 +14,8 @@ pub const SUBSIDY_FLOOR: u64 = 19_531_250;
 pub const BASE_FEE_BURN_BPS: u64 = 5_000;
 
 /// Minimum fee per individual sub-spend inside a `Tx::BatchSpend` (0.0001 LOVE = 10,000 units),
-/// ensuring self-spamming batch proofs to farm prover subsidy burns real coins under the
-/// Homeostatic Fee Burn.
+/// preventing zero-fee dust packing inside compressed batches.
 pub const MIN_BATCH_SPEND_FEE: u64 = 10_000;
-
-/// Split Coinbase (AuxPoW Orderer + Negentropy Prover): each shielded spend compressed inside
-/// a `Tx::BatchSpend` allocates `500 bps` (5%) of block subsidy to the Batch Prover, capped at
-/// `PROVER_SUBSIDY_MAX_BPS` (30% = 3,000 bps at `>= 6` compressed spends). When a block has
-/// no `Tx::BatchSpend`, the AuxPoW miner receives 100% of subsidy (zero liveness stall risk).
-pub const PROVER_SUBSIDY_PER_SPEND_BPS: u64 = 500;
-pub const PROVER_SUBSIDY_MAX_BPS: u64 = 3_000;
 
 /// A memo: text, or text with envelopes that deliver notes on chain (`crate::deliver`).
 pub const MAX_MEMO: usize = crate::deliver::MAX_MEMO_BYTES;
@@ -81,16 +73,22 @@ pub fn split_spend_fee(fee: u64, homeostatic_burn_active: bool) -> (u64, u64) {
     (burned, fee - burned)
 }
 
-/// Compute the consensus prover share of `block_subsidy` for `compressed_spends` total spends
-/// proved inside `Tx::BatchSpend` transactions in a block.
-pub fn prover_subsidy_share(block_subsidy: u64, compressed_spends: u64) -> u64 {
-    if compressed_spends < 2 {
-        return 0;
+/// Split a `BatchSpend` fee budget into `(burned_fee, prover_fee, miner_fee)`.
+/// Strictly incentive-compatible: the AuxPoW miner ALWAYS keeps 100% of block subsidy plus
+/// `miner_fee`, while `prover_fee` is paid out of the unburned fee share (`prover_fee <= net_fee`)
+/// directly to `prover_a_pk` in the block coinbase (both bound inside the STARK proof).
+pub fn split_batch_fee(
+    total_fee: u64,
+    prover_fee: u64,
+    homeostatic_burn_active: bool,
+) -> Result<(u64, u64, u64), String> {
+    let (burned, net) = split_spend_fee(total_fee, homeostatic_burn_active);
+    if prover_fee > net {
+        return Err(format!(
+            "batch prover_fee {prover_fee} exceeds unburned net fee {net}"
+        ));
     }
-    let bps = compressed_spends
-        .saturating_mul(PROVER_SUBSIDY_PER_SPEND_BPS)
-        .min(PROVER_SUBSIDY_MAX_BPS);
-    ((block_subsidy as u128 * bps as u128) / 10_000) as u64
+    Ok((burned, prover_fee, net - prover_fee))
 }
 
 /// Bitcoin's schedule until it reaches the floor, then the floor forever. Depends on
@@ -154,14 +152,20 @@ pub struct Params {
     /// Height from which Homeostatic Base-Fee Burn (`50%` of shielded spend fees permanently
     /// burned into `state.burned`) is active (`Some(0)` on Mainnet v2; `None` on v0.1.0).
     pub homeostatic_burn_from: Option<u32>,
-    /// Height from which `Tx::BatchSpend` multi-spend STARK compression and Split Coinbase
-    /// (AuxPoW Orderer + Negentropy Prover) are active.
+    /// Height from which `Tx::BatchSpend` multi-spend STARK compression with STARK-bound
+    /// `prover_fee` coinbase settlement is active.
     pub batch_spend_from: Option<u32>,
     /// Height from which blocks commit to the ancestor FlyClient Header MMR root
     /// (`DigestParts::header_mmr`, Zcash ZIP-221 style). `Some(0)` on Mainnet v2; `None` on v0.1.0.
     pub mmr_from: Option<u32>,
-    /// Require opportunistic post-quantum `NSPQ1` (NIST FIPS 203 ML-KEM-768 + SHA-256 AEAD) P2P
-    /// encryption on all peer links (`true` on Mainnet v2; stops passive HNDL eavesdropping).
+    /// Height from which `locks` and `conds` digest commitments use $O(\log N)$ `MerkleMap` roots
+    /// instead of $O(N)$ full-map linear hashing (`Some(0)` on Mainnet v2; `None` on v0.1.0).
+    pub merkle_locks_conds_from: Option<u32>,
+    /// Whether legacy Freivalds matrix-product jobs (`Deposit::Post`/`Claim`) are accepted.
+    /// Disabled (`false`) on Mainnet v2 (`nsM2`) so `state.jobs` stays permanently empty (`O(1)`).
+    pub legacy_jobs_enabled: bool,
+    /// Require post-quantum `NSPQ1`/`NSPQ2` (NIST FIPS 203 ML-KEM-768 + optional SLH-DSA pinning)
+    /// P2P encryption on all peer links (`true` on Mainnet v2).
     pub pq_transport: bool,
     /// Nodes to reach when none is named with `--peer`. Any node can be one; these are
     /// only where a new node first looks.
@@ -211,6 +215,8 @@ impl Params {
                 homeostatic_burn_from: None,
                 batch_spend_from: None,
                 mmr_from: None,
+                merkle_locks_conds_from: None,
+                legacy_jobs_enabled: true,
                 pq_transport: false,
                 seeds: &["newsatoshi-seed.fly.dev:18444"],
             }),
@@ -241,6 +247,8 @@ impl Params {
                 homeostatic_burn_from: None,
                 batch_spend_from: Some(0),
                 mmr_from: None,
+                merkle_locks_conds_from: None,
+                legacy_jobs_enabled: true,
                 pq_transport: false,
                 seeds: &[],
             }),
@@ -262,6 +270,8 @@ impl Params {
                 homeostatic_burn_from: None,
                 batch_spend_from: Some(0),
                 mmr_from: None,
+                merkle_locks_conds_from: None,
+                legacy_jobs_enabled: true,
                 pq_transport: false,
                 seeds: &[],
                 ..Self::main_with(0, 0)
@@ -300,21 +310,24 @@ impl Params {
             homeostatic_burn_from: None,
             batch_spend_from: None,
             mmr_from: None,
+            merkle_locks_conds_from: None,
+            legacy_jobs_enabled: true,
             pq_transport: false,
             seeds: &["newsatoshi-seed.fly.dev:8444"],
         }
     }
 
-    /// Canonical `v1.0.0-core` Mainnet launch rules (`nsM2`):
+    /// Canonical `v1.2.0-mainnet-rc1` Mainnet v2 launch rules (`nsM2`):
     /// - One fresh Bitcoin-block-anchored fair-launch genesis (zero premine; Nov 10 v0.1 canary retired)
     /// - Anti-instamine Day-1 ASERT ramp (1-hour half-life for first 2,016 blocks -> 48-hour steady)
-    /// - SHA-384 FRI commitment stack (`spend::MAIN_V2`: 128-bit QROM hash collision bound)
+    /// - 256-bit Quartic Goldilocks + SHA-384 FRI (`spend::MAIN_V2`: >= 100 conservative CMS19 QROM bits)
     /// - Consensus-committed FlyClient Header MMR (`mmr_from: Some(0)`)
-    /// - Opportunistic post-quantum ML-KEM-768 P2P transport (`pq_transport: true`, HNDL protection)
+    /// - $O(\log N)$ Merkleized `locks`, `conds`, `channels`, and `priors` + legacy jobs disabled (`O(1)` digest!)
+    /// - Post-quantum ML-KEM-768 + optional SLH-DSA pinned P2P transport (`pq_transport: true`)
     /// - PayWord hash-chain channels (`rfc0022_from: Some(0)`)
     /// - Priorism-FEP `PriorLock` (`prior_from: Some(0)`) + Homeostatic 50% Fee Burn
-    ///   (`homeostatic_burn_from: Some(0)`) + `BatchSpend` compression & split AuxPoW/Prover
-    ///   coinbase (`batch_spend_from: Some(0)`).
+    ///   (`homeostatic_burn_from: Some(0)`) + strictly incentive-compatible `BatchSpend` prover-fee
+    ///   settlement (`batch_spend_from: Some(0)`, AuxPoW miners keep 100% of block subsidy!).
     pub fn main_v2_with(genesis_time: u32, genesis_nonce: u32, genesis_bits: u32) -> Params {
         Params {
             name: "mainnet-v2",
@@ -331,7 +344,10 @@ impl Params {
             homeostatic_burn_from: Some(0),
             batch_spend_from: Some(0),
             mmr_from: Some(0),
+            merkle_locks_conds_from: Some(0),
+            legacy_jobs_enabled: false,
             pq_transport: true,
+            seeds: &["newsatoshi-seed.fly.dev:8445"],
             ..Self::main_with(genesis_time, genesis_nonce)
         }
     }
@@ -387,12 +403,10 @@ mod tests {
         assert_eq!(split_spend_fee(800_000, true), (400_000, 400_000));
         assert_eq!(split_spend_fee(800_001, true), (400_000, 400_001));
 
-        // Prover subsidy share bounds (0% for <2 spends, 5% per spend, capped at 30%)
-        assert_eq!(prover_subsidy_share(50 * COIN, 0), 0);
-        assert_eq!(prover_subsidy_share(50 * COIN, 1), 0);
-        assert_eq!(prover_subsidy_share(50 * COIN, 2), 5 * COIN); // 10%
-        assert_eq!(prover_subsidy_share(50 * COIN, 4), 10 * COIN); // 20%
-        assert_eq!(prover_subsidy_share(50 * COIN, 6), 15 * COIN); // 30% cap
-        assert_eq!(prover_subsidy_share(50 * COIN, 16), 15 * COIN); // still 30% cap
+        // Incentive-compatible BatchSpend prover_fee split (miners always keep 100% subsidy!)
+        assert_eq!(split_batch_fee(1_600_000, 200_000, true).unwrap(), (800_000, 200_000, 600_000));
+        assert_eq!(split_batch_fee(1_600_000, 0, true).unwrap(), (800_000, 0, 800_000));
+        assert_eq!(split_batch_fee(1_600_000, 800_000, true).unwrap(), (800_000, 800_000, 0));
+        assert!(split_batch_fee(1_600_000, 800_001, true).is_err());
     }
 }

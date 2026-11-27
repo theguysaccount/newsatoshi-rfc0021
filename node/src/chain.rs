@@ -102,7 +102,7 @@ pub struct Entry {
 /// hash of the Bitcoin header whose coinbase commits to it (white paper §4).
 /// The difficulty a block on top of `parent` must carry: ASERT from the genesis anchor
 /// (with optional anti-instamine Day-1 launch ramp when `params.launch_blocks > 0`).
-pub fn next_bits_for(params: &Params, parent: &Entry) -> u32 {
+pub fn next_bits_for(params: &Params, parent: &Entry) -> Result<u32, String> {
     next_bits_for_with_anchor(params, parent, None)
 }
 
@@ -110,9 +110,9 @@ pub fn next_bits_for_with_anchor(
     params: &Params,
     parent: &Entry,
     steady_anchor: Option<(u32, i64)>,
-) -> u32 {
+) -> Result<u32, String> {
     if params.net == Net::Reg {
-        return params.pow_limit;
+        return Ok(params.pow_limit);
     }
     pow::asert_bits_staged(
         params.genesis_bits,
@@ -129,19 +129,31 @@ pub fn next_bits_for_with_anchor(
 }
 
 /// Check a run of headers on top of `prev`, whose own time and those of the ten blocks
-/// before it are `times` (oldest first): each links to the one before, carries the
-/// difficulty ASERT sets and the work it claims, is later than the median of the eleven
-/// before it and not too far ahead of `now`, and agrees with every release checkpoint.
-/// Returns the last header's entry and the times ending at it. Full nodes run it before
-/// they fetch blocks; light clients run it instead of fetching them (`crate::light`).
-pub fn check_run(params: &Params, mut prev: Entry, mut times: std::collections::VecDeque<u32>, hs: &[Block], now: i64) -> Result<(Entry, std::collections::VecDeque<u32>), String> {
+/// before it are `times` (oldest first), plus optional `steady_anchor` `(bits, time)` at
+/// `params.launch_blocks` when `prev.height >= params.launch_blocks`. Each header links to
+/// the one before, carries the difficulty ASERT sets and the work it claims, is later than
+/// the median of the eleven before it and not too far ahead of `now`, and agrees with every
+/// release checkpoint. Automatically captures `steady_anchor` as the run crosses
+/// `params.launch_blocks`, returning `(last_entry, times, steady_anchor)`.
+pub fn check_run(
+    params: &Params,
+    mut prev: Entry,
+    mut times: std::collections::VecDeque<u32>,
+    mut steady_anchor: Option<(u32, i64)>,
+    hs: &[Block],
+    now: i64,
+) -> Result<(Entry, std::collections::VecDeque<u32>, Option<(u32, i64)>), String> {
+    if params.launch_blocks > 0 && prev.height == params.launch_blocks && steady_anchor.is_none() {
+        steady_anchor = Some((prev.bits, prev.time as i64));
+    }
     for b in hs {
         let hd = &b.header;
         if hd.prev != prev.hash {
             return Err("headers do not link".into());
         }
         let height = prev.height + 1;
-        if hd.bits != next_bits_for(params, &prev) {
+        let expected_bits = next_bits_for_with_anchor(params, &prev, steady_anchor)?;
+        if hd.bits != expected_bits {
             return Err(format!("wrong difficulty at height {height}"));
         }
         check_work(b)?;
@@ -161,12 +173,15 @@ pub fn check_run(params: &Params, mut prev: Entry, mut times: std::collections::
             }
         }
         prev = Entry { hash: hd.hash(), prev: hd.prev, height, time: hd.time, bits: hd.bits, work: prev.work + pow::work(hd.bits) };
+        if params.launch_blocks > 0 && height == params.launch_blocks {
+            steady_anchor = Some((hd.bits, hd.time as i64));
+        }
         times.push_back(hd.time);
         if times.len() > 11 {
             times.pop_front();
         }
     }
-    Ok((prev, times))
+    Ok((prev, times, steady_anchor))
 }
 
 pub fn check_work(b: &Block) -> Result<(), String> {
@@ -518,31 +533,33 @@ impl Chain {
         self.index.get(h).map(|e| self.active.get(e.height as usize) == Some(h)).unwrap_or(false)
     }
 
-    pub fn next_bits(&self, parent: &Entry) -> u32 {
-        let steady_anchor = if self.params.launch_blocks > 0 && parent.height >= self.params.launch_blocks {
-            let lb = self.params.launch_blocks;
-            let anchor_hash = if self.is_active(&parent.hash) {
-                self.active.get(lb as usize).copied()
-            } else {
-                let mut cur = parent.hash;
-                while let Some(e) = self.index.get(&cur) {
-                    if e.height == lb {
-                        break;
-                    }
-                    if e.height < lb {
-                        break;
-                    }
-                    cur = e.prev;
-                }
-                self.index.get(&cur).filter(|e| e.height == lb).map(|e| e.hash)
-            };
-            anchor_hash
-                .and_then(|h| self.index.get(&h))
-                .map(|e| (e.bits, e.time as i64))
+    /// Resolve the `(bits, time)` anchor at height `params.launch_blocks` along `parent`'s chain,
+    /// needed by `asert_bits_staged` once `parent.height >= params.launch_blocks`.
+    pub fn steady_anchor_for(&self, parent: &Entry) -> Option<(u32, i64)> {
+        if self.params.launch_blocks == 0 || parent.height < self.params.launch_blocks {
+            return None;
+        }
+        let lb = self.params.launch_blocks;
+        let anchor_hash = if self.is_active(&parent.hash) {
+            self.active.get(lb as usize).copied()
         } else {
-            None
+            let mut cur = parent.hash;
+            while let Some(e) = self.index.get(&cur) {
+                if e.height <= lb {
+                    break;
+                }
+                cur = e.prev;
+            }
+            self.index.get(&cur).filter(|e| e.height == lb).map(|e| e.hash)
         };
-        next_bits_for_with_anchor(&self.params, parent, steady_anchor)
+        anchor_hash
+            .and_then(|h| self.index.get(&h))
+            .map(|e| (e.bits, e.time as i64))
+    }
+
+    pub fn next_bits(&self, parent: &Entry) -> u32 {
+        next_bits_for_with_anchor(&self.params, parent, self.steady_anchor_for(parent))
+            .expect("known parent must resolve steady_anchor when past launch_blocks")
     }
 
     /// Median time of the last eleven blocks ending at `h`.
@@ -644,7 +661,8 @@ impl Chain {
     fn check_header(&self, b: &Block, parent: &Entry) -> Result<(), String> {
         let hd = &b.header;
         let height = parent.height + 1;
-        if hd.bits != self.next_bits(parent) {
+        let want_bits = next_bits_for_with_anchor(&self.params, parent, self.steady_anchor_for(parent))?;
+        if hd.bits != want_bits {
             return Err("wrong difficulty".into());
         }
         check_work(b)?;
@@ -673,10 +691,15 @@ impl Chain {
         self.wanted.extend(hashes.into_iter().filter(|h| !self.index.contains_key(h)).take(MAX_WANTED));
     }
 
-    /// The entry of a block this node has and the times of the eleven blocks ending at it
-    /// (oldest first): what `check_run` needs to check headers that follow it.
-    pub fn header_base(&self, h: &[u8; 32]) -> Option<(Entry, std::collections::VecDeque<u32>)> {
+    /// The entry of a block this node has, the times of the eleven blocks ending at it
+    /// (oldest first), and its ASERT steady anchor (when `height >= launch_blocks`):
+    /// everything `check_run` needs to check headers that follow it.
+    pub fn header_base(
+        &self,
+        h: &[u8; 32],
+    ) -> Option<(Entry, std::collections::VecDeque<u32>, Option<(u32, i64)>)> {
         let prev = self.index.get(h)?.clone();
+        let steady_anchor = self.steady_anchor_for(&prev);
         let mut times = std::collections::VecDeque::new();
         let mut cur = Some(prev.hash);
         while let Some(x) = cur {
@@ -687,7 +710,7 @@ impl Chain {
             times.push_front(e.time);
             cur = if e.height == 0 { None } else { Some(e.prev) };
         }
-        Some((prev, times))
+        Some((prev, times, steady_anchor))
     }
 
     /// Encoded size of a block this node holds.
@@ -836,8 +859,8 @@ impl Chain {
     /// 80 bytes a block, before downloading the blocks.
     pub fn check_headers(&self, hs: &[Block]) -> Result<(U256, u32), String> {
         let first = hs.first().ok_or("no headers")?;
-        let (prev, times) = self.header_base(&first.header.prev).ok_or("unknown parent")?;
-        let (tip, _) = check_run(&self.params, prev, times, hs, now())?;
+        let (prev, times, steady_anchor) = self.header_base(&first.header.prev).ok_or("unknown parent")?;
+        let (tip, _, _) = check_run(&self.params, prev, times, steady_anchor, hs, now())?;
         Ok((tip.work, tip.height))
     }
 

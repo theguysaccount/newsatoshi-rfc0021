@@ -110,7 +110,13 @@ impl BaseElement {
         let z = (s_hi << 32) - s_hi;
         let (res, over) = s_lo.overflowing_add(z);
 
-        BaseElement::from_mont(res.wrapping_add(0u32.wrapping_sub(over as u32) as u64))
+        // NEWSATOSHI patch: upstream `mul_small` left `r` unreduced in `[M, 2^64 - 1]`
+        // (probability ~2^-32 per call, e.g. `0x24924924_92492492 * 7 = 0xffffffff_fffffffe`),
+        // breaking `BaseElement`'s `< M` invariant and causing `M - rhs.0` underflow in `Add`.
+        let r = res.wrapping_add(0u32.wrapping_sub(over as u32) as u64);
+        let (r_sub, borrow) = r.overflowing_sub(M);
+        let mask = 0u64.wrapping_sub(borrow as u64);
+        BaseElement::from_mont((r & mask) | (r_sub & !mask))
     }
 }
 
@@ -131,9 +137,12 @@ impl FieldElement for BaseElement {
 
     #[inline]
     fn double(self) -> Self {
-        let ret = (self.0 as u128) << 1;
-        let (result, over) = (ret as u64, (ret >> 64) as u64);
-        Self(result.wrapping_sub(M * over))
+        // NEWSATOSHI patch: upstream `((self.0 as u128) << 1)` only subtracted `M` when bit 64
+        // overflowed, returning non-canonical values in `[M + 1, 2^64 - 2]` whenever
+        // `self.0 ∈ [0x7fffffff_80000001, 0x7fffffff_ffffffff]` (probability 2^-33 per call),
+        // which then underflowed `M - rhs.0` in `Add`. `self + self` is branchless, constant-time,
+        // and strictly canonical in `[0, M)`.
+        self + self
     }
 
     #[inline]

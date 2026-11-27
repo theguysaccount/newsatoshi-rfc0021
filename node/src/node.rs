@@ -451,7 +451,8 @@ impl Msg {
         Self::decode_payload(h[4], &buf, max_block)
     }
 
-    /// Read one message from an `NSPQ1` post-quantum ML-KEM-768 encrypted stream.
+    /// Read one message from an `NSPQ1`/`NSPQ2` post-quantum ML-KEM-768 encrypted stream
+    /// using chunked paced reads (zero up-front 16 MB slowloris allocation).
     pub fn read_asked_pq(
         s: &mut TcpStream,
         pq_rx: &mut crate::pq_transport::PqReceiver,
@@ -461,10 +462,8 @@ impl Msg {
         blocks: bool,
         headers: bool,
     ) -> Result<Msg, String> {
-        s.set_read_timeout(wait).ok();
         let cap = (Self::cap(2, max_block) + 9).min(crate::pq_transport::MAX_ENCRYPTED_FRAME_BYTES);
-        let raw = pq_rx.read_frame(s, cap)?;
-        s.set_read_timeout(None).ok();
+        let raw = pq_rx.read_frame_paced(s, cap, wait, MIN_BYTES_PER_SEC)?;
         if raw.len() < 9 {
             return Err("truncated PQ P2P frame".into());
         }
@@ -644,6 +643,8 @@ pub struct Node {
     pub listen_port: Option<u16>,
     pub external: String,
     nonce: u64,
+    /// Optional NIST FIPS 205 `SLH-DSA-SHA2-128s` identity key for `NSPQ2` authenticated peer pinning.
+    pub p2p_identity: Option<Arc<crate::job::JobKey>>,
     /// The highest valid header a peer has shown, for reporting sync progress.
     pub best_header: u32,
 }
@@ -676,6 +677,7 @@ impl Node {
             listen_port: None,
             external: String::new(),
             nonce: rand::thread_rng().gen(),
+            p2p_identity: None,
             best_header: 0,
         };
         n.pool_state = n.fresh_pool_state();
@@ -747,11 +749,19 @@ impl Node {
                 spend::verify_bytes_cached(&params.proof, &sp.public()?, &sp.proof)
             }
             Tx::BatchSpend(bs) => {
+                let burn_active = params.homeostatic_burn_from.is_some();
                 let total_fee = bs.total_fee()?;
-                if total_fee < min_relay_fee(size) {
+                let floor = min_relay_fee(size);
+                if total_fee < floor {
                     return Err(format!(
-                        "batch fee {total_fee} below the minimum relay fee {} for {size} bytes",
-                        min_relay_fee(size)
+                        "batch fee {total_fee} below the minimum relay fee {floor} for {size} bytes"
+                    ));
+                }
+                let (_, _, miner_fee) = bs.fee_split(burn_active)?;
+                let (_, min_miner_fee) = crate::params::split_spend_fee(floor, burn_active);
+                if miner_fee < min_miner_fee {
+                    return Err(format!(
+                        "batch miner fee {miner_fee} below the minimum relay fee {min_miner_fee} for {size} bytes"
                     ));
                 }
                 crate::batch_spend::verify_batch_bytes_cached(&params.proof, &bs.public()?, &bs.proof)
@@ -802,9 +812,10 @@ impl Node {
             return Ok(false);
         }
         let size = tx.to_bytes().len();
+        let burn_active = self.chain.params.homeostatic_burn_from.is_some_and(|f| self.next_height() >= f);
         let fee = match &tx {
-            Tx::Spend(s) => s.fee,
-            Tx::BatchSpend(bs) => bs.total_fee().unwrap_or(0),
+            Tx::Spend(s) => crate::params::split_spend_fee(s.fee, burn_active).1,
+            Tx::BatchSpend(bs) => bs.fee_split(burn_active).map(|(_, _, m)| m).unwrap_or(0),
             Tx::Act(crate::job::Action::ChannelClaim { channel, .. })
             | Tx::Act(crate::job::Action::ChannelExpire { channel }) => {
                 self.pool_state.channels.get(channel).map(|c| c.post.claim_fee).unwrap_or(0)
@@ -835,7 +846,10 @@ impl Node {
         }
         let h = self.next_height();
         let applied_fee = self.pool_state.apply_tx(&new.tx, h, &self.chain.params, NO_PROOFS)?;
-        new.fee = applied_fee;
+        new.fee = match &new.tx {
+            Tx::BatchSpend(bs) => applied_fee.saturating_sub(bs.prover_fee),
+            _ => applied_fee,
+        };
         self.seq += 1;
         self.pool_bytes += size;
         self.pool.push(new);
@@ -857,7 +871,10 @@ impl Node {
         self.pool_bytes = 0;
         for mut e in old {
             if let Ok(applied_fee) = st.apply_tx(&e.tx, h, &self.chain.params, NO_PROOFS) {
-                e.fee = applied_fee;
+                e.fee = match &e.tx {
+                    Tx::BatchSpend(bs) => applied_fee.saturating_sub(bs.prover_fee),
+                    _ => applied_fee,
+                };
                 self.pool_bytes += e.size;
                 self.pool.push(e);
             }
@@ -974,7 +991,7 @@ fn prewarm(shared: &Shared, blocks: &[Block]) {
         let Some(base) = n.chain.header_base(&first.header.prev) else { return };
         (n.chain.params.clone(), base, n.chain.tip().work)
     };
-    let (mut prev, mut times) = base;
+    let (mut prev, mut times, mut steady_anchor) = base;
     let now = crate::chain::now();
     enum ProofJob<'a> {
         Single(spend::SpendPublic, &'a [u8]),
@@ -982,10 +999,11 @@ fn prewarm(shared: &Shared, blocks: &[Block]) {
     }
     let mut jobs: Vec<ProofJob<'_>> = Vec::new();
     for b in blocks {
-        match crate::chain::check_run(&params, prev, times, std::slice::from_ref(b), now) {
-            Ok((e, t)) => {
+        match crate::chain::check_run(&params, prev, times, steady_anchor, std::slice::from_ref(b), now) {
+            Ok((e, t, sa)) => {
                 prev = e;
                 times = t;
+                steady_anchor = sa;
             }
             Err(_) => return,
         }
@@ -1062,7 +1080,23 @@ struct HeaderRun {
     fork: [u8; 32],
     last: crate::chain::Entry,
     times: std::collections::VecDeque<u32>,
+    steady_anchor: Option<(u32, i64)>,
     hashes: Vec<[u8; 32]>,
+}
+
+/// Parse an optional pinned peer specification `HOST:PORT@<64hex_slh_dsa_vk>`.
+pub fn parse_peer_pin(spec: &str) -> Result<(&str, Option<[u8; 32]>), String> {
+    match spec.split_once('@') {
+        None => Ok((spec, None)),
+        Some((addr, vk_hex)) => {
+            let raw = hex::decode(vk_hex.trim())
+                .map_err(|_| "pinned peer SLH-DSA key must be 64 hex characters".to_string())?;
+            let vk: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| "pinned peer SLH-DSA key must be 32 bytes (64 hex chars)".to_string())?;
+            Ok((addr, Some(vk)))
+        }
+    }
 }
 
 /// What a block that failed costs the peer that sent it. Nothing, where honest nodes can
@@ -1080,22 +1114,37 @@ fn block_penalty(e: &str) -> u32 {
 fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String>, inbound: bool, counted: Option<IpAddr>) {
     let _slot = PeerSlot { inbound, counted };
     let remote = s.peer_addr().ok();
-    let (magic, max_block, params) = {
+    let (magic, max_block, params, p2p_identity) = {
         let n = lock(&shared);
-        (n.magic(), n.chain.params.max_block_bytes, n.chain.params.clone())
+        (
+            n.magic(),
+            n.chain.params.max_block_bytes,
+            n.chain.params.clone(),
+            n.p2p_identity.clone(),
+        )
     };
-    // Post-Quantum `NSPQ1` ML-KEM-768 P2P transport negotiation:
-    // - When `params.pq_transport` is true (Mainnet v2): mandatory NIST FIPS 203 ML-KEM-768
-    //   `NSPQ1` handshake on every link (outbound initiates, inbound responds; plaintext rejected).
-    // - When `params.pq_transport` is false (v0.1.0 compatibility): immediate plaintext framing.
+    let pinned_vk = dialled
+        .as_deref()
+        .and_then(|d| parse_peer_pin(d).ok())
+        .and_then(|(_, vk)| vk);
+    // Post-Quantum `NSPQ1`/`NSPQ2` ML-KEM-768 (+ optional SLH-DSA-SHA2-128s pinning) P2P negotiation:
     let (mut pq_tx, mut pq_rx) = if params.pq_transport {
         let hs_timeout = Duration::from_millis(HANDSHAKE_MS.load(Ordering::SeqCst));
         s.set_read_timeout(Some(hs_timeout)).ok();
         s.set_write_timeout(Some(hs_timeout)).ok();
         let res = if !inbound {
-            crate::pq_transport::PqSession::handshake_initiator(&mut s, magic)
+            if let Some(ref vk) = pinned_vk {
+                crate::pq_transport::PqSession::handshake_initiator_pinned(&mut s, magic, vk)
+            } else {
+                crate::pq_transport::PqSession::handshake_initiator(&mut s, magic)
+            }
         } else {
-            crate::pq_transport::PqSession::handshake_responder(&mut s, magic)
+            crate::pq_transport::PqSession::handshake_responder_auto(
+                &mut s,
+                magic,
+                p2p_identity.as_deref(),
+            )
+            .map(|(sess, _)| sess)
         };
         s.set_read_timeout(None).ok();
         s.set_write_timeout(None).ok();
@@ -1262,15 +1311,17 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
                 let mut n = lock(&shared);
                 // these continue the run this peer was showing, or start at a block this
                 // node has
-                let (prev, times, fork, mut hashes) = match run.take() {
-                    Some(r) if r.last.hash == first.header.prev => (r.last, r.times, r.fork, r.hashes),
+                let (prev, times, steady_anchor, fork, mut hashes) = match run.take() {
+                    Some(r) if r.last.hash == first.header.prev => {
+                        (r.last, r.times, r.steady_anchor, r.fork, r.hashes)
+                    }
                     _ => match n.chain.header_base(&first.header.prev) {
-                        Some((e, t)) => (e, t, first.header.prev, vec![]),
+                        Some((e, t, sa)) => (e, t, sa, first.header.prev, vec![]),
                         None => continue,
                     },
                 };
-                match crate::chain::check_run(&n.chain.params, prev, times, &hs, crate::chain::now()) {
-                    Ok((last, times)) => {
+                match crate::chain::check_run(&n.chain.params, prev, times, steady_anchor, &hs, crate::chain::now()) {
+                    Ok((last, times, steady_anchor)) => {
                         hashes.extend(hs.iter().map(|b| b.hash()));
                         if last.work > n.chain.tip().work {
                             // heavier than ours: fetch its blocks, which are kept as they
@@ -1284,7 +1335,7 @@ fn handle_peer(shared: Shared, mut s: TcpStream, id: u64, dialled: Option<String
                             // not yet heavier: ask for the headers that follow
                             n.send(id, &Msg::GetHeaders { locator: vec![last.hash] });
                             asked_headers = true;
-                            run = Some(HeaderRun { fork, last, times, hashes });
+                            run = Some(HeaderRun { fork, last, times, steady_anchor, hashes });
                         }
                     }
                     Err(e) => {
@@ -1551,11 +1602,12 @@ pub fn connect(shared: Shared, addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Stay connected to `addr`: connect, serve the connection until it drops, wait, repeat.
-/// A peer that is down at start, or restarts, is picked up again without a restart here.
+/// Stay connected to `addr` (supports optional `@<64hex_slh_dsa_vk>` `NSPQ2` peer pinning):
+/// connect, serve the connection until it drops, wait, repeat.
 pub fn keep_connected(shared: Shared, addr: String) {
     thread::spawn(move || loop {
-        if let Ok(s) = TcpStream::connect(&addr) {
+        let tcp_addr = parse_peer_pin(&addr).map(|(h, _)| h).unwrap_or(addr.as_str());
+        if let Ok(s) = TcpStream::connect(tcp_addr) {
             PEERS.fetch_add(1, Ordering::SeqCst);
             let id = rand::thread_rng().gen();
             lock(&shared).outbound.insert(addr.clone());

@@ -11,8 +11,7 @@ use crate::merkmap::MerkleMap;
 use crate::nftree::NfTree;
 use crate::note::{self, NoteTree, MAX_NOTE_VALUE};
 use crate::params::{
-    prover_subsidy_share, split_spend_fee, subsidy, Params, MAX_COINBASE_EXTRA, MAX_MEMO,
-    MIN_BATCH_SPEND_FEE,
+    split_spend_fee, subsidy, Params, MAX_COINBASE_EXTRA, MAX_MEMO, MIN_BATCH_SPEND_FEE,
 };
 use crate::prior::{self, PriorEnd, PriorLock};
 use crate::spend;
@@ -38,6 +37,8 @@ pub struct State {
     pub jobs: BTreeMap<[u8; 32], Job>,
     /// Open hash- and time-locked payments. A lock leaves this map when it is claimed or refunded.
     pub locks: BTreeMap<[u8; 32], Lock>,
+    /// Mainnet v2 $O(\log N)$ Merkle root over open locks (`Params::merkle_locks_conds_from`).
+    pub locks_merkle: MerkleMap,
     /// Coinbase outputs wait here until they mature, then join the note tree.
     pub pending_coinbase: VecDeque<(u32, Vec<PlainOut>)>,
     pub issued: u128,
@@ -48,6 +49,10 @@ pub struct State {
     pub lock_ends: HashMap<[u8; 32], LockEnd>,
     /// Coins under conditions (`crate::cond`), and how the finished ones ended.
     pub conds: BTreeMap<[u8; 32], Cond>,
+    /// Mainnet v2 $O(\log N)$ Merkle root over open conditions (`Params::merkle_locks_conds_from`).
+    pub conds_merkle: MerkleMap,
+    /// Whether `digest_parts()` commits to `locks_merkle` / `conds_merkle` ($O(1)$ per block).
+    pub merkle_locks_conds: bool,
     pub cond_ends: HashMap<[u8; 32], CondEnd>,
     pub locks_by_hash: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// RFC-0022: Open unilateral partial-claim PayWord payment channels (`crate::channel`).
@@ -83,33 +88,24 @@ impl Default for State {
     }
 }
 
-/// Compute mandatory consensus split-coinbase payouts to `BatchSpend` provers for a block at
-/// height `h` containing `txs`. Returns `(prover_a_pk, min_required_payout)` sorted by address.
-/// Returns empty when `batch_spend_from` is inactive or no `Tx::BatchSpend` is included.
+/// Compute mandatory consensus coinbase payouts to `BatchSpend` provers for a block at
+/// height `h` containing `txs`. Returns `(prover_a_pk, min_required_prover_fee)` sorted by address.
+/// Strictly incentive-compatible: paid exclusively from each batch's unburned fee budget
+/// (`bs.prover_fee <= net_fee`); the AuxPoW miner always keeps 100% of `subsidy(h)` + `miner_fee`.
 pub fn required_prover_payouts(h: u32, txs: &[Tx], params: &Params) -> Vec<(Word8, u64)> {
     if h == 0 || !params.batch_spend_from.is_some_and(|f| h >= f) {
         return vec![];
     }
-    let mut counts: BTreeMap<Word8, u64> = BTreeMap::new();
-    let mut total: u64 = 0;
+    let mut payouts: BTreeMap<Word8, u64> = BTreeMap::new();
     for tx in txs {
         if let Tx::BatchSpend(bs) = tx {
-            let k = bs.spends.len() as u64;
-            *counts.entry(bs.prover_a_pk).or_insert(0) += k;
-            total = total.saturating_add(k);
+            if bs.prover_fee > 0 {
+                let entry = payouts.entry(bs.prover_a_pk).or_insert(0);
+                *entry = entry.saturating_add(bs.prover_fee);
+            }
         }
     }
-    if total < 2 {
-        return vec![];
-    }
-    let total_share = prover_subsidy_share(subsidy(h), total);
-    counts
-        .into_iter()
-        .filter_map(|(a_pk, c)| {
-            let req = ((total_share as u128 * c as u128) / total as u128) as u64;
-            (req > 0).then_some((a_pk, req))
-        })
-        .collect()
+    payouts.into_iter().collect()
 }
 
 struct PendingSpendEffects {
@@ -137,6 +133,7 @@ impl State {
             nf_acc: [0u8; 32],
             jobs: BTreeMap::new(),
             locks: BTreeMap::new(),
+            locks_merkle: MerkleMap::new(),
             pending_coinbase: VecDeque::new(),
             issued: 0,
             burned: 0,
@@ -144,6 +141,8 @@ impl State {
             public_notes: HashMap::new(),
             lock_ends: HashMap::new(),
             conds: BTreeMap::new(),
+            conds_merkle: MerkleMap::new(),
+            merkle_locks_conds: false,
             cond_ends: HashMap::new(),
             locks_by_hash: HashMap::new(),
             channels: imbl::OrdMap::new(),
@@ -181,20 +180,28 @@ impl State {
             }
         }
         let locks = (!self.locks.is_empty()).then(|| {
-            let mut lw = Writer::new();
-            lw.raw(b"nsLOCKS");
-            for l in self.locks.values() {
-                l.encode(&mut lw);
+            if self.merkle_locks_conds {
+                self.locks_merkle.root()
+            } else {
+                let mut lw = Writer::new();
+                lw.raw(b"nsLOCKS");
+                for l in self.locks.values() {
+                    l.encode(&mut lw);
+                }
+                sha256(&lw.0)
             }
-            sha256(&lw.0)
         });
         let conds = (!self.conds.is_empty()).then(|| {
-            let mut cw = Writer::new();
-            cw.raw(b"nsCONDS");
-            for c in self.conds.values() {
-                c.encode(&mut cw);
+            if self.merkle_locks_conds {
+                self.conds_merkle.root()
+            } else {
+                let mut cw = Writer::new();
+                cw.raw(b"nsCONDS");
+                for c in self.conds.values() {
+                    c.encode(&mut cw);
+                }
+                sha256(&cw.0)
             }
-            sha256(&cw.0)
         });
         let channels = (!self.channels.is_empty()).then(|| self.channels_merkle.root());
         let priors = (!self.priors.is_empty()).then(|| self.priors_merkle.root());
@@ -288,6 +295,9 @@ impl State {
         let first_nf = if dummy[0] { nf[1] } else { nf[0] };
         let job_after = match deposit {
             Some(Deposit::Post(p)) => {
+                if !params.legacy_jobs_enabled {
+                    return Err("legacy matrix-product jobs are disabled on this network".into());
+                }
                 job::check_post(p, h)?;
                 let id = job::job_id(p, &first_nf);
                 if self.jobs.contains_key(&id) {
@@ -296,6 +306,9 @@ impl State {
                 Some(Job { id, post: p.clone(), posted_at: h, phase: Phase::Open })
             }
             Some(Deposit::Claim(c)) => {
+                if !params.legacy_jobs_enabled {
+                    return Err("legacy matrix-product jobs are disabled on this network".into());
+                }
                 let mut j = self.jobs.get(&c.job).ok_or("unknown job")?.clone();
                 job::apply_claim(&mut j, c, h)?;
                 Some(j)
@@ -360,7 +373,7 @@ impl State {
                 }
                 prior::check_post(p, h)?;
                 let id = prior::prior_id(p, &first_nf);
-                if self.priors.contains_key(&id) || self.prior_ends.contains_key(&id) {
+                if self.priors.contains_key(&id) {
                     return Err("duplicate prior".into());
                 }
                 Some(PriorLock {
@@ -410,9 +423,11 @@ impl State {
         }
         if let Some(l) = fx.lock_after {
             self.locks_by_hash.entry(l.post.hash).or_default().push(l.id);
+            self.locks_merkle.insert(l.id, l.value_hash());
             self.locks.insert(l.id, l);
         }
         if let Some(c) = fx.cond_after {
+            self.conds_merkle.insert(c.id, c.value_hash());
             self.conds.insert(c.id, c);
         }
         for ch in fx.channels_after {
@@ -475,6 +490,9 @@ impl State {
                 if bs.proof.len() > MAX_BATCH_PROOF_BYTES {
                     return Err("batch proof too large".into());
                 }
+                if bs.prover_fee >= spend::MAX_VALUE_BALANCE {
+                    return Err("batch prover_fee out of range".into());
+                }
                 for (idx, item) in bs.spends.iter().enumerate() {
                     if item.fee < MIN_BATCH_SPEND_FEE {
                         return Err(format!(
@@ -483,6 +501,9 @@ impl State {
                         ));
                     }
                 }
+                // Enforce strictly incentive-compatible fee split (`prover_fee <= net_fee` so
+                // AuxPoW miners NEVER lose a single satoshi of block subsidy!).
+                let (_, _, _) = bs.fee_split(burn_active)?;
                 let pi = bs.public()?;
                 // Apply sequentially onto a scratch clone so intra-batch double spends or
                 // duplicate deposits are caught atomically before mutating `self`.
@@ -512,6 +533,12 @@ impl State {
                         .checked_add(pf)
                         .ok_or("batch producer fee overflow")?;
                 }
+                if bs.prover_fee > producer_fees {
+                    return Err(format!(
+                        "batch prover_fee {} exceeds unburned net fee {producer_fees}",
+                        bs.prover_fee
+                    ));
+                }
                 if checks.verify_proofs {
                     batch_spend::verify_batch_bytes_cached(&params.proof, &pi, &bs.proof)
                         .map_err(|e| format!("batch proof rejected: {e}"))?;
@@ -524,6 +551,7 @@ impl State {
                 let p = lock::unlock(l, preimage, h)?;
                 self.pay_out(&[p], 0)?;
                 let l = self.locks.remove(id).expect("checked above");
+                self.locks_merkle.remove(id);
                 self.lock_ends.insert(*id, LockEnd { lock: l, height: h, preimage: Some(*preimage) });
                 Ok(0)
             }
@@ -531,6 +559,7 @@ impl State {
                 let p = cond::expire(&self.conds[id], h)?;
                 self.pay_out(&[p], 0)?;
                 let c = self.conds.remove(id).expect("checked above");
+                self.conds_merkle.remove(id);
                 self.cond_ends.insert(*id, CondEnd { cond: c, height: h, fulfilled: None });
                 Ok(0)
             }
@@ -539,6 +568,7 @@ impl State {
                 let p = cond::fulfil(c, *payout, salt, program, witness, h)?;
                 self.pay_out(&[p], 0)?;
                 let c = self.conds.remove(id).expect("checked above");
+                self.conds_merkle.remove(id);
                 self.cond_ends.insert(*id, CondEnd { cond: c, height: h, fulfilled: Some((*payout, program.clone())) });
                 Ok(0)
             }
@@ -547,6 +577,7 @@ impl State {
                 let p = lock::expire(l, h)?;
                 self.pay_out(&[p], 0)?;
                 let l = self.locks.remove(id).expect("checked above");
+                self.locks_merkle.remove(id);
                 self.lock_ends.insert(*id, LockEnd { lock: l, height: h, preimage: None });
                 Ok(0)
             }
@@ -699,6 +730,9 @@ impl State {
                 Ok(eff.miner_fee)
             }
             Tx::Act(a) => {
+                if !params.legacy_jobs_enabled {
+                    return Err("legacy matrix-product jobs are disabled on this network".into());
+                }
                 let mut j = self.jobs.get(a.job()).ok_or("unknown job")?.clone();
                 let fx = job::apply_action(&mut j, a, h)?;
                 self.pay_out(&fx.payouts, fx.burned)?;
@@ -760,6 +794,7 @@ impl State {
         let mut s = self.clone();
         s.nf_committed = params.nf_tree_from.is_some_and(|f| h >= f);
         s.mmr_committed = params.mmr_from.is_some_and(|f| h >= f);
+        s.merkle_locks_conds = params.merkle_locks_conds_from.is_some_and(|f| h >= f);
         if s.mmr_committed && !genesis {
             if let Some(prev_hd) = s.last_header {
                 s.header_mmr

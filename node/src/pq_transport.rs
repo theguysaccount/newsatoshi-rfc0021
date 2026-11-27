@@ -1,30 +1,35 @@
-//! Opportunistic Post-Quantum Encrypted P2P Transport (`NSPQ1`: ML-KEM-768 + SHA-256 AEAD).
+//! Post-Quantum Encrypted & Optionally Authenticated P2P Transport (`NSPQ1` & `NSPQ2`).
 //!
-//! Threat model (honest scope — matches Bitcoin Core BIP-324's opportunistic model, upgraded
-//! to post-quantum key exchange):
-//! - **What it protects against:** Passive traffic eavesdropping and Harvest-Now-Decrypt-Later
-//!   (HNDL) quantum traffic capture, plus in-session frame tampering/replay/reordering via
-//!   per-direction Encrypt-then-MAC keys and monotonic 64-bit sequence numbers.
-//! - **What it does NOT protect against by itself:** Active man-in-the-middle (MITM) attacks on
-//!   unauthenticated peer connections. Because the ML-KEM-768 handshake is ephemeral and peers
-//!   are not identity-pinned, preventing active MITM requires out-of-band peer key pinning or
-//!   consensus-level validation (which always verifies PoW + STARKs independently of transport).
-//! - **Wire & Crypto:** Ephemeral NIST FIPS 203 `ML-KEM-768` (1,184-byte EK, 1,088-byte CT),
-//!   bound to network `magic` + both 32-byte nonces (`sha256("NSPQ1-KDF" || ...)`), followed by
-//!   SHA-256-CTR + Encrypt-then-MAC keyed SHA-256 with constant-time tag comparison.
-//!   Wired live into `node::handle_peer` and `node::submit_with_pq` when `params.pq_transport = true`.
+//! Two seamlessly interoperable modes on one TCP port:
+//! 1. **`NSPQ1` (Opportunistic ML-KEM-768 + SHA-256 AEAD):**
+//!    Zero-config protection against passive traffic eavesdropping and Harvest-Now-Decrypt-Later
+//!    (HNDL) quantum traffic capture, plus in-session frame tampering/replay/reordering defense.
+//! 2. **`NSPQ2` (Authenticated ML-KEM-768 + NIST FIPS 205 `SLH-DSA-SHA2-128s` Peer Pinning):**
+//!    When an operator pins a peer's 32-byte `SLH-DSA-SHA2-128s` verifying key
+//!    (`--peer HOST:PORT@<64hex_vk>`), the responder signs the ML-KEM session transcript with
+//!    its persistent post-quantum identity key — defeating **active man-in-the-middle (MITM)**
+//!    attacks with 100% pure-hash / lattice post-quantum cryptography!
+//!
+//! Frame reads allocate incrementally in 64 KB chunks with per-chunk pacing deadlines so a hostile
+//! peer declaring a 16 MB frame length cannot trigger up-front memory exhaustion (slowloris OOM).
 
 use crate::hash::sha256;
 use ::kem::Decapsulate;
 use ml_kem::{EncapsulateDeterministic, EncodedSizeUser, KemCore, MlKem768, B32};
 use rand::RngCore;
 use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 pub const HANDSHAKE_MAGIC: &[u8; 5] = b"NSPQ1";
+/// Authenticated post-quantum handshake magic (ML-KEM-768 + SLH-DSA-SHA2-128s peer identity proof).
+pub const HANDSHAKE_AUTH_MAGIC: &[u8; 5] = b"NSPQ2";
 pub const EK_BYTES: usize = 1184;
 pub const CT_BYTES: usize = 1088;
 pub const TAG_BYTES: usize = 32;
 pub const MAX_ENCRYPTED_FRAME_BYTES: usize = 16 << 20;
+pub const MAX_AUTH_SIG_BYTES: usize = 8_192;
+const FRAME_CHUNK_BYTES: usize = 64 * 1024;
 
 type Dk = <MlKem768 as KemCore>::DecapsulationKey;
 type Ek = <MlKem768 as KemCore>::EncapsulationKey;
@@ -172,11 +177,9 @@ impl PqSession {
         }
     }
 
-    /// Initiator handshake: generates an ephemeral ML-KEM-768 keypair, sends
-    /// `NSPQ1 || magic(4) || init_nonce(32) || ek(1184)`, receives
-    /// `NSPQ1 || magic(4) || resp_nonce(32) || ct(1088)`, and decapsulates the shared secret.
-    pub fn handshake_initiator<S: Read + Write>(
+    fn handshake_initiator_with_magic<S: Read + Write>(
         stream: &mut S,
+        hs_magic: &[u8; 5],
         magic: [u8; 4],
     ) -> Result<Self, String> {
         let mut rng = rand::thread_rng();
@@ -190,7 +193,7 @@ impl PqSession {
         let (dk, ek): (Dk, Ek) = MlKem768::generate_deterministic(&B32::from(d), &B32::from(z));
         let ek_bytes = ek.as_bytes();
         let mut hello = Vec::with_capacity(5 + 4 + 32 + EK_BYTES);
-        hello.extend_from_slice(HANDSHAKE_MAGIC);
+        hello.extend_from_slice(hs_magic);
         hello.extend_from_slice(&magic);
         hello.extend_from_slice(&init_nonce);
         hello.extend_from_slice(ek_bytes.as_slice());
@@ -201,8 +204,8 @@ impl PqSession {
         stream
             .read_exact(&mut resp)
             .map_err(|e| format!("PQ resp read: {e}"))?;
-        if &resp[0..5] != HANDSHAKE_MAGIC || resp[5..9] != magic {
-            return Err("NSPQ1 responder magic mismatch".into());
+        if &resp[0..5] != hs_magic || resp[5..9] != magic {
+            return Err("NSPQ responder magic mismatch".into());
         }
         let resp_nonce: [u8; 32] = resp[9..41].try_into().unwrap();
         let ct_slice = &resp[41..41 + CT_BYTES];
@@ -223,21 +226,56 @@ impl PqSession {
         Ok(Self::from_master(master, true))
     }
 
-    /// Responder handshake: reads initiator's ephemeral ML-KEM-768 encapsulation key, encapsulates
-    /// fresh shared randomness, replies with `NSPQ1 || magic(4) || resp_nonce(32) || ct(1088)`.
-    pub fn handshake_responder<S: Read + Write>(
+    /// Opportunistic initiator handshake (`NSPQ1`, zero-config HNDL defense).
+    pub fn handshake_initiator<S: Read + Write>(
         stream: &mut S,
         magic: [u8; 4],
     ) -> Result<Self, String> {
-        let mut req = vec![0u8; 5 + 4 + 32 + EK_BYTES];
+        Self::handshake_initiator_with_magic(stream, HANDSHAKE_MAGIC, magic)
+    }
+
+    /// Authenticated initiator handshake (`NSPQ2`): runs ephemeral ML-KEM-768 and then verifies
+    /// the responder's NIST FIPS 205 `SLH-DSA-SHA2-128s` signature over the exact session
+    /// transcript against `expected_peer_vk` — defeating active MITM attacks!
+    pub fn handshake_initiator_pinned<S: Read + Write>(
+        stream: &mut S,
+        magic: [u8; 4],
+        expected_peer_vk: &[u8; 32],
+    ) -> Result<Self, String> {
+        let sess = Self::handshake_initiator_with_magic(stream, HANDSHAKE_AUTH_MAGIC, magic)?;
+        let mut len_buf = [0u8; 2];
         stream
-            .read_exact(&mut req)
-            .map_err(|e| format!("PQ req read: {e}"))?;
-        if &req[0..5] != HANDSHAKE_MAGIC || req[5..9] != magic {
-            return Err("NSPQ1 initiator magic mismatch".into());
+            .read_exact(&mut len_buf)
+            .map_err(|e| format!("NSPQ2 sig len read: {e}"))?;
+        let sig_len = u16::from_le_bytes(len_buf) as usize;
+        if sig_len == 0 || sig_len > MAX_AUTH_SIG_BYTES {
+            return Err("NSPQ2 peer signature length out of range".into());
         }
-        let init_nonce: [u8; 32] = req[9..41].try_into().unwrap();
-        let ek_slice = &req[41..41 + EK_BYTES];
+        let mut sig = vec![0u8; sig_len];
+        stream
+            .read_exact(&mut sig)
+            .map_err(|e| format!("NSPQ2 sig read: {e}"))?;
+        let auth_msg = auth_transcript_message(magic, &sess.session_id);
+        if !crate::job::verify_sig(expected_peer_vk, &auth_msg, &sig) {
+            return Err("NSPQ2 peer SLH-DSA authentication failed (active MITM or wrong pinned key)".into());
+        }
+        Ok(sess)
+    }
+
+    fn handshake_responder_body<S: Read + Write>(
+        stream: &mut S,
+        hs_magic: &[u8; 5],
+        magic: [u8; 4],
+    ) -> Result<Self, String> {
+        let mut rest = vec![0u8; 4 + 32 + EK_BYTES];
+        stream
+            .read_exact(&mut rest)
+            .map_err(|e| format!("PQ req read: {e}"))?;
+        if rest[0..4] != magic {
+            return Err("NSPQ initiator network magic mismatch".into());
+        }
+        let init_nonce: [u8; 32] = rest[4..36].try_into().unwrap();
+        let ek_slice = &rest[36..36 + EK_BYTES];
         let ek = Ek::from_bytes(
             ek_slice
                 .try_into()
@@ -254,7 +292,7 @@ impl PqSession {
             .encapsulate_deterministic(&B32::from(m))
             .map_err(|_| "ML-KEM-768 encapsulation failed")?;
         let mut reply = Vec::with_capacity(5 + 4 + 32 + CT_BYTES);
-        reply.extend_from_slice(HANDSHAKE_MAGIC);
+        reply.extend_from_slice(hs_magic);
         reply.extend_from_slice(&magic);
         reply.extend_from_slice(&resp_nonce);
         reply.extend_from_slice(ct.as_slice());
@@ -274,6 +312,50 @@ impl PqSession {
         Ok(Self::from_master(master, false))
     }
 
+    /// Opportunistic responder handshake (`NSPQ1`).
+    pub fn handshake_responder<S: Read + Write>(
+        stream: &mut S,
+        magic: [u8; 4],
+    ) -> Result<Self, String> {
+        let (sess, _) = Self::handshake_responder_auto(stream, magic, None)?;
+        Ok(sess)
+    }
+
+    /// Auto-negotiating responder handshake: accepts both opportunistic `NSPQ1` and pinned
+    /// `NSPQ2` (signing the session transcript with `node_identity` when `NSPQ2` is requested).
+    /// Returns `(session, authenticated)`.
+    pub fn handshake_responder_auto<S: Read + Write>(
+        stream: &mut S,
+        magic: [u8; 4],
+        node_identity: Option<&crate::job::JobKey>,
+    ) -> Result<(Self, bool), String> {
+        let mut hdr = [0u8; 5];
+        stream
+            .read_exact(&mut hdr)
+            .map_err(|e| format!("PQ magic read: {e}"))?;
+        if &hdr == HANDSHAKE_MAGIC {
+            let sess = Self::handshake_responder_body(stream, HANDSHAKE_MAGIC, magic)?;
+            Ok((sess, false))
+        } else if &hdr == HANDSHAKE_AUTH_MAGIC {
+            let key = node_identity
+                .ok_or_else(|| "NSPQ2 requested but node has no SLH-DSA identity key".to_string())?;
+            let sess = Self::handshake_responder_body(stream, HANDSHAKE_AUTH_MAGIC, magic)?;
+            let auth_msg = auth_transcript_message(magic, &sess.session_id);
+            let sig = key.sign(&auth_msg);
+            if sig.len() > MAX_AUTH_SIG_BYTES {
+                return Err("SLH-DSA signature exceeds MAX_AUTH_SIG_BYTES".into());
+            }
+            stream
+                .write_all(&(sig.len() as u16).to_le_bytes())
+                .and_then(|_| stream.write_all(&sig))
+                .and_then(|_| stream.flush())
+                .map_err(|e| format!("NSPQ2 sig write: {e}"))?;
+            Ok((sess, true))
+        } else {
+            Err("unknown PQ handshake magic (plaintext rejected)".into())
+        }
+    }
+
     pub fn seal_frame(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
         self.send.seal_frame(plaintext)
     }
@@ -283,21 +365,9 @@ impl PqSession {
         w.write_all(&frame).map_err(|e| format!("PQ write frame: {e}"))
     }
 
+    /// Read one encrypted frame incrementally in 64 KB chunks (zero up-front 16 MB slowloris alloc!).
     pub fn read_frame<R: Read>(&mut self, r: &mut R, max_bytes: usize) -> Result<Vec<u8>, String> {
-        let mut len_buf = [0u8; 4];
-        r.read_exact(&mut len_buf)
-            .map_err(|e| format!("PQ read len: {e}"))?;
-        let n = u32::from_le_bytes(len_buf) as usize;
-        if n > max_bytes.min(MAX_ENCRYPTED_FRAME_BYTES) {
-            return Err("PQ encrypted frame too large".into());
-        }
-        let mut ct = vec![0u8; n];
-        r.read_exact(&mut ct)
-            .map_err(|e| format!("PQ read ct: {e}"))?;
-        let mut tag = [0u8; TAG_BYTES];
-        r.read_exact(&mut tag)
-            .map_err(|e| format!("PQ read tag: {e}"))?;
-        self.recv.open_frame(&ct, &tag)
+        read_frame_chunked(&mut self.recv, r, max_bytes)
     }
 
     pub fn open_raw_frame(&mut self, raw: &[u8]) -> Result<Vec<u8>, String> {
@@ -335,26 +405,114 @@ impl PqSender {
     }
 }
 
-/// Inbound half of an established `NSPQ1` ML-KEM-768 P2P transport session.
+/// Domain-separated transcript digest signed by a responder in `NSPQ2` authenticated mode.
+pub fn auth_transcript_message(magic: [u8; 4], session_id: &[u8; 32]) -> [u8; 32] {
+    let mut buf = [0u8; 10 + 4 + 32];
+    buf[..10].copy_from_slice(b"NSPQ2-AUTH");
+    buf[10..14].copy_from_slice(&magic);
+    buf[14..46].copy_from_slice(session_id);
+    sha256(&buf)
+}
+
+fn read_frame_chunked<R: Read>(
+    recv: &mut CipherHalf,
+    r: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)
+        .map_err(|e| format!("PQ read len: {e}"))?;
+    let n = u32::from_le_bytes(len_buf) as usize;
+    if n > max_bytes.min(MAX_ENCRYPTED_FRAME_BYTES) {
+        return Err("PQ encrypted frame too large".into());
+    }
+    let mut ct = Vec::with_capacity(n.min(FRAME_CHUNK_BYTES));
+    let mut chunk = [0u8; FRAME_CHUNK_BYTES];
+    let mut rem = n;
+    while rem > 0 {
+        let want = rem.min(chunk.len());
+        r.read_exact(&mut chunk[..want])
+            .map_err(|e| format!("PQ read ct: {e}"))?;
+        ct.extend_from_slice(&chunk[..want]);
+        rem -= want;
+    }
+    let mut tag = [0u8; TAG_BYTES];
+    r.read_exact(&mut tag)
+        .map_err(|e| format!("PQ read tag: {e}"))?;
+    recv.open_frame(&ct, &tag)
+}
+
+/// Inbound half of an established `NSPQ1`/`NSPQ2` ML-KEM-768 P2P transport session.
 pub struct PqReceiver {
     recv: CipherHalf,
 }
 
 impl PqReceiver {
     pub fn read_frame<R: Read>(&mut self, r: &mut R, max_bytes: usize) -> Result<Vec<u8>, String> {
+        read_frame_chunked(&mut self.recv, r, max_bytes)
+    }
+
+    /// Paced incremental frame read on a `TcpStream` (defeats slowloris memory & socket holds):
+    /// waits at most `wait` for the 4-byte length header, then enforces a hard overall deadline
+    /// proportional to `n / min_bytes_per_sec` while growing memory in 64 KB chunks.
+    pub fn read_frame_paced(
+        &mut self,
+        s: &mut TcpStream,
+        max_bytes: usize,
+        wait: Option<Duration>,
+        min_bytes_per_sec: usize,
+    ) -> Result<Vec<u8>, String> {
+        s.set_read_timeout(wait).ok();
         let mut len_buf = [0u8; 4];
-        r.read_exact(&mut len_buf)
+        s.read_exact(&mut len_buf)
             .map_err(|e| format!("PQ read len: {e}"))?;
         let n = u32::from_le_bytes(len_buf) as usize;
         if n > max_bytes.min(MAX_ENCRYPTED_FRAME_BYTES) {
+            s.set_read_timeout(None).ok();
             return Err("PQ encrypted frame too large".into());
         }
-        let mut ct = vec![0u8; n];
-        r.read_exact(&mut ct)
-            .map_err(|e| format!("PQ read ct: {e}"))?;
+        let secs = 10 + (n + TAG_BYTES) / min_bytes_per_sec.max(1);
+        let deadline = Instant::now() + Duration::from_secs(secs as u64);
+        let mut ct = Vec::with_capacity(n.min(FRAME_CHUNK_BYTES));
+        let mut chunk = [0u8; FRAME_CHUNK_BYTES];
+        let mut rem = n;
+        while rem > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                s.set_read_timeout(None).ok();
+                return Err("PQ frame too slow".into());
+            }
+            s.set_read_timeout(Some(left)).ok();
+            let want = rem.min(chunk.len());
+            let got = s
+                .read(&mut chunk[..want])
+                .map_err(|e| format!("PQ read ct: {e}"))?;
+            if got == 0 {
+                s.set_read_timeout(None).ok();
+                return Err("PQ connection closed mid-frame".into());
+            }
+            ct.extend_from_slice(&chunk[..got]);
+            rem -= got;
+        }
         let mut tag = [0u8; TAG_BYTES];
-        r.read_exact(&mut tag)
-            .map_err(|e| format!("PQ read tag: {e}"))?;
+        let mut tag_read = 0usize;
+        while tag_read < TAG_BYTES {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                s.set_read_timeout(None).ok();
+                return Err("PQ tag too slow".into());
+            }
+            s.set_read_timeout(Some(left)).ok();
+            let got = s
+                .read(&mut tag[tag_read..])
+                .map_err(|e| format!("PQ read tag: {e}"))?;
+            if got == 0 {
+                s.set_read_timeout(None).ok();
+                return Err("PQ connection closed before tag".into());
+            }
+            tag_read += got;
+        }
+        s.set_read_timeout(None).ok();
         self.recv.open_frame(&ct, &tag)
     }
 }

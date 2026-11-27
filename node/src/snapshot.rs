@@ -33,7 +33,7 @@ use std::path::Path;
 
 pub const SNAPSHOT_FILE: &str = "state.snap";
 pub const SNAPSHOT_INTERVAL: u32 = 50;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP05";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"nsSNAP06";
 const MAX_SNAPSHOT_ITEMS: usize = 10_000_000;
 
 /// Metadata for one active block (heights `1..=tip`) stored inside `blocks.dat`.
@@ -226,8 +226,9 @@ fn encode_state(st: &State, w: &mut Writer) {
         w.u64(e.miner_fee);
     }
 
-    // FlyClient consensus Header MMR commitment + last_header
+    // FlyClient consensus Header MMR commitment + last_header + O(log N) locks/conds mode
     w.bool(st.mmr_committed);
+    w.bool(st.merkle_locks_conds);
     match &st.last_header {
         Some(hd) => {
             w.bool(true).raw(&hd.bytes());
@@ -300,19 +301,23 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         jobs.insert(j.id, j);
     }
 
-    // Open locks
+    // Open locks + canonical MerkleMap
     let n_locks = read_count(r)?;
     let mut locks = BTreeMap::new();
+    let mut locks_merkle = MerkleMap::new();
     for _ in 0..n_locks {
         let l = Lock::decode(r)?;
+        locks_merkle.insert(l.id, l.value_hash());
         locks.insert(l.id, l);
     }
 
-    // Open conditions
+    // Open conditions + canonical MerkleMap
     let n_conds = read_count(r)?;
     let mut conds = BTreeMap::new();
+    let mut conds_merkle = MerkleMap::new();
     for _ in 0..n_conds {
         let c = Cond::decode(r)?;
+        conds_merkle.insert(c.id, c.value_hash());
         conds.insert(c.id, c);
     }
 
@@ -430,8 +435,9 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         prior_ends.insert(id, PriorEnd { prior, height: h, disconfirmed, miner_fee });
     }
 
-    // FlyClient consensus Header MMR + last_header
+    // FlyClient consensus Header MMR + last_header + O(log N) locks/conds mode
     let mmr_committed = r.bool()?;
+    let merkle_locks_conds = r.bool()?;
     let last_header = if r.bool()? {
         Some(crate::tx::Header::from_bytes(&r.arr::<80>()?))
     } else {
@@ -450,6 +456,7 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         nf_acc,
         jobs,
         locks,
+        locks_merkle,
         pending_coinbase,
         issued,
         burned,
@@ -457,6 +464,8 @@ fn decode_state(r: &mut Reader) -> Res<State> {
         public_notes,
         lock_ends,
         conds,
+        conds_merkle,
+        merkle_locks_conds,
         cond_ends,
         locks_by_hash,
         channels,

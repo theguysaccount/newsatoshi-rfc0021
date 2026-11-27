@@ -135,9 +135,9 @@ fn redteam_bip9_auxpow_non_collision_and_asert_bounds() {
     assert!(!signal::signals_bit(0xffff_ffff, 8));
 
     let lim = 0x1d00ffffu32;
-    let b_far_future = asert_bits_staged(lim, 0, 2016, 3600, None, 10, 10_000_000_000, 172_800, lim, TARGET_SPACING);
+    let b_far_future = asert_bits_staged(lim, 0, 2016, 3600, None, 10, 10_000_000_000, 172_800, lim, TARGET_SPACING).unwrap();
     assert_eq!(b_far_future, lim);
-    let b_fast = asert_bits_staged(lim, 1_000_000, 2016, 3600, None, 100, 1_000_010, 172_800, lim, TARGET_SPACING);
+    let b_fast = asert_bits_staged(lim, 1_000_000, 2016, 3600, None, 100, 1_000_010, 172_800, lim, TARGET_SPACING).unwrap();
     assert_ne!(b_fast, lim);
 }
 

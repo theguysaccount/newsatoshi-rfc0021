@@ -15,10 +15,11 @@ use std::time::Instant;
 
 const USAGE: &str = "newsatoshi — proof of work orders, proof of negentropy validates
 
-usage: newsatoshi [--net regtest|testnet|rehearsal] [--datadir DIR] <command>
+usage: newsatoshi [--net regtest|testnet|rehearsal|mainnet] [--genesis-v2 FILE.json] [--datadir DIR] <command>
 
-  node [--port P] [--peer HOST:PORT]... [--mine [--interval S] [--mine-duty PCT]]   run a full node, optionally mining
-                                                (with no --peer it finds the network's seeds; --no-seeds to stay alone)
+  node [--port P] [--peer HOST:PORT[@SLH_DSA_VK]]... [--mine [--interval S] [--mine-duty PCT]]
+                                                run a full node, optionally mining (append @64HEX_VK to
+                                                --peer for NSPQ2 SLH-DSA-authenticated active-MITM defense)
        [--maxout N] [--external HOST:PORT]       dial up to N peers from the address book it learns (default 8, 0: none);
                                                 --external is the address others should reach this node at
        [--rpc PORT [--rpcbind ADDR] [--rpcauth USER:PASS]]       JSON-RPC for pools: merged mining with Bitcoin
@@ -27,9 +28,10 @@ usage: newsatoshi [--net regtest|testnet|rehearsal] [--datadir DIR] <command>
        [--swap-lnd HOST:PORT --swap-macaroon FILE|HEX|env:VAR    swaps with Lightning through an LND node (REST, no-rest-tls)
         [--swap-rate SATS_PER_COIN] [--swap-min SATS] [--swap-max SATS] [--swap-fee-ppm N] [--swap-network NAME]]
        [--swap-fake]                                             regtest only: swaps with a pretend Lightning, to try the flow
-  info                                          chain height, tip, difficulty, supply, notes, jobs
+  info                                          chain height, tip, difficulty, supply, notes, priors, channels
   address [--delivery]                          your shielded address; --delivery: the long nsd1… address,
                                                 payments to which arrive on chain with nothing to pass on
+  p2p-key                                       your node's SLH-DSA-SHA2-128s verifying key for NSPQ2 peer pinning
   balance                                       your spendable balance, once it has looked for payments delivered to you
   send ADDRESS COINS [--fee COINS] [--memo T]   prove and submit a private payment: to an nsd1… address it arrives by
                                                 itself; to an ns1… address, give the payee the note it prints
@@ -41,7 +43,7 @@ usage: newsatoshi [--net regtest|testnet|rehearsal] [--datadir DIR] <command>
   unlock LOCKID PREIMAGE                        release a lock to its claim address by publishing the preimage
   expire LOCKID                                 release a timed-out lock to its refund address
   locks                                         list open locks
-  signing-key                                   your public signing key (SLH-DSA), for conditions and jobs
+  signing-key                                   your public signing key (SLH-DSA), for conditions and priors
   cond COINS --pay ADDR[,ADDR..] (--program TEXT | --two-of-three KEY,KEY,KEY) [--blocks N]
                                                 lock coins to a condition: a program that chooses among the
                                                 payouts (the first is payout 0); after N blocks they come back
@@ -49,13 +51,12 @@ usage: newsatoshi [--net regtest|testnet|rehearsal] [--datadir DIR] <command>
   fulfil CONDID PAYOUT [--witness HEX,HEX..] [--salt HEX --program TEXT]
                                                 release coins under a condition by running its program
   conds                                         list open conditions
+  priors                                        list open Priorism-FEP PriorLocks
+  flyclient [--tail N] [--samples N]            generate and verify an O(log N) FlyClient PoW chain proof
+  prune --out DIR [--keep N]                    export a pruned Utreexo 1 KB frontier + disk KV nullifier checkpoint
+  genesis-v2 --btc-block-hash H --btc-height N [--time T] [--bits HEX] [--mine] [--out FILE]
+                                                generate/mine a Bitcoin-block-anchored Mainnet v2 fair-launch genesis
   program TEXT                                  assemble a condition program and print it in hex
-  job post A.csv B.csv --pay C --bond C [--claim N] [--deliver N] [--window N]
-  job claim JOBID --bond COINS
-  job commit JOBID C.csv                        commit your result's root (sign with your job key)
-  job check JOBID A.csv B.csv C.csv [--fraud]   Freivalds check; with --fraud, submit the proof of a wrong entry
-  job accept|finalize|refund JOBID
-  jobs                                          list jobs
   demo                                          an in-process tour: payment, honest job, cheating job
 ";
 
@@ -292,6 +293,14 @@ fn run() -> Result<(), String> {
                 let mut n = node::lock(&shared);
                 n.listen_port = Some(port);
                 n.book = newsatoshi::peers::AddrBook::open(Some(o.dir.join("peers.txt")));
+                if let Ok(w) = Wallet::load_or_create(&wallet_path) {
+                    if let Ok(jk) = w.job_key() {
+                        if p.pq_transport {
+                            println!("p2p NSPQ2 identity key: {}", hex::encode(jk.vk()));
+                        }
+                        n.p2p_identity = Some(std::sync::Arc::new(jk));
+                    }
+                }
                 if let Some(e) = flag(&o.rest, "--external") {
                     if !newsatoshi::peers::valid(&e) {
                         return Err("--external takes HOST:PORT".into());
@@ -397,7 +406,60 @@ fn run() -> Result<(), String> {
             println!("burned      {}", fmt(s.burned));
             println!("in escrow   {}", fmt(s.locked));
             println!("shielded    {}", fmt(s.shielded_supply()));
-            println!("notes       {}  nullifiers {}  jobs {}", s.tree.len(), s.nullifiers.len(), s.jobs.len());
+            println!("notes       {}  nullifiers {}  priors {}  channels {}  locks {}  conds {}", s.tree.len(), s.nullifiers.len(), s.priors.len(), s.channels.len(), s.locks.len(), s.conds.len());
+        }
+        ["p2p-key"] => println!("{}", hex::encode(Wallet::load_or_create(&wallet_path)?.job_key()?.vk())),
+        ["priors"] => {
+            let c = open_chain(&o)?;
+            for pl in c.state.priors.values() {
+                println!(
+                    "{}  stake {}  deadline {}  window {}  quorum {}/{}  committed {}",
+                    hex::encode(pl.id),
+                    fmt(pl.post.stake as u128),
+                    pl.post.deadline,
+                    pl.post.challenge_window,
+                    pl.post.quorum_m,
+                    pl.post.arbiter_vks.len(),
+                    pl.outcome_hash.map(hex::encode).unwrap_or_else(|| "none".into()),
+                );
+            }
+        }
+        ["flyclient", ..] => {
+            let c = open_chain(&o)?;
+            let tail: usize = flag(&o.rest, "--tail").and_then(|x| x.parse().ok()).unwrap_or(6);
+            let samples: usize = flag(&o.rest, "--samples").and_then(|x| x.parse().ok()).unwrap_or(16);
+            let headers: Vec<_> = (0..=c.height())
+                .map(|h| c.block_at(h).ok_or_else(|| format!("missing block at height {h}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let tip_tx_root = headers.last().unwrap().tx_root();
+            let parts = c.state.digest_parts();
+            let proof = newsatoshi::light::FlyClientProof::prove(&headers, tip_tx_root, parts, tail, samples)?;
+            let require_mmr = c.params.mmr_from.is_some_and(|f| c.height() >= f);
+            let (tip_h, work) = proof.verify(headers[0].hash(), samples.min(proof.samples.len()), require_mmr)?;
+            println!(
+                "{{\"ok\":true,\"tip_height\":{},\"tip\":\"{}\",\"mmr_root\":\"{}\",\"peaks\":{},\"samples\":{},\"total_work\":\"{}\",\"header_mmr_bound\":{}}}",
+                proof.tip_height,
+                hash_hex(&tip_h),
+                hex::encode(proof.mmr_root),
+                proof.peaks.len(),
+                proof.samples.len(),
+                work,
+                require_mmr,
+            );
+        }
+        ["prune", ..] => {
+            let out_dir = flag(&o.rest, "--out").ok_or("usage: newsatoshi prune --out DIR [--keep N]")?;
+            let keep: u32 = flag(&o.rest, "--keep").and_then(|x| x.parse().ok()).unwrap_or(288);
+            let c = open_chain(&o)?;
+            let rep = newsatoshi::pruned_store::prune_chain_to_disk(&c, std::path::Path::new(&out_dir), keep)?;
+            println!(
+                "pruned through height {} (kept {} tail blocks from {}); compact frontier {} B, disk nullifiers {}",
+                rep.tip_height,
+                rep.tail_blocks_kept,
+                rep.pruned_below_height,
+                rep.compact_note_frontier_bytes,
+                rep.disk_nullifiers_indexed,
+            );
         }
         ["address"] => println!("{}", Wallet::load_or_create(&wallet_path)?.address()),
         ["address", "--delivery"] => println!("{}", Wallet::load_or_create(&wallet_path)?.delivery_address()),
@@ -655,7 +717,9 @@ fn run() -> Result<(), String> {
                 None => 0x1d00_ffff,
             };
             let do_mine = o.rest.iter().any(|a| a == "--mine");
-            let mut p = Params::main_v2_with(time, u32::MAX, bits);
+            // Pass nonce=0 so dry-run mode (without `--mine`) does NOT trigger `genesis_block`'s
+            // `u32::MAX` auto-mining sentinel at `0x1d00ffff` (difficulty 1 = ~4.3B hashes).
+            let mut p = Params::main_v2_with(time, 0, bits);
             p.genesis_message = msg_static;
             let mut g = genesis_block(&p);
             let fp = hex::encode(newsatoshi::hash::sha256(
@@ -674,7 +738,7 @@ fn run() -> Result<(), String> {
                 None
             };
             let json_out = format!(
-                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"release\": \"v1.1.0-hardened\",\n  \"magic\": \"nsM2\",\n  \"default_port\": {},\n  \"opportunistic_pq_transport\": true,\n  \"flyclient_mmr_from\": 0,\n  \"prior_lock_from\": 0,\n  \"homeostatic_fee_burn_bps\": {},\n  \"batch_spend_from\": 0,\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_hash_profile\": \"MAIN_V2_QUARTIC_SHA384_152Q_B8_G20_QROM100\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
+                "{{\n  \"ok\": true,\n  \"network\": \"mainnet-v2\",\n  \"release\": \"v1.2.0-mainnet-rc1\",\n  \"magic\": \"nsM2\",\n  \"default_port\": {},\n  \"p2p_transport\": \"NSPQ1+NSPQ2 (ML-KEM-768 + optional SLH-DSA-SHA2-128s pinning)\",\n  \"flyclient_mmr_from\": 0,\n  \"merkle_locks_conds_from\": 0,\n  \"legacy_jobs_enabled\": false,\n  \"prior_lock_from\": 0,\n  \"homeostatic_fee_burn_bps\": {},\n  \"batch_spend_from\": 0,\n  \"batch_spend_fee_model\": \"incentive_compatible_prover_fee_100pct_miner_subsidy\",\n  \"premine_love\": 0,\n  \"auxpow_chainid\": 20051,\n  \"fri_hash_profile\": \"MAIN_V2_QUARTIC_SHA384_152Q_B8_G20_QROM100\",\n  \"asert_launch_blocks\": {},\n  \"asert_launch_half_life_sec\": {},\n  \"asert_steady_half_life_sec\": {},\n  \"btc_anchor_height\": {},\n  \"btc_anchor_hash\": \"{}\",\n  \"genesis_message\": \"{}\",\n  \"genesis_time\": {},\n  \"genesis_bits\": \"{:#010x}\",\n  \"mined\": {},\n  \"genesis_nonce\": {},\n  \"genesis_hash\": \"{}\",\n  \"mined_ms\": {},\n  \"params_fingerprint_sha256\": \"{}\"\n}}",
                 p.default_port,
                 newsatoshi::params::BASE_FEE_BURN_BPS,
                 p.launch_blocks,

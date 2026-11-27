@@ -82,6 +82,24 @@ fn mul_small() {
     let expected = BaseElement::new(a as u64) * t;
 
     assert_eq!(expected, t.mul_small(a));
+
+    // NEWSATOSHI regression: values whose raw product lands in `[M, 2^64 - 1]` must reduce `< M`
+    // so subsequent `Add` (`M - rhs.0`) never underflows.
+    let adv_mul = BaseElement::from_mont(0x2492_4924_9249_2492);
+    let ms = adv_mul.mul_small(7);
+    assert!(ms.inner() < M, "mul_small returned non-canonical inner {}", ms.inner());
+    assert_eq!(ms, adv_mul * BaseElement::new(7));
+    assert_eq!(BaseElement::new(10) + ms, BaseElement::new(10) + adv_mul * BaseElement::new(7));
+
+    // NEWSATOSHI regression: `double()` on `[0x7fffffff_80000001, 0x7fffffff_ffffffff]` must
+    // reduce `< M`.
+    for raw in [0x7fff_ffff_8000_0001u64, 0x7fff_ffff_ffff_ffffu64, M - 1] {
+        let x = BaseElement::from_mont(raw);
+        let d = x.double();
+        assert!(d.inner() < M, "double returned non-canonical inner {}", d.inner());
+        assert_eq!(d, x + x);
+        assert_eq!(BaseElement::new(10) + d, BaseElement::new(10) + x + x);
+    }
 }
 
 #[test]

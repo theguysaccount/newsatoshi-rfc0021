@@ -84,6 +84,13 @@ impl Cond {
     pub fn decode(r: &mut Reader) -> Res<Self> {
         Ok(Cond { id: r.arr()?, post: CondPost::decode(r)?, at: r.u32()? })
     }
+    /// Canonical SHA-256 leaf digest for $O(\log N)$ `State::conds_merkle` (`Mainnet v2`).
+    pub fn value_hash(&self) -> [u8; 32] {
+        let mut w = Writer::new();
+        w.raw(b"nsCNDV1");
+        self.encode(&mut w);
+        sha256(&w.0)
+    }
 }
 
 /// The commitment to a program: SHA-256 of a domain tag, a 32-byte salt and the program.

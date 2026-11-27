@@ -16,8 +16,7 @@ use newsatoshi::job::{Action, Deposit, JobKey};
 use newsatoshi::light::HeaderTip;
 use newsatoshi::node::{lock, Node};
 use newsatoshi::params::{
-    prover_subsidy_share, split_spend_fee, subsidy, Params, COIN, MAIN_V2_DEFAULT_FEE,
-    MIN_BATCH_SPEND_FEE,
+    split_spend_fee, subsidy, Params, COIN, MAIN_V2_DEFAULT_FEE, MIN_BATCH_SPEND_FEE,
 };
 use newsatoshi::prior::{self, PriorPost};
 use newsatoshi::rpc::{self, J};
@@ -241,12 +240,12 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
     let single_bytes = single_proof.to_bytes().len();
 
     // Helper to build a K-spend `Tx::BatchSpend` from Alice's first `k` unspent notes
-    let make_batch = |chain: &Chain, k: usize| -> (Tx, usize, u128, u128, u32) {
+    // with strictly incentive-compatible `prover_fee` paid out of unburned fees (miners keep 100% subsidy!).
+    let make_batch = |chain: &Chain, k: usize, fee_each: u64, prover_fee: u64| -> (Tx, usize, u128, u128, u32) {
         let mut rng = rand::thread_rng();
         let mut wits = Vec::with_capacity(k);
         let mut binds = Vec::with_capacity(k);
         let mut items = Vec::with_capacity(k);
-        let fee_each = MIN_BATCH_SPEND_FEE * 2; // 20,000 units per sub-spend
         for c in &unspent[..k] {
             let out_pay = OutputNote { a_pk: bob.a_pk(), v: 1 * COIN, rho: rng.gen() };
             let out_chg = OutputNote { a_pk: alice.a_pk(), v: c.v - 1 * COIN - fee_each, rho: rng.gen() };
@@ -273,7 +272,8 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
             binds.push(bind);
         }
         let t0 = std::time::Instant::now();
-        let (bpi, proof) = batch_spend::prove_batch_for(&params.proof, &wits, &binds, prover.a_pk()).unwrap();
+        let (bpi, proof) =
+            batch_spend::prove_batch_for(&params.proof, &wits, &binds, prover.a_pk(), prover_fee).unwrap();
         let prove_ms = t0.elapsed().as_millis();
         let qrom = proof.proven_security::<spend::Hash384>().qrom_ldr_bits(384);
         assert!(qrom >= 100, "MAIN_V2 K={k} BatchSpend must achieve >= 100 conservative QROM bits, got {qrom}");
@@ -284,13 +284,14 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
         let tx = Tx::BatchSpend(BatchSpend {
             spends: items,
             prover_a_pk: prover.a_pk(),
+            prover_fee,
             proof: pbytes.clone(),
         });
         (tx, pbytes.len(), prove_ms, verify_ms, qrom)
     };
 
     // Benchmark K = 4 SHA-384 BatchSpend
-    let (_batch4_tx, b4_bytes, b4_prove_ms, b4_verify_ms, b4_qrom) = make_batch(&chain, 4);
+    let (_batch4_tx, b4_bytes, b4_prove_ms, b4_verify_ms, b4_qrom) = make_batch(&chain, 4, 250_000, 100_000);
     println!(
         "[MAIN_V2 QUARTIC SHA-384 BENCH] K=1: {single_bytes} B ({single_ms} ms, QROM={single_qrom}b) | K=4: {b4_bytes} B ({} B/spend, {:.2}x compression, prove={b4_prove_ms} ms, verify={b4_verify_ms} ms, QROM={b4_qrom}b)",
         b4_bytes / 4,
@@ -303,7 +304,11 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
     );
 
     // Benchmark K = 8 SHA-384 BatchSpend (proves 8 full 2-in/2-out spends in ONE SHA-384 STARK!)
-    let (batch8_tx, b8_bytes, b8_prove_ms, b8_verify_ms, b8_qrom) = make_batch(&chain, 8);
+    // Total fee = 8 * 200_000 = 1_600_000 (4x cheaper per user than 8 * 800_000!):
+    //   50% burned (800_000) | prover_fee = 200_000 | miner_fee = 600_000 + 100% of 50 LOVE subsidy!
+    let fee_each = 200_000u64;
+    let prover_fee = 200_000u64;
+    let (batch8_tx, b8_bytes, b8_prove_ms, b8_verify_ms, b8_qrom) = make_batch(&chain, 8, fee_each, prover_fee);
     let tx8_wire = batch8_tx.to_bytes();
     assert_eq!(Tx::from_bytes(&tx8_wire).unwrap(), batch8_tx);
     println!(
@@ -319,38 +324,88 @@ fn batch_spend_sha384_compresses_4_and_8_spends_and_enforces_split_coinbase() {
         single_bytes * 8
     );
 
-    // CONSENSUS SPLIT-COINBASE ENFORCEMENT TEST:
-    // Height 10 with K=8 compressed spends -> Prover MUST receive 30% of subsidy (15 LOVE)!
+    // INCENTIVE-COMPATIBLE PROVER-FEE ENFORCEMENT TEST:
+    // AuxPoW miner keeps 100% of 50 LOVE subsidy + 600,000 miner_fee (strictly MORE than omitting!),
+    // while consensus forces coinbase to pay exact STARK-bound `prover_fee = 200,000` to `prover_a_pk`!
     let next_h = chain.height() + 1;
     let sub = subsidy(next_h);
-    let prover_req = prover_subsidy_share(sub, 8);
-    assert_eq!(prover_req, (sub * 30) / 100);
-    let fee_each = MIN_BATCH_SPEND_FEE * 2;
     let (burn_each, prod_each) = split_spend_fee(fee_each, true);
     let total_burn = burn_each * 8;
-    let total_prod_fee = prod_each * 8;
+    let total_net_fee = prod_each * 8;
+    let miner_fee = total_net_fee - prover_fee;
+    assert_eq!((total_burn, prover_fee, miner_fee), (800_000, 200_000, 600_000));
 
-    // 1. Greedy AuxPoW miner tries to keep 100% of subsidy (omitting prover) -> REJECTED!
-    let greedy = vec![PlainOut { a_pk: miner.a_pk(), v: sub + total_prod_fee, rho: [1; 5] }];
+    // Verify Node::precheck & mempool relay accept the incentive-compatible K=8 BatchSpend!
+    Node::precheck(&batch8_tx, &params).unwrap();
+
+    // 1. Greedy AuxPoW miner tries to pocket prover_fee (omitting prover coinbase output) -> REJECTED!
+    let greedy = vec![PlainOut { a_pk: miner.a_pk(), v: sub + total_net_fee, rho: [1; 5] }];
     assert!(
         chain.template(greedy, vec![batch8_tx.clone()], vec![]).is_err(),
-        "miner omitting BatchSpend prover coinbase share MUST be rejected by consensus"
+        "miner omitting STARK-bound BatchSpend prover_fee MUST be rejected by consensus"
     );
 
-    // 2. Honest split coinbase (70% AuxPoW miner + fees, 30% Negentropy Prover) -> ACCEPTED!
-    let split_outs = vec![
-        PlainOut { a_pk: miner.a_pk(), v: sub - prover_req + total_prod_fee, rho: [2; 5] },
-        PlainOut { a_pk: prover.a_pk(), v: prover_req, rho: [3; 5] },
+    // 2. Honest coinbase: 100% subsidy + miner_fee to miner, prover_fee to prover -> ACCEPTED!
+    let honest_outs = vec![
+        PlainOut { a_pk: miner.a_pk(), v: sub + miner_fee, rho: [2; 5] },
+        PlainOut { a_pk: prover.a_pk(), v: prover_fee, rho: [3; 5] },
     ];
-    let mut b10 = chain.template(split_outs, vec![batch8_tx], vec![]).unwrap();
+    let mut b10 = chain.template(honest_outs, vec![batch8_tx], vec![]).unwrap();
     assert!(mine(&mut b10.header, u64::MAX));
     chain.add_block(b10).unwrap();
 
     assert_eq!(chain.height(), 10);
     assert_eq!(chain.state.burned, total_burn as u128);
-    // Advance 1 block so coinbase matures (maturity = 1) and verify Prover received 15 LOVE!
+    // Advance 1 block so coinbase matures (maturity = 1) and verify BOTH miner & prover balances!
     let mut b11 = chain.template(vec![PlainOut { a_pk: miner.a_pk(), v: subsidy(11), rho: [4; 5] }], vec![], vec![]).unwrap();
     assert!(mine(&mut b11.header, u64::MAX));
     chain.add_block(b11).unwrap();
-    assert_eq!(prover.balance(&chain), prover_req);
+    assert_eq!(prover.balance(&chain), prover_fee);
+    assert_eq!(miner.balance(&chain), sub + miner_fee);
+}
+
+#[test]
+fn goldilocks_f64_double_and_mul_small_strictly_canonical_and_quartic_sound() {
+    use winterfell::math::{
+        fields::{f64::BaseElement as Felt, QuartExtension},
+        FieldElement, StarkField,
+    };
+    const M: u64 = Felt::MODULUS;
+
+    // 1. Adversarial `double()` inputs in `[0x7fffffff_80000001, 0x7fffffff_ffffffff]` that
+    // previously produced non-canonical inner values `>= M` and underflowed `M - rhs.0` in `Add`.
+    for raw in [
+        0x7fff_ffff_8000_0000u64,
+        0x7fff_ffff_8000_0001u64,
+        0x7fff_ffff_c000_0000u64,
+        0x7fff_ffff_ffff_ffffu64,
+        M - 2,
+        M - 1,
+    ] {
+        let x = Felt::from_mont(raw);
+        let d = x.double();
+        assert!(d.inner() < M, "double() emitted non-canonical inner {:#x}", d.inner());
+        assert_eq!(d, x + x);
+        assert_eq!(Felt::new(10) + d, Felt::new(10) + x + x);
+    }
+
+    // 2. Adversarial `mul_small(7)` inputs whose product previously landed in `[M, 2^64 - 1]`.
+    for raw in [0x2492_4924_9249_2492u64, 0x2492_4924_9249_2491u64, 0x2492_4924_9249_2493u64, M - 1] {
+        let x = Felt::from_mont(raw);
+        let ms = x.mul_small(7);
+        assert!(ms.inner() < M, "mul_small(7) emitted non-canonical inner {:#x}", ms.inner());
+        assert_eq!(ms, x * Felt::new(7));
+        assert_eq!(Felt::new(10) + ms, Felt::new(10) + x * Felt::new(7));
+    }
+
+    // 3. Adversarial `QuartExtension::mul` & `square` hitting `0x2492_4924_9249_2492` on every limb.
+    let adv = Felt::from_mont(0x2492_4924_9249_2492);
+    let q1 = QuartExtension::new(Felt::new(10), Felt::ONE, Felt::ZERO, Felt::ZERO);
+    let q2 = QuartExtension::new(Felt::new(3), Felt::ZERO, Felt::ZERO, adv);
+    let prod = q1 * q2;
+    let [c0, c1, c2, c3] = prod.to_base_elements();
+    assert!(c0.inner() < M && c1.inner() < M && c2.inner() < M && c3.inner() < M);
+    assert_eq!(c0, Felt::new(10) * Felt::new(3) + adv * Felt::new(7));
+    assert_eq!(prod, q2 * q1);
+    assert_eq!(prod * q2.inv(), q1);
 }

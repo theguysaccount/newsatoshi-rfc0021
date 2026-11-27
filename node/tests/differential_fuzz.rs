@@ -246,6 +246,7 @@ fn mutation_fuzz_10000_hostile_wire_stark_batch_p2p_payloads() {
     let bpi = BatchSpendPublic {
         spends: vec![pi.clone(), pi.clone()],
         prover_a_pk: [9; 8],
+        prover_fee: 0,
     };
 
     let mut book = AddrBook::default();

@@ -224,6 +224,39 @@ export function asertBits(anchorBits, anchorParentTime, parentHeight, parentTime
   return compactFromTarget(next);
 }
 
+/** Exact BigInt two-stage Day-1 launch ramp + steady-state ASERT (matches Rust `pow::asert_bits_staged`). */
+export function asertBitsStaged(
+  genesisBits,
+  genesisParentTime,
+  launchBlocks,
+  launchHalfLife,
+  steadyAnchor,
+  parentHeight,
+  parentTime,
+  steadyHalfLife,
+  powLimitBits,
+  spacing,
+) {
+  if (launchBlocks === 0) {
+    return asertBits(genesisBits, genesisParentTime, parentHeight, parentTime, steadyHalfLife, powLimitBits, spacing);
+  }
+  if (parentHeight < launchBlocks) {
+    return asertBits(genesisBits, genesisParentTime, parentHeight, parentTime, launchHalfLife, powLimitBits, spacing);
+  }
+  if (!steadyAnchor) {
+    throw new Error(`missing ASERT steady anchor at height ${launchBlocks}`);
+  }
+  return asertBits(
+    steadyAnchor.bits,
+    steadyAnchor.time - spacing,
+    parentHeight - launchBlocks,
+    parentTime,
+    steadyHalfLife,
+    powLimitBits,
+    spacing,
+  );
+}
+
 /** Independent Merkle root (CVE-2012-2459 zero-padded, NOT Bitcoin duplicated tail). */
 export function merkleRoot(txHashHexes) {
   if (txHashHexes.length === 0) return Buffer.alloc(32);
@@ -413,6 +446,25 @@ export function verifyVectorBundle(vec) {
     out.asert_bits = bits;
     if (a.expected_bits !== undefined && bits !== (a.expected_bits >>> 0)) {
       return { ok: false, reason: `asert_bits mismatch: got ${bits} expected ${a.expected_bits}` };
+    }
+  }
+  if (vec.asert_staged) {
+    const s = vec.asert_staged;
+    const bits = asertBitsStaged(
+      s.genesis_bits,
+      s.genesis_parent_time,
+      s.launch_blocks,
+      s.launch_half_life,
+      s.steady_anchor ?? null,
+      s.parent_height,
+      s.parent_time,
+      s.steady_half_life,
+      s.pow_limit_bits,
+      s.spacing,
+    );
+    out.asert_staged_bits = bits;
+    if (s.expected_bits !== undefined && bits !== (s.expected_bits >>> 0)) {
+      return { ok: false, reason: `asert_staged_bits mismatch: got ${bits} expected ${s.expected_bits}` };
     }
   }
   if (vec.note_leaves) {
