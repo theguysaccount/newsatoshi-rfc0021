@@ -5,7 +5,7 @@
 [![Consensus Crypto](https://img.shields.io/badge/L1%20Coins-FIPS%20SHA--2%2F384%20STARKs%20%2B%20SLH--DSA-38bdf8)](docs/newsatoshi-v2.2.pdf)
 [![Lean 4](https://img.shields.io/badge/Lean%204.36-249%20AIR%20%2B%20Semantic%20Soundness-a855f7)](node/proof/SpendCircuitFull.lean)
 [![Bug Bounty](https://img.shields.io/badge/Security%20Bounty-Paid%20in%20Mined%20LOVE-ef4444)](docs/BUG_BOUNTY.md)
-[![License: MIT](https://img.shields.io/badge/License-MIT-zinc)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-amber)](LICENSE)
 
 **Private, post-quantum electronic cash secured by Bitcoin merge-mining (`AuxPoW`, `chainid = 20051`) — where all coin security and consensus proofs rest strictly on FIPS 180-4 SHA-2 (`SHA-256` / `SHA-384`) and FIPS 205 `SLH-DSA`, with zero elliptic curves, zero trusted setup, and zero novel algebraic ZK-hashes.**
 
